@@ -17,11 +17,11 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/Anchorline-labs/anchorline"
+repository = "https://github.com/Sylox-labs/sylox"
 
 [workspace.dependencies]
 soroban-sdk = "29.0.0"
-anchorline-types = { path = "contracts/types" }
+sylox-types = { path = "contracts/types" }
 
 [profile.release]
 opt-level = "z"

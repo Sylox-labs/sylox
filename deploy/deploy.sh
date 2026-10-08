@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Anchorline deployment script. technical-doc.md Section 22.2.
+# Sylox deployment script. technical-doc.md Section 22.2.
 #
 # Usage: deploy/deploy.sh <testnet|mainnet>
 #
@@ -34,7 +34,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="$REPO_ROOT/deploy/$NETWORK.toml"
 DEPLOYMENTS_DIR="$REPO_ROOT/deployments"
 
-echo "==> Anchorline deploy: $NETWORK"
+echo "==> Sylox deploy: $NETWORK"
 echo "==> Config: $CONFIG"
 
 echo "==> [1/8] Building contracts"

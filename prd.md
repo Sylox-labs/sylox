@@ -1,11 +1,11 @@
-PRD: Anchorline Protocol
+PRD: Sylox Protocol
 Oct 8, 2026 · @david
 1. Document control and executive summary
-Anchorline is a Soroban protocol that measures the risk of each Stellar anchor and stablecoin issuer, and lets people buy and sell protection against that issuer failing. Target: SCF Build Award, Open Track, full protocol scope.
+Sylox is a Soroban protocol that measures the risk of each Stellar anchor and stablecoin issuer, and lets people buy and sell protection against that issuer failing. Target: SCF Build Award, Open Track, full protocol scope.
 Field
 Value
 Project
-Anchorline Protocol (working name; check for collisions in Phase 0)
+Sylox Protocol (working name; check for collisions in Phase 0)
 Status
 Pre protocol / validation
 Version
@@ -21,13 +21,13 @@ $140K to $150K in XLM (Section 16)
 
 
 1.1 One line
-Anchorline gives every anchor issued token on Stellar a public risk score and a market where holders can insure against that issuer depegging, freezing withdrawals or failing.
+Sylox gives every anchor issued token on Stellar a public risk score and a market where holders can insure against that issuer depegging, freezing withdrawals or failing.
 1.2 The protocol in three parts
 1. Anchor Risk Oracle: a public onchain feed per issued asset, combining price, issuer account behaviour and anchor endpoint health into signals and a risk score.
 2. Credit Event Registry: objective definitions of failure (depeg, issuer freeze, halted withdrawals, insolvency) and a process that declares them, using keeper posted, publicly recomputable data checks, staked reporters with disputes, and a committee for edge cases.
 3. Protection Markets: fully collateralized pools per issued asset. Buyers pay premiums for cover; sellers post USDC and earn premiums; payouts settle automatically when a credit event is declared.
 1.3 Why it matters
-Stellar's model is many issuers for the same currency. Users, wallets, lenders and NGOs hold these tokens but have no shared way to see, price or hedge issuer risk. Anchorline turns that hidden risk into public data and a tradable market, which also gives good anchors a way to prove they are safe.
+Stellar's model is many issuers for the same currency. Users, wallets, lenders and NGOs hold these tokens but have no shared way to see, price or hedge issuer risk. Sylox turns that hidden risk into public data and a tradable market, which also gives good anchors a way to prove they are safe.
 1.4 The honest summary
 The contracts are the easy part. The hard parts are reliable credit event detection, market manipulation on thin liquidity, getting both buyers and sellers, and legal structure, since protection like this is likely a derivative or insurance in most jurisdictions. This PRD treats those four as first class workstreams, not footnotes.
 1.4a Who is trusted in v1
@@ -62,9 +62,9 @@ Good anchors
 Cannot prove they are safer than rivals
 Publish reports nobody can verify onchain
 2.4 The gap
-There is no shared, onchain answer to two questions: how risky is this issuer right now, and how do I protect myself if it fails. Anchorline answers both, and makes the answer composable for any wallet or protocol.
+There is no shared, onchain answer to two questions: how risky is this issuer right now, and how do I protect myself if it fails. Sylox answers both, and makes the answer composable for any wallet or protocol.
 3. Protocol overview and positioning
-Anchorline is a protocol, not an app: its rules live in Soroban contracts, anyone can read the risk feed, open a market or buy cover, and other protocols can build on its signals and events.
+Sylox is a protocol, not an app: its rules live in Soroban contracts, anyone can read the risk feed, open a market or buy cover, and other protocols can build on its signals and events.
 3.1 Why it is a protocol
 • Rules onchain: signals, credit event status, collateral, premiums and payouts are held and enforced by contracts.
 • Permissionless use: any wallet or contract can read the feed; any user can buy or sell protection; anyone can propose a data verified event, or challenge any event or signal by posting a bond. Keepers and reporters are permissioned in v1 (Section 1.4a).
@@ -97,12 +97,12 @@ Limits portfolio loss, not issuer specific
 Optimistic oracles
 Soroban Optimistic Oracle
 No
-No; a tool Anchorline reuses
+No; a tool Sylox reuses
 Depeg cover on other chains
 DeFi cover protocols on EVM chains
 Partly
 Yes, but not for Stellar anchors
-Anchorline
+Sylox
 This project
 Yes, per issuer
 Yes, per issuer, onchain
@@ -292,7 +292,7 @@ Engages with the protocol, publishes attestations
 A public, verifiable safety signal
 9.1 Buyer journey
 1. NGO treasurer holds 50,000 USD worth of an ARS token for local payouts.
-2. Opens the Anchorline app, sees the issuer's score (Normal, 18/100) and its signals.
+2. Opens the Sylox app, sees the issuer's score (Normal, 18/100) and its signals.
 3. Buys 90 days of cover for 20,000 USD at the best quoted rate, paying the premium in USDC.
 4. Holds a protection token in their wallet.
 5. If the issuer halts withdrawals and the event is declared, the treasurer claims 20,000 USDC. If not, the cover expires.
@@ -447,7 +447,7 @@ All contract ids registered at award; a public dashboard shows every metric; tea
 Legal scoping comes first and partners come before the application, because those decide whether the protocol can launch at all.
 Week numbers are relative to the start of Phase 0; the SCF #47 deadline is still to be confirmed. Failing a gate triggers the kill criteria in Section 18. Phase 0 includes a mainnet data pull of candidate assets (USD, EUR, ARS and others) with liquidity, trade history and issuer flags, which decides the launch assets and whether the cover cap is meaningful (technical-doc.md Section 1.7).
 15. SCF Open Track alignment and tranche plan
-Anchorline fits the Open Track's "novel protocols or primitives that solve for key ecosystem needs": it is new on Stellar, fully onchain, and built for others to use. Tranches follow SCF's 10 / 20 / 30 / 40 split and end at mainnet.
+Sylox fits the Open Track's "novel protocols or primitives that solve for key ecosystem needs": it is new on Stellar, fully onchain, and built for others to use. Tranches follow SCF's 10 / 20 / 30 / 40 split and end at mainnet.
 15.1 Open Track checklist
 Handbook item
 Where answered
@@ -666,7 +666,7 @@ Depeg and cover protocols on EVM chains
 Cover against stablecoin or protocol failure
 Concept exists elsewhere; not for Stellar anchors
 B. Open questions
-[ ] Is the name "Anchorline" free (projects, domains, npm)?
+[ ] Is the name "Sylox" free (projects, domains, npm)?
 [ ] Which oracles provide ARS and other local currency reference rates on Stellar, and do they publish the official rate, the market rate, or both?
 [ ] Which issued assets have enough supply and liquidity to cover at launch? (Phase 0 data pull, technical-doc.md Section 1.7)
 [ ] Legal classification in target jurisdictions (Section 11.1)

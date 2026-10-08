@@ -1,4 +1,4 @@
-# Anchorline testnet configuration. technical-doc.md Section 22.3.
+# Sylox testnet configuration. technical-doc.md Section 22.3.
 # Contract ids are filled in by deploy.sh after each deployment step
 # (Section 22.2) and recorded in deployments/testnet.json.
 

@@ -1,6 +1,6 @@
 #![no_std]
 
-//! Shared types for the Anchorline protocol, imported by every contract so
+//! Shared types for the Sylox protocol, imported by every contract so
 //! encodings never drift between them. See technical-doc.md Section 4.
 
 pub mod assets;

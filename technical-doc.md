@@ -1,4 +1,4 @@
-# Anchorline Protocol: Technical Documentation
+# Sylox Protocol: Technical Documentation
 
 Version: v1.1 draft, October 8, 2026 · Author: David Ejere
 
@@ -68,7 +68,7 @@ Every change from v1.0, with the decision record behind it (`docs/decisions/`) a
 
 ## 1. Overview and conventions
 
-This document specifies how Anchorline is built: the Soroban contracts, their data, math, interfaces and events, the offchain services that feed them, and how to integrate, deploy and operate the system. It is the engineering companion to the Anchorline PRD and is written against a v1 design that has not yet been implemented, so every interface here is a draft to be validated in Phase 1.
+This document specifies how Sylox is built: the Soroban contracts, their data, math, interfaces and events, the offchain services that feed them, and how to integrate, deploy and operate the system. It is the engineering companion to the Sylox PRD and is written against a v1 design that has not yet been implemented, so every interface here is a draft to be validated in Phase 1.
 
 ### 1.1 Audience
 
@@ -112,7 +112,7 @@ Soroban contracts cannot read classic Stellar DEX order books, classic liquidity
 | Identifiers | `AssetId` = the Stellar Asset Contract address of the issued asset. `SeriesId`, `EventId`, `ClaimId` = `u64` counters per contract |
 | Hashes | SHA-256, `BytesN<32>` |
 | Rounding | Always in favour of the pool: round premiums up, payouts and withdrawals down |
-| Naming | Contracts in PascalCase, functions in snake\_case, events as `("anchorline", "<contract>", "<event>")` topics |
+| Naming | Contracts in PascalCase, functions in snake\_case, events as `("sylox", "<contract>", "<event>")` topics |
 
 ### 1.5 Terms used throughout
 
@@ -179,7 +179,7 @@ The Governor governs every contract through timelocked actions; its arrows are o
 
 ## 3. Contract inventory and deployment topology
 
-Anchorline v1 is seven Soroban contracts plus the Stellar Asset Contracts (SACs) of the assets it references. Three are core (oracle, registry, market factory), one is instantiated per series, and three are supporting (staking, treasury and governance).
+Sylox v1 is seven Soroban contracts plus the Stellar Asset Contracts (SACs) of the assets it references. Three are core (oracle, registry, market factory), one is instantiated per series, and three are supporting (staking, treasury and governance).
 
 ### 3.1 Contracts
 
@@ -253,7 +253,7 @@ The repository is a single Cargo workspace (Section 22.1) plus independent offch
 ```mermaid
 flowchart TB
   subgraph WS["Cargo workspace: contracts/"]
-    TY[anchorline-types<br/>rlib, shared contracttypes]
+    TY[sylox-types<br/>rlib, shared contracttypes]
     RO[risk-oracle]
     ER[event-registry]
     ST[staking]
@@ -317,7 +317,7 @@ Solid arrows are compile time (Cargo) dependencies; dashed arrows are runtime cr
 
 ## 4. Core data model
 
-All shared types live in a `anchorline-types` crate imported by every contract, so encodings never drift between contracts. Types are `#[contracttype]` unless noted.
+All shared types live in a `sylox-types` crate imported by every contract, so encodings never drift between contracts. Types are `#[contracttype]` unless noted.
 
 ### 4.1 Assets and signals
 
@@ -627,7 +627,7 @@ sequenceDiagram
     Disputer->>Oracle: dispute_signals(asset, epoch, alt_hash)
     Oracle->>Staking: lock_bond(SignalDispute(asset, epoch), disputer, signal_dispute_bond)
     Oracle-->>Disputer: signals_disputed event, state = Disputed
-    Committee->>Committee: run anchorline-recompute on both bundles
+    Committee->>Committee: run sylox-recompute on both bundles
     Committee->>Oracle: resolve_signal_dispute(asset, epoch, keeper_wins, reason)
     alt keeper_wins
       Oracle->>Oracle: state = Final
@@ -1490,7 +1490,7 @@ fn accrued(env, who: Address) -> i128;                     // accrued and not ye
 
 ## 13. Events reference
 
-Every state change emits a contract event. Topics are `("anchorline", <contract>, <event>, <primary key>)`; data is a single `#[contracttype]` struct. Indexers and the SDK subscribe through Soroban RPC `getEvents`, filtering on the first two topics.
+Every state change emits a contract event. Topics are `("sylox", <contract>, <event>, <primary key>)`; data is a single `#[contracttype]` struct. Indexers and the SDK subscribe through Soroban RPC `getEvents`, filtering on the first two topics.
 
 | Contract | Event | Primary key topic | Data fields |
 | --- | --- | --- | --- |
@@ -1619,7 +1619,7 @@ Each contract defines a `#[contracterror]` enum with `u32` codes in its own rang
 
 ## 15. Storage layout and TTL strategy
 
-Soroban storage has three classes with different lifetimes and costs: instance (lives with the contract), persistent (archived when its TTL runs out, restorable) and temporary (deleted when its TTL runs out). Anchorline puts anything that guards money in persistent storage and keeps its TTL extended by every touching call.
+Soroban storage has three classes with different lifetimes and costs: instance (lives with the contract), persistent (archived when its TTL runs out, restorable) and temporary (deleted when its TTL runs out). Sylox puts anything that guards money in persistent storage and keeps its TTL extended by every touching call.
 
 ### 15.1 Keys per contract
 
@@ -1854,7 +1854,7 @@ Four services run outside the chain: the keeper computes signals, the reporter n
 | Inputs | Trade history and order books (Horizon), ledger operations for issuer accounts, ledger asset stats for supply, SAC events (Soroban RPC `getEvents`), FX reference on the asset's rate basis via adapter. Not probe results: the endpoint status is never keeper posted |
 | Schedule | Cron at each epoch close plus 60 seconds, per asset; after an outage, backfills every closed, non Final epoch still inside `window_secs` (Section 5.2) |
 | Output | `SignalSet` posted via `post_signals` with `endpoint = Unknown`; inputs bundle uploaded first, its SHA-256 placed in `inputs_hash`. Also calls `finalize_endpoint`, `settle_probes`, `finalize` and `resolve_timeout` when due, since these are permissionless |
-| Determinism | Recomputation tool (`anchorline-recompute`) takes a bundle and must output byte identical `SignalSet`; the keeper uses the same library |
+| Determinism | Recomputation tool (`sylox-recompute`) takes a bundle and must output byte identical `SignalSet`; the keeper uses the same library |
 | Keys | Keeper signing key in an HSM or KMS; fee account separate from bond account |
 | Failure | Retries within the epoch; alerts after 2 missed epochs |
 
@@ -1892,14 +1892,14 @@ The API is a convenience. Integrators that need guarantees read contract state d
 
 ## 19. TypeScript SDK reference
 
-`@anchorline/sdk` wraps the contract clients generated by `stellar contract bindings typescript`, adds fixed point helpers, simulation, archived entry restoration and error mapping. It is a client of the protocol; everything it does can be done with raw contract calls.
+`@sylox/sdk` wraps the contract clients generated by `stellar contract bindings typescript`, adds fixed point helpers, simulation, archived entry restoration and error mapping. It is a client of the protocol; everything it does can be done with raw contract calls.
 
 ### 19.1 Setup
 
 ```ts
-import { Anchorline, Networks } from "@anchorline/sdk";
+import { Sylox, Networks } from "@sylox/sdk";
 
-const al = new Anchorline({
+const al = new Sylox({
   network: Networks.Testnet,          // rpcUrl, passphrase and contract ids preset
   signer: walletSigner,               // signTransaction / signAuthEntry adapter (e.g. Stellar Wallets Kit)
 });
@@ -1956,7 +1956,7 @@ await al.treasury.claimReward();                         // keeper or reporter r
 
 ### 19.7 Behaviour guarantees
 
-- Every write is simulated first; the SDK throws `AnchorlineError` with the contract error name (Section 14) before asking the wallet to sign.
+- Every write is simulated first; the SDK throws `SyloxError` with the contract error name (Section 14) before asking the wallet to sign.
 - If simulation reports archived entries, the SDK builds and submits a restore transaction first (with user consent callback).
 - Amounts are `bigint` in base units everywhere; `al.fx` converts for display only.
 - No private keys are handled by the SDK; signing is delegated to the provided signer.
@@ -2090,7 +2090,7 @@ Coverage target: 95% line coverage on `Series`, `EventRegistry`, `Staking` and `
 
 Check OpenZeppelin's Stellar contracts library (the Soroban port of OpenZeppelin Contracts) before hand rolling standard components, and record what it covers at the time each contract is built. Use an audited implementation wherever one fits; hand roll only what it does not cover, and note why.
 
-| Need | Where in Anchorline | What to check in the library |
+| Need | Where in Sylox | What to check in the library |
 | --- | --- | --- |
 | SEP-41 fungible token | Cover units in `Series` (Section 9.1) | A fungible token implementing the SEP-41 interface, with allowance, burn and metadata extensions, that can be embedded in a contract with its own non token logic |
 | Pausable | Guardian scopes (Section 16.2) | A pausable utility that supports several independent scopes and expiring pauses, or can be wrapped to do so |
@@ -2108,7 +2108,7 @@ Deployment is scripted end to end with the Stellar CLI and is the same on testne
 ### 22.1 Repository layout
 
 ```
-anchorline/
+sylox/
   contracts/
     types/            # shared #[contracttype]s
     risk-oracle/
@@ -2153,7 +2153,7 @@ flowchart LR
   P0["Phase 0 data pull<br/>launch assets, liquidity, issuer flags (1.7)"] --> A
 
   subgraph PA["Phase A: data layer"]
-    A["anchorline-types<br/>shared contracttypes (Section 4)"] --> B["RiskOracle<br/>signals, ring buffer, score, bands (5-6)"]
+    A["sylox-types<br/>shared contracttypes (Section 4)"] --> B["RiskOracle<br/>signals, ring buffer, score, bands (5-6)"]
     A --> C["Staking<br/>stakes, probes, bond escrow (7)"]
     A --> T["Treasury<br/>fees, slashed funds, reward pools (12.7)"]
     A -.-> H["adapters/amm-soroswap<br/>adapters/fx-reference (3.3)"]

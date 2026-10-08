@@ -1,6 +1,6 @@
-# Anchorline Protocol
+# Sylox Protocol
 
-Anchorline gives every anchor-issued token on Stellar a public risk score and
+Sylox gives every anchor-issued token on Stellar a public risk score and
 a market where holders can insure against that issuer depegging, freezing
 withdrawals, or failing.
 
@@ -32,7 +32,7 @@ services/
   indexer/           # contract events into queryable history
   api/               # public read-only REST/WebSocket API
 packages/
-  sdk/               # @anchorline/sdk, TypeScript client
+  sdk/               # @sylox/sdk, TypeScript client
   recompute/         # deterministic signal recomputation tool
 deploy/
   testnet.toml, mainnet.toml, deploy.sh
