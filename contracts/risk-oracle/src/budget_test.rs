@@ -1,7 +1,8 @@
-//! Phase 1 resource spike: measures `post_signals` and a Tier 1 style read
-//! against a FULL 240 slot ring buffer, and prints the numbers against the
-//! current network limits. See the PR description for the full report;
-//! this file is the source of every number quoted there.
+//! Resource spike: measures `post_signals` and `score` (the real Tier 1
+//! style read path, not a placeholder) against a FULL 240 slot ring
+//! buffer, and prints the numbers against the current network limits.
+//! See the PR description for the full report; this file is the source
+//! of every number quoted there.
 //!
 //! Run with: `cargo test -p risk-oracle --lib budget -- --nocapture`
 
@@ -14,6 +15,7 @@ use soroban_sdk::{
 use std::println;
 use sylox_types::{AssetConfig, EndpointStatus, IssuerActions, Reference, SignalSet};
 
+use crate::mocks::MockStaking;
 use crate::storage::RING_SLOTS;
 use crate::{RiskOracle, RiskOracleClient};
 
@@ -40,7 +42,7 @@ fn signal_set(env: &Env, epoch: u64, peg_ratio: i128) -> SignalSet {
         liquidity_2pct: 500_000_000_000,
         redemption_net: 10_000_000_000,
         supply: 10_000_000_000_000,
-        supply_change_bps: 12,
+        supply_change_bps: 0,
         issuer_actions: IssuerActions {
             clawbacks: 1,
             clawback_amount: 5_000_000_000,
@@ -53,15 +55,16 @@ fn signal_set(env: &Env, epoch: u64, peg_ratio: i128) -> SignalSet {
     }
 }
 
-/// Registers RiskOracle, initializes it, and adds one enabled asset.
+/// Registers RiskOracle and a mock Staking, initializes RiskOracle
+/// against it, and adds one enabled asset.
 fn setup(env: &Env) -> (RiskOracleClient<'_>, Address) {
     env.mock_all_auths();
+    let staking_id = env.register(MockStaking, ());
     let contract_id = env.register(RiskOracle, ());
     let client = RiskOracleClient::new(env, &contract_id);
     let governor = Address::generate(env);
     let registry = Address::generate(env);
-    let staking = Address::generate(env);
-    client.initialize(&governor, &registry, &staking);
+    client.initialize(&governor, &registry, &staking_id);
 
     let asset = Address::generate(env);
     let issuer = Address::generate(env);
@@ -73,7 +76,10 @@ fn setup(env: &Env) -> (RiskOracleClient<'_>, Address) {
 /// Fills the ring to `RING_SLOTS` consecutive epochs, 1 posting per call,
 /// so the final posting measured below writes into a buffer that already
 /// holds a full set of slots: the steady state every posting after startup
-/// actually pays. Returns the next unused epoch.
+/// actually pays. Each posting uses a supply equal to the previous
+/// epoch's, so the Section 11.3 supply-change consistency check (which
+/// reads the previous epoch's ring slot) never rejects the fill. Returns
+/// the next unused epoch.
 fn warm_full_ring(env: &Env, client: &RiskOracleClient, asset: &Address) -> u64 {
     let keeper = Address::generate(env);
     for epoch in 0..RING_SLOTS as u64 {
@@ -120,32 +126,31 @@ fn budget_post_signals_against_a_full_ring() {
     );
 }
 
-/// A Tier 1 style read: load the ring and compute the same aggregates
-/// Section 6.5 and 8.2 need (24h and 7d aggregates, 168 slot median
-/// liquidity, 72h peg_ratio_p10 window), all from the one `ring(asset)`
-/// read. Calls `RiskOracle::tier1_style_read`, a test-only contract method
-/// that does this computation inside the contract, so the Soroban budget
-/// actually meters it; doing the same arithmetic in test code would only
-/// measure the preceding `ring()` call, since the Soroban budget meters
-/// contract invocations, not native test code (see that method's doc
-/// comment in lib.rs).
+/// The real Tier 1 style read: `score(asset)`, which reads the 168 newest
+/// ring slots via `storage::get_window` and computes all six Section 6.1
+/// components, applies hysteresis and persists the result. This replaced
+/// an earlier `#[cfg(test)]`-only placeholder method that approximated
+/// the same aggregates without being a real, shipped function; now that
+/// `score` exists for real, the budget test measures it directly instead.
 #[test]
-fn budget_tier1_style_read_against_a_full_ring() {
+fn budget_score_against_a_full_ring() {
     let env = Env::default();
     let (client, asset) = setup(&env);
     warm_full_ring(&env, &client, &asset);
 
-    let result = client.tier1_style_read(&asset);
+    let result = client.score(&asset);
     println!("computed: {result:?}");
 
     let estimate = env.cost_estimate();
-    print_resources("tier1 style read, full 240 slot ring", &estimate);
+    print_resources("score (Tier 1 style read), full 240 slot ring", &estimate);
 }
 
 /// Breaks the headline fee down by component. `fee()` uses a hardcoded
 /// mainnet fee snapshot from 2026-07-10 (see its doc comment in
 /// soroban-sdk), which may drift from the live network; this test exists
-/// to show WHERE the fee goes, not to pin an exact total.
+/// to show WHERE the fee goes, not to pin an exact total. See the PR
+/// description for the quickstart-network simulated figure, which is the
+/// number to trust over this one.
 #[test]
 fn budget_post_signals_fee_breakdown() {
     let env = Env::default();
