@@ -935,7 +935,8 @@ fn score_moves_down_after_band_down_epochs_consecutive_qualifying_epochs() {
     let mut flush = signal_set(&env, flush_epoch, sylox_types::SCALE);
     flush.liquidity_2pct = 100_000_000_000;
     flush.supply_change_bps = 0;
-    fx.client.post_signals(&Address::generate(&env), &asset, &flush);
+    fx.client
+        .post_signals(&Address::generate(&env), &asset, &flush);
 
     let result = fx.client.score(&asset);
     assert_ne!(
@@ -1258,7 +1259,14 @@ fn resolve_signal_dispute_disputer_wins_reopens_the_epoch() {
 #[allow(clippy::type_complexity)]
 fn setup_disputed_epoch(
     env: &Env,
-) -> (RiskOracleClient<'_>, Address, Address, Address, Address, Address) {
+) -> (
+    RiskOracleClient<'_>,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
     env.mock_all_auths();
     let staking = env.register(MockStaking, ());
     let governor = env.register(MockGovernor, ());
@@ -1285,8 +1293,7 @@ fn setup_disputed_epoch(
 #[test]
 fn resolve_signal_dispute_timeout_rejects_before_the_ruling_deadline() {
     let env = Env::default();
-    let (client, asset, _staking, _committee, _disputer, _contract_id) =
-        setup_disputed_epoch(&env);
+    let (client, asset, _staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
 
     // Still inside signal_dispute_ruling_secs (7d) from the dispute.
     env.ledger()
@@ -1298,8 +1305,7 @@ fn resolve_signal_dispute_timeout_rejects_before_the_ruling_deadline() {
 #[test]
 fn resolve_signal_dispute_timeout_succeeds_exactly_at_the_deadline() {
     let env = Env::default();
-    let (client, asset, _staking, _committee, _disputer, _contract_id) =
-        setup_disputed_epoch(&env);
+    let (client, asset, _staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
 
     env.ledger()
         .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
@@ -1312,8 +1318,7 @@ fn resolve_signal_dispute_timeout_succeeds_exactly_at_the_deadline() {
 #[test]
 fn resolve_signal_dispute_timeout_releases_the_bond_never_slashes() {
     let env = Env::default();
-    let (client, asset, staking, _committee, _disputer, _contract_id) =
-        setup_disputed_epoch(&env);
+    let (client, asset, staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
 
     env.ledger()
         .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
@@ -1337,8 +1342,7 @@ fn resolve_signal_dispute_timeout_releases_the_bond_never_slashes() {
 #[test]
 fn resolve_signal_dispute_timeout_records_a_committee_miss() {
     let env = Env::default();
-    let (client, asset, _staking, committee, _disputer, contract_id) =
-        setup_disputed_epoch(&env);
+    let (client, asset, _staking, committee, _disputer, contract_id) = setup_disputed_epoch(&env);
 
     env.ledger()
         .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
@@ -1353,8 +1357,7 @@ fn resolve_signal_dispute_timeout_records_a_committee_miss() {
 #[test]
 fn resolve_signal_dispute_timeout_is_permissionless() {
     let env = Env::default();
-    let (client, asset, _staking, _committee, _disputer, _contract_id) =
-        setup_disputed_epoch(&env);
+    let (client, asset, _staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
 
     env.ledger()
         .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
@@ -1379,8 +1382,7 @@ fn resolve_signal_dispute_timeout_rejects_an_epoch_with_no_open_dispute() {
 #[test]
 fn resolve_signal_dispute_timeout_cannot_run_twice() {
     let env = Env::default();
-    let (client, asset, _staking, _committee, _disputer, _contract_id) =
-        setup_disputed_epoch(&env);
+    let (client, asset, _staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
 
     env.ledger()
         .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
@@ -1394,8 +1396,7 @@ fn resolve_signal_dispute_timeout_cannot_run_twice() {
 #[test]
 fn resolve_signal_dispute_timeout_does_not_block_a_committee_ruling_that_arrives_first() {
     let env = Env::default();
-    let (client, asset, _staking, committee, disputer, contract_id) =
-        setup_disputed_epoch(&env);
+    let (client, asset, _staking, committee, disputer, contract_id) = setup_disputed_epoch(&env);
 
     // The committee rules well before the deadline.
     env.ledger().set_timestamp(time_at_epoch(5) + 3_600);
@@ -2044,7 +2045,13 @@ fn backfill_after_an_outage_matches_no_outage() {
 /// entirely) — used by the C6 tests to build a long posting history
 /// with a deliberate gap, without fill_ring_with_constant_signal's
 /// automatic flush/finalize_endpoint call masking the gap.
-fn post_one_healthy_epoch(env: &Env, client: &RiskOracleClient, staking: &Address, asset: &Address, epoch: u64) {
+fn post_one_healthy_epoch(
+    env: &Env,
+    client: &RiskOracleClient,
+    staking: &Address,
+    asset: &Address,
+    epoch: u64,
+) {
     let keeper = Address::generate(env);
     let staking_client = crate::mocks::MockStakingClient::new(env, staking);
     staking_client.set_aggregate(asset, &epoch, &EndpointStatus::Up);
@@ -2080,7 +2087,10 @@ fn finality_keeps_advancing_past_a_permanently_missing_epoch() {
          epoch 100 is permanently missing; got stuck at epoch {}",
         score.epoch
     );
-    assert!(!score.stale, "a score this close to the newest epoch must not read stale");
+    assert!(
+        !score.stale,
+        "a score this close to the newest epoch must not read stale"
+    );
 }
 
 #[test]
@@ -2105,7 +2115,12 @@ fn finality_keeps_advancing_past_an_overturned_epoch_that_is_never_reposted() {
     }
     // Dispute and overturn epoch 100 (disputer wins), then never repost it.
     let disputer = Address::generate(&env);
-    client.dispute_signals(&disputer, &asset, &100, &BytesN::from_array(&env, &[9u8; 32]));
+    client.dispute_signals(
+        &disputer,
+        &asset,
+        &100,
+        &BytesN::from_array(&env, &[9u8; 32]),
+    );
     client.resolve_signal_dispute(&asset, &100, &false, &BytesN::from_array(&env, &[0u8; 32]));
 
     for epoch in 101..230u64 {
@@ -2144,7 +2159,12 @@ fn finality_keeps_advancing_past_an_unresolved_dispute() {
     }
     // Dispute epoch 100 and never resolve it: it stays Disputed forever.
     let disputer = Address::generate(&env);
-    client.dispute_signals(&disputer, &asset, &100, &BytesN::from_array(&env, &[9u8; 32]));
+    client.dispute_signals(
+        &disputer,
+        &asset,
+        &100,
+        &BytesN::from_array(&env, &[9u8; 32]),
+    );
 
     for epoch in 101..230u64 {
         post_one_healthy_epoch(&env, &client, &staking, &asset, epoch);
@@ -2177,8 +2197,7 @@ fn a_frozen_score_must_report_stale_judged_against_its_own_epoch() {
     assert!(!fresh.stale);
     let scored_epoch = fresh.epoch;
 
-    env.ledger()
-        .set_timestamp((scored_epoch + 1 + 200) * 3_600);
+    env.ledger().set_timestamp((scored_epoch + 1 + 200) * 3_600);
     let frozen = fx.client.score(&asset);
     assert!(
         frozen.stale,
@@ -2502,8 +2521,7 @@ fn check_stale_does_not_fire_one_second_before_first_stale_time() {
     }
     let last_epoch = fx.client.score(&asset).epoch;
 
-    env.ledger()
-        .set_timestamp(first_stale_time(last_epoch) - 1);
+    env.ledger().set_timestamp(first_stale_time(last_epoch) - 1);
     assert!(
         !fx.client.check_stale(&asset),
         "one second before first_stale_time, the asset must not read stale yet"
@@ -2526,7 +2544,8 @@ fn check_stale_recovers_silently_then_relapses_with_a_fresh_asset_stale() {
     }
     let first_last_epoch = fx.client.score(&asset).epoch;
 
-    env.ledger().set_timestamp(first_stale_time(first_last_epoch));
+    env.ledger()
+        .set_timestamp(first_stale_time(first_last_epoch));
     assert!(fx.client.check_stale(&asset));
     assert_eq!(
         asset_stale_count(&env, &contract_id, &asset, first_last_epoch),
@@ -2552,9 +2571,15 @@ fn check_stale_recovers_silently_then_relapses_with_a_fresh_asset_stale() {
         // only exposes the LAST invocation's events): none of these,
         // including the one that eventually clears the stale state,
         // may emit asset_stale.
-        assert_eq!(asset_stale_count(&env, &contract_id, &asset, first_last_epoch), 0);
+        assert_eq!(
+            asset_stale_count(&env, &contract_id, &asset, first_last_epoch),
+            0
+        );
     }
-    assert!(!fx.client.score(&asset).stale, "a fresh epoch must clear the stale state");
+    assert!(
+        !fx.client.score(&asset).stale,
+        "a fresh epoch must clear the stale state"
+    );
     let second_last_epoch = fx.client.score(&asset).epoch;
 
     // Relapse: go quiet again, past first_stale_time for the new
@@ -2586,7 +2611,10 @@ fn a_late_backfill_that_is_stale_on_arrival_emits_asset_stale_via_post_signals()
         post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
     }
     let last_epoch = fx.client.score(&asset).epoch;
-    assert!(!fx.client.score(&asset).stale, "sanity check: a real score must exist here");
+    assert!(
+        !fx.client.score(&asset).stale,
+        "sanity check: a real score must exist here"
+    );
     assert!(
         last_epoch < 170,
         "sanity check: last_epoch must be below the never-posted epoch 170"
@@ -2672,9 +2700,8 @@ fn topics_for_event_named(
     env: &Env,
     event_name: &str,
 ) -> Option<std::vec::Vec<soroban_sdk::xdr::ScVal>> {
-    let name_scval = soroban_sdk::xdr::ScVal::Symbol(
-        soroban_sdk::xdr::ScSymbol(event_name.try_into().unwrap()),
-    );
+    let name_scval =
+        soroban_sdk::xdr::ScVal::Symbol(soroban_sdk::xdr::ScSymbol(event_name.try_into().unwrap()));
     for event in env.events().all().events() {
         let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
         if body.topics.get(1) == Some(&name_scval) {
@@ -2822,4 +2849,3 @@ fn every_event_uses_the_sylox_event_name_asset_topic_convention() {
     client.post_signals(&keeper3, &asset3, &s3);
     assert_event_topics(&env, "asset_stale", &asset3);
 }
-

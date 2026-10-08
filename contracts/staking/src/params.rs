@@ -134,8 +134,9 @@ pub const SECONDS_PER_LEDGER: u64 = 5;
 /// against the live network's actual close time only approximately
 /// (an assumption, not an onchain read); see `params_test` for the
 /// bound in seconds this corresponds to.
-pub const PROBE_TTL_LEDGERS: u32 = ((EPOCH_SECS + PROBE_GRACE_SECS + SETTLE_WINDOW_SECS + PROBE_TTL_MARGIN_SECS)
-    / SECONDS_PER_LEDGER) as u32;
+pub const PROBE_TTL_LEDGERS: u32 =
+    ((EPOCH_SECS + PROBE_GRACE_SECS + SETTLE_WINDOW_SECS + PROBE_TTL_MARGIN_SECS)
+        / SECONDS_PER_LEDGER) as u32;
 
 #[cfg(test)]
 // These assertions are provably true at compile time, which is

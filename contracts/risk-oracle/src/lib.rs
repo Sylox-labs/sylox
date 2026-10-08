@@ -333,7 +333,8 @@ impl RiskOracle {
                 }
                 .publish(&env);
             }
-            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS)
+            {
                 recompute_score(&env, &asset, newest_final)?;
             }
         } else {
@@ -357,7 +358,8 @@ impl RiskOracle {
             // epoch, now Empty, without stopping), but a resolution
             // can still be the event that unblocks something later
             // that was waiting on this one, so sweep here too.
-            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS)
+            {
                 recompute_score(&env, &asset, newest_final)?;
             }
         }
@@ -391,9 +393,14 @@ impl RiskOracle {
     /// out exactly as they would from a `keeper_wins: true` ruling,
     /// which is the committee's silence being read as "no evidence
     /// the posting was wrong", not as a loss for either side.
-    pub fn resolve_signal_dispute_timeout(env: Env, asset: Address, epoch: u64) -> Result<(), Error> {
+    pub fn resolve_signal_dispute_timeout(
+        env: Env,
+        asset: Address,
+        epoch: u64,
+    ) -> Result<(), Error> {
         let config = Self::require_config(&env)?;
-        let dispute = storage::get_dispute(&env, &asset, epoch).ok_or(Error::DisputeWindowClosed)?;
+        let dispute =
+            storage::get_dispute(&env, &asset, epoch).ok_or(Error::DisputeWindowClosed)?;
         let now = env.ledger().timestamp();
         if now < dispute.opened_at + SIGNAL_DISPUTE_RULING_SECS {
             return Err(Error::RulingDeadlineNotReached);
