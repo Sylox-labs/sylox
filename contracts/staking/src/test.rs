@@ -1199,6 +1199,86 @@ fn slash_a_keeper_reduces_the_bond_and_splits_50_50() {
     assert_eq!(fx.client.claimable(&fx.treasury), amount - amount / 2);
 }
 
+// -- S5: slash must never pay out more than it actually deducts --
+
+#[test]
+fn slash_a_keeper_below_the_amount_pays_out_only_what_was_actually_held() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let keeper = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    let disputer = Address::generate(&env);
+    // Request more than the keeper's whole bond.
+    let requested = params::KEEPER_BOND + 5_000_000_000;
+
+    fx.client
+        .slash(&keeper, &requested, &Some(disputer.clone()), &BytesN::from_array(&env, &[0u8; 32]));
+
+    // The keeper had exactly KEEPER_BOND; that is all that can ever be
+    // deducted or paid out, regardless of what was requested.
+    assert_eq!(fx.client.keeper(&keeper).unwrap().bond, 0);
+    let actual = params::KEEPER_BOND;
+    assert_eq!(fx.client.claimable(&disputer), actual / 2);
+    assert_eq!(fx.client.claimable(&fx.treasury), actual - actual / 2);
+
+    // S1: the contract's own USDC balance must still cover every
+    // claimable balance it just created. If slash had paid out the
+    // full `requested` amount instead of `actual`, this would fail:
+    // claimable(disputer) + claimable(treasury) would exceed what the
+    // keeper ever deposited.
+    let balance = fx.usdc_client.balance(&fx.contract_id);
+    let liabilities = fx.client.claimable(&disputer) + fx.client.claimable(&fx.treasury);
+    assert!(
+        balance >= liabilities,
+        "S1 violated: balance {} < liabilities {}",
+        balance,
+        liabilities
+    );
+}
+
+#[test]
+fn slash_a_reporter_below_the_amount_pays_out_only_what_was_actually_held() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let reporter = add_and_fund_reporter(&env, &fx, &region(&env, "eu"), params::REPORTER_STAKE);
+    let requested = params::REPORTER_STAKE + 1_000_000_000;
+
+    fx.client
+        .slash(&reporter, &requested, &None, &BytesN::from_array(&env, &[0u8; 32]));
+
+    assert_eq!(fx.client.reporter(&reporter).unwrap().stake, 0);
+    assert_eq!(fx.client.claimable(&fx.treasury), params::REPORTER_STAKE);
+
+    let balance = fx.usdc_client.balance(&fx.contract_id);
+    let liabilities = fx.client.claimable(&fx.treasury);
+    assert!(balance >= liabilities, "S1 violated: balance {} < liabilities {}", balance, liabilities);
+}
+
+#[test]
+fn two_slashes_in_a_row_exceeding_the_bond_in_total_never_overpay() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let keeper = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    let disputer = Address::generate(&env);
+
+    // First slash takes most of the bond.
+    let first = params::KEEPER_BOND - 1_000_000_000;
+    fx.client
+        .slash(&keeper, &first, &Some(disputer.clone()), &BytesN::from_array(&env, &[0u8; 32]));
+    assert_eq!(fx.client.keeper(&keeper).unwrap().bond, 1_000_000_000);
+
+    // Second slash requests more than what remains.
+    let second_requested = 5_000_000_000;
+    fx.client
+        .slash(&keeper, &second_requested, &Some(disputer.clone()), &BytesN::from_array(&env, &[0u8; 32]));
+    assert_eq!(fx.client.keeper(&keeper).unwrap().bond, 0);
+
+    let total_actual = params::KEEPER_BOND;
+    let balance = fx.usdc_client.balance(&fx.contract_id);
+    let liabilities = fx.client.claimable(&disputer) + fx.client.claimable(&fx.treasury);
+    assert_eq!(liabilities, total_actual);
+    assert!(balance >= liabilities, "S1 violated: balance {} < liabilities {}", balance, liabilities);
+}
+
 #[test]
 fn slash_a_reporter_with_no_winner_sends_the_full_amount_to_the_treasury() {
     let env = Env::default();
