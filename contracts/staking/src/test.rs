@@ -199,6 +199,16 @@ fn add_keeper_rejects_a_duplicate() {
 }
 
 #[test]
+fn add_keeper_rejects_an_address_already_registered_as_a_reporter() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let who = Address::generate(&env);
+    fx.client.add_reporter(&who, &region(&env, "eu"));
+    let result = fx.client.try_add_keeper(&who);
+    assert_eq!(result, Err(Ok(Error::RoleConflict)));
+}
+
+#[test]
 fn remove_keeper_rejects_an_unregistered_address() {
     let env = Env::default();
     let fx = setup(&env);
@@ -238,6 +248,16 @@ fn add_reporter_rejects_a_duplicate() {
     fx.client.add_reporter(&reporter, &region(&env, "eu"));
     let result = fx.client.try_add_reporter(&reporter, &region(&env, "us"));
     assert_eq!(result, Err(Ok(Error::AlreadyRegistered)));
+}
+
+#[test]
+fn add_reporter_rejects_an_address_already_registered_as_a_keeper() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let who = Address::generate(&env);
+    fx.client.add_keeper(&who);
+    let result = fx.client.try_add_reporter(&who, &region(&env, "eu"));
+    assert_eq!(result, Err(Ok(Error::RoleConflict)));
 }
 
 #[test]
@@ -385,7 +405,7 @@ fn unstake_rejects_a_keeper_with_an_open_dispute() {
     fx.client.unstake_request(&keeper, &params::KEEPER_BOND);
     env.ledger().set_timestamp(params::UNSTAKE_COOLDOWN_SECS);
     let result = fx.client.try_unstake(&keeper);
-    assert_eq!(result, Err(Ok(Error::Suspended)));
+    assert_eq!(result, Err(Ok(Error::DisputesOpen)));
 }
 
 // -- withdraw_keeper_bond --
@@ -439,7 +459,7 @@ fn withdraw_keeper_bond_fails_until_an_open_dispute_resolves_then_succeeds() {
     fx.client.remove_keeper(&keeper);
     env.ledger().set_timestamp(params::KEEPER_EXIT_DELAY_SECS);
     let result = fx.client.try_withdraw_keeper_bond(&keeper);
-    assert_eq!(result, Err(Ok(Error::Suspended)));
+    assert_eq!(result, Err(Ok(Error::DisputesOpen)));
 
     fx.client.release_bond(&key);
     let paid = fx.client.withdraw_keeper_bond(&keeper);
@@ -475,7 +495,7 @@ fn keeper_removed_then_a_new_dispute_arrives_still_blocks_withdrawal() {
         .lock_bond(&key, &disputer, &params::KEEPER_BOND, &Some(keeper.clone()));
 
     let result = fx.client.try_withdraw_keeper_bond(&keeper);
-    assert_eq!(result, Err(Ok(Error::Suspended)));
+    assert_eq!(result, Err(Ok(Error::DisputesOpen)));
 }
 
 #[test]

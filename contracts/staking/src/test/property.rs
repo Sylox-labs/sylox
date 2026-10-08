@@ -43,6 +43,12 @@ enum Op {
     FundRewards,
     ClaimRewards,
     AdvanceTime(u16),
+    /// Review fix S5: `amount` is drawn from a range that regularly
+    /// exceeds `KEEPER_BOND`/`REPORTER_STAKE` (up to 3x either), so
+    /// this property actually exercises the overpay path `slash`
+    /// used to have, not just in-range amounts that could never have
+    /// caught it.
+    Slash(u8, i128),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -58,6 +64,7 @@ fn op() -> impl Strategy<Value = Op> {
         Just(Op::FundRewards),
         Just(Op::ClaimRewards),
         (0u16..7_300).prop_map(Op::AdvanceTime),
+        (0u8..2, 0i128..(3 * params::KEEPER_BOND)).prop_map(|(w, a)| Op::Slash(w, a)),
     ]
 }
 
@@ -200,6 +207,15 @@ proptest! {
                     if new_epoch > current_epoch {
                         current_epoch = new_epoch;
                     }
+                }
+                Op::Slash(which, amount) => {
+                    let target = if which % 2 == 0 { &keeper } else { &r1 };
+                    let _ = fx.client.try_slash(
+                        target,
+                        &amount,
+                        &Some(disputer.clone()),
+                        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+                    );
                 }
             }
 

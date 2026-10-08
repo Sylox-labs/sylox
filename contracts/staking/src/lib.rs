@@ -117,6 +117,12 @@ impl Staking {
         if storage::get_keeper(&env, &keeper).is_some() {
             return Err(Error::AlreadyRegistered);
         }
+        if storage::get_reporter(&env, &keeper).is_some() {
+            // Review fix S6: one role per address, so slash (and
+            // every other keeper-or-reporter branch) always has
+            // exactly one target.
+            return Err(Error::RoleConflict);
+        }
         storage::set_keeper(
             &env,
             &keeper,
@@ -160,6 +166,10 @@ impl Staking {
         config.governor.require_auth();
         if storage::get_reporter(&env, &reporter).is_some() {
             return Err(Error::AlreadyRegistered);
+        }
+        if storage::get_keeper(&env, &reporter).is_some() {
+            // Review fix S6: see add_keeper's own check above.
+            return Err(Error::RoleConflict);
         }
         storage::set_reporter(
             &env,
@@ -308,7 +318,11 @@ impl Staking {
                 return Err(Error::UnstakeCooldown);
             }
             if keeper.open_dispute_count > 0 {
-                return Err(Error::Suspended);
+                // Review fix S7: a dedicated code, distinct from
+                // Suspended (a fault/evidence outcome). This keeper
+                // is not suspended; its funds are still needed as
+                // collateral for an open dispute.
+                return Err(Error::DisputesOpen);
             }
             let amount = keeper.bond;
             keeper.bond = 0;
@@ -369,7 +383,8 @@ impl Staking {
             return Err(Error::UnstakeCooldown);
         }
         if info.open_dispute_count > 0 {
-            return Err(Error::Suspended);
+            // Review fix S7: see unstake's own comment above.
+            return Err(Error::DisputesOpen);
         }
         let amount = info.bond;
         info.bond = 0;
@@ -525,7 +540,7 @@ impl Staking {
     /// one) manufacture a majority by letting everyone else's probe
     /// expire first.
     pub fn settle_probes(env: Env, asset: Address, epoch: u64) -> Result<(), Error> {
-        Self::require_config(&env)?;
+        let config = Self::require_config(&env)?;
         if storage::get_probes_settled(&env, &asset, epoch) {
             return Err(Error::AlreadySettled);
         }
@@ -563,7 +578,7 @@ impl Staking {
                 }
                 rewarded += 1;
             } else if majority_size >= params::FAULT_MAJORITY_THRESHOLD {
-                Self::record_fault(&env, &reporter, now);
+                Self::record_fault(&env, &reporter, now, &config.treasury);
                 faulted += 1;
             }
         }
@@ -600,7 +615,7 @@ impl Staking {
     /// outside `FAULT_WINDOW_SECS` first, then slashes and suspends if
     /// the pruned, incremented count exceeds `REPORTER_MAX_FAULTS`
     /// (Section 7.5).
-    fn record_fault(env: &Env, reporter: &Address, now: u64) {
+    fn record_fault(env: &Env, reporter: &Address, now: u64, treasury: &Address) {
         let Some(mut info) = storage::get_reporter(env, reporter) else {
             return;
         };
@@ -614,28 +629,44 @@ impl Staking {
         info.fault_times = fault_times;
 
         if info.fault_times.len() > params::REPORTER_MAX_FAULTS && !info.suspended {
+            // `slash_amount` is a percentage (REPORTER_SLASH_BPS <=
+            // 10_000) of `info.stake` itself, so it can never exceed
+            // `info.stake`: no `min`/overpay risk here the way
+            // `slash`'s caller-supplied `amount` has (review fix S5).
+            // `checked_sub` still replaces the previous
+            // `saturating_sub`, per the review's "remove
+            // saturating_sub from every money path" instruction, even
+            // though it cannot actually underflow given the above.
             let slash_amount = info.stake * params::REPORTER_SLASH_BPS / 10_000;
-            info.stake = info.stake.saturating_sub(slash_amount);
+            info.stake = info
+                .stake
+                .checked_sub(slash_amount)
+                .expect("slash_amount is bounded by info.stake; cannot underflow");
             info.suspended = true;
             storage::set_reporter(env, reporter, &info);
-            let half = slash_amount / 2;
-            let to_treasury = slash_amount - half;
             // No bonded counterparty for a fault slash (Section 7.5
             // gives the split as 50/50 winner/Treasury, but a fault is
             // not a dispute with a winner): the whole amount goes to
             // the Treasury address, mirroring the "no bonded
             // counterparty... 100% goes to the Treasury" rule Section
             // 7.8 states for the analogous case on bond forfeits.
+            // Review fix (found alongside S5): this credit was
+            // previously missing entirely (`let _ = to_treasury;`
+            // discarded it) -- the slashed stake was deducted but
+            // never reached anyone, an S1-adjacent bug of its own
+            // (not an overpay, but a silent loss from the tracked
+            // liabilities side).
+            storage::add_claimable(env, treasury, slash_amount);
             events::Slashed {
                 who: reporter.clone(),
                 amount: slash_amount,
+                requested_amount: slash_amount,
                 winner: None,
                 to_treasury: slash_amount,
                 reason: BytesN::from_array(env, &[0u8; 32]),
                 suspended: true,
             }
             .publish(env);
-            let _ = to_treasury;
         } else {
             storage::set_reporter(env, reporter, &info);
         }
@@ -770,11 +801,28 @@ impl Staking {
     ) -> Result<(), Error> {
         let config = Self::require_config(&env)?;
         Self::require_slash_caller(&env, &config)?;
+        if amount <= 0 {
+            // A non-positive amount is never a real slash (review fix
+            // S5, found while fixing the overpay bug): without this
+            // check, `amount.min(remaining)` below would return a
+            // negative `actual`, and `bond -= actual` would INCREASE
+            // the bond rather than reduce it.
+            return Err(Error::StakeTooLow);
+        }
         let now = env.ledger().timestamp();
 
         let suspended;
+        // S1 (review fix S5): never deduct or pay out more than `who`
+        // actually holds. `actual` is the amount genuinely taken;
+        // every downstream credit (`to_winner`/`to_treasury`) is
+        // computed from `actual`, never from the caller's requested
+        // `amount`, so a request exceeding the remaining balance is
+        // capped down rather than overpaid from other participants'
+        // funds.
+        let actual;
         if let Some(mut keeper) = storage::get_keeper(&env, &who) {
-            keeper.bond = keeper.bond.saturating_sub(amount);
+            actual = amount.min(keeper.bond);
+            keeper.bond -= actual;
             // Section 7.5, 7.8: `keeper_slash` on a lost signal
             // dispute counts as one fault; suspension follows
             // `KEEPER_MAX_FAULTS` in `FAULT_WINDOW_SECS`, the same
@@ -793,25 +841,27 @@ impl Staking {
             suspended = keeper.suspended;
             storage::set_keeper(&env, &who, &keeper);
         } else if let Some(mut reporter) = storage::get_reporter(&env, &who) {
-            reporter.stake = reporter.stake.saturating_sub(amount);
+            actual = amount.min(reporter.stake);
+            reporter.stake -= actual;
             suspended = reporter.suspended;
             storage::set_reporter(&env, &who, &reporter);
         } else {
             return Err(Error::NotKeeper);
         }
 
-        let (to_winner, to_treasury) = split_half(amount);
+        let (to_winner, to_treasury) = split_half(actual);
         if let Some(winner_addr) = &winner {
             storage::add_claimable(&env, winner_addr, to_winner);
             storage::add_claimable(&env, &config.treasury, to_treasury);
         } else {
-            storage::add_claimable(&env, &config.treasury, amount);
+            storage::add_claimable(&env, &config.treasury, actual);
         }
 
-        let to_treasury_final = if winner.is_some() { to_treasury } else { amount };
+        let to_treasury_final = if winner.is_some() { to_treasury } else { actual };
         events::Slashed {
             who,
-            amount,
+            amount: actual,
+            requested_amount: amount,
             winner,
             to_treasury: to_treasury_final,
             reason,

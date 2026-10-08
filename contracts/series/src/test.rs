@@ -9,5 +9,5 @@ fn deposit_is_not_yet_implemented() {
     let contract_id = env.register(Series, ());
     let client = SeriesClient::new(&env, &contract_id);
     let seller = Address::generate(&env);
-    client.deposit(&seller, &1_000_0000000);
+    client.deposit(&seller, &10_000_000_000);
 }

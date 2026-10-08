@@ -95,7 +95,16 @@ pub struct BondForfeited {
 pub struct Slashed {
     #[topic]
     pub who: Address,
+    /// The amount actually deducted from `who`'s bond or stake and
+    /// split between `winner`/`to_treasury` below. Never exceeds what
+    /// `who` actually held at the time (S1, review fix S5): a caller
+    /// requesting more than that gets `amount == requested_amount`
+    /// capped down, not the request honored past what exists.
     pub amount: i128,
+    /// The amount the caller asked `slash` to take, before capping
+    /// against `who`'s actual remaining balance. Equal to `amount`
+    /// unless the request exceeded what `who` held.
+    pub requested_amount: i128,
     pub winner: Option<Address>,
     pub to_treasury: i128,
     pub reason: BytesN<32>,

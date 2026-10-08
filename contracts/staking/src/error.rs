@@ -80,4 +80,16 @@ pub enum Error {
     /// `SignalDispute` key requires `Some(keeper)`, an event bond kind
     /// requires `None` (lead decision, feat/staking).
     InvalidBondSubject = 318,
+    /// Review fix S6: `add_keeper` for an address already registered
+    /// as a reporter, or `add_reporter` for an address already
+    /// registered as a keeper. One role per address, so `slash` (and
+    /// every other keeper-or-reporter branch in this contract) always
+    /// has exactly one target to act on for a given address.
+    RoleConflict = 319,
+    /// Review fix S7: `unstake`/`withdraw_keeper_bond` called for a
+    /// keeper with `open_dispute_count > 0`. Distinct from
+    /// `Suspended` (a fault/evidence outcome, a different condition):
+    /// this keeper is not suspended, its funds are simply still
+    /// needed as collateral for a dispute that has not resolved yet.
+    DisputesOpen = 320,
 }
