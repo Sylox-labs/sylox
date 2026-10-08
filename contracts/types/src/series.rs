@@ -1,4 +1,6 @@
-use soroban_sdk::{contracttype, Address, BytesN};
+use soroban_sdk::{contracttype, Address, Map};
+
+use crate::EventKind;
 
 /// Fixed terms for one protection series. technical-doc.md Section 4.4.
 /// Immutable once a series is opened (invariant I11).
@@ -6,8 +8,11 @@ use soroban_sdk::{contracttype, Address, BytesN};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeriesTerms {
     pub asset: Address,
-    pub event_def_hash: BytesN<32>,
-    /// USDC SAC.
+    /// One pinned definition version per covered event kind. The keys are
+    /// the kinds the series covers; each value must be the canonical
+    /// version for `(asset, kind)` when the series opens (ADR-001).
+    pub def_versions: Map<EventKind, u32>,
+    /// USDC SAC. Must differ from `asset` and must not share its issuer.
     pub settlement: Address,
     pub start: u64,
     /// start + 30 or 90 days.

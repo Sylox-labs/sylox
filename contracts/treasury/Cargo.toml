@@ -1,5 +1,5 @@
 [package]
-name = "reporter-staking"
+name = "treasury"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
