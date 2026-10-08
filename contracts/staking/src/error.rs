@@ -92,4 +92,10 @@ pub enum Error {
     /// this keeper is not suspended, its funds are simply still
     /// needed as collateral for a dispute that has not resolved yet.
     DisputesOpen = 320,
+    /// PR #7 approval fix: `lock_bond` called with `amount <= 0`. A
+    /// zero (or negative) bond would still increment the subject
+    /// keeper's `open_dispute_count` without ever locking any real
+    /// collateral, leaving that counter permanently out of sync with
+    /// what `release_bond`/`forfeit_bond` could ever actually settle.
+    InvalidAmount = 321,
 }

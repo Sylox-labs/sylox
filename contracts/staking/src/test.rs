@@ -1041,6 +1041,30 @@ fn lock_bond_requires_oracle_auth_for_a_signal_dispute_key() {
 }
 
 #[test]
+fn lock_bond_rejects_a_non_positive_amount_and_does_not_touch_open_dispute_count() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let disputer = Address::generate(&env);
+    let keeper = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    let key = BondKey::SignalDispute(asset, 0);
+
+    let result = fx.client.try_lock_bond(&key, &disputer, &0, &Some(keeper.clone()));
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+
+    let negative_result = fx.client.try_lock_bond(&key, &disputer, &-1, &Some(keeper.clone()));
+    assert_eq!(negative_result, Err(Ok(Error::InvalidAmount)));
+
+    // The approval fix's own concern: a rejected zero/negative amount
+    // must never have incremented the subject keeper's
+    // open_dispute_count, which release_bond/forfeit_bond could then
+    // never actually settle back down (no bond was ever recorded for
+    // them to act on).
+    assert_eq!(fx.client.keeper(&keeper).unwrap().open_dispute_count, 0);
+    assert_eq!(fx.client.bond(&key), None);
+}
+
+#[test]
 fn lock_bond_rejects_a_duplicate_key() {
     let env = Env::default();
     let fx = setup(&env);

@@ -692,6 +692,13 @@ impl Staking {
         let config = Self::require_config(&env)?;
         Self::require_bond_caller(&env, &config, &key)?;
         Self::require_valid_subject(&key, &subject)?;
+        if amount <= 0 {
+            // PR #7 approval fix: without this, a zero (or negative)
+            // bond would still increment the subject keeper's
+            // open_dispute_count below, with no real collateral ever
+            // locked to justify it.
+            return Err(Error::InvalidAmount);
+        }
         if storage::get_bond(&env, &key).is_some() {
             return Err(Error::BondExists);
         }
