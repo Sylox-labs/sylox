@@ -119,6 +119,66 @@ Every external read goes through an **adapter** with a fixed interface, so a dep
 
 Testnet uses real mainnet signals so the feed is meaningful before launch; testnet USDC is used for collateral and payouts.
 
+### 3.5 Repository and module map
+
+The repository is a single Cargo workspace (Section 22.1) plus independent offchain services. Every contract crate depends on one shared types crate so encodings never drift; nothing depends on a contract crate except its own tests and the offchain services that call it over RPC.
+
+```mermaid
+flowchart TB
+  subgraph WS["Cargo workspace: contracts/"]
+    TY[anchorline-types<br/>rlib, shared contracttypes]
+    RO[risk-oracle]
+    ER[event-registry]
+    RS[reporter-staking]
+    MF[market-factory]
+    SE[series]
+    GV[governor]
+    AD1[adapters/amm-soroswap]
+    AD2[adapters/fx-reference]
+  end
+
+  TY --> RO
+  TY --> ER
+  TY --> RS
+  TY --> MF
+  TY --> SE
+  TY --> GV
+
+  RO -. cross contract call .-> AD1
+  RO -. cross contract call .-> AD2
+  RO -. contract address .-> ER
+  RS -. contract address .-> RO
+  ER -. contract address .-> SE
+  MF -. deploys from Wasm hash .-> SE
+  MF -. contract address .-> RO
+  MF -. contract address .-> ER
+
+  subgraph SVC["services/ (offchain, independent processes)"]
+    KP[keeper]
+    RN[reporter-node]
+    IX[indexer]
+    API[api]
+  end
+
+  subgraph PKG["packages/"]
+    SDK[sdk]
+    RC[recompute]
+  end
+
+  KP -- "post_signals via RPC" --> RO
+  RN -- "submit_probe via RPC" --> RS
+  IX -- "getEvents via RPC" --> RO
+  IX -- "getEvents via RPC" --> ER
+  IX -- "getEvents via RPC" --> SE
+  API -- reads --> IX
+  SDK -- "wraps generated bindings for" --> RO
+  SDK -- "wraps generated bindings for" --> ER
+  SDK -- "wraps generated bindings for" --> SE
+  KP -. "same recompute library" .-> RC
+```
+
+Solid arrows are compile time (Cargo) dependencies; dashed arrows are runtime cross contract calls or RPC calls, not Cargo dependencies. No service is trusted for payouts (Section 18): everything a service posts is checked or disputable onchain, which is why the diagram has no arrow from a service into `Series`.
+
 ## 4. Core data model
 
 All shared types live in a `anchorline-types` crate imported by every contract, so encodings never drift between contracts. Types are `#[contracttype]` unless noted.
@@ -298,6 +358,61 @@ The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by 
 - Any keeper may post for any asset; the first valid posting for an epoch wins and earns `keeper_reward` from the protocol fee pool.
 - Reference keeper implementation is open source (Section 18), so third parties can run one.
 
+### 5.7 Signal lifecycle
+
+Every epoch's `SignalSet` moves through the same three states, independent of every other epoch. `Final` is a precondition for a Tier 1 credit event check (Section 8.2); a signal that is still `Pending` cannot trigger one.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Pending: post_signals passes checks (5.3.2-5.3.3)
+  Pending --> Final: signal_dispute_secs elapses, unchallenged
+  Pending --> Disputed: dispute_signals (5.4)
+  Disputed --> Final: resolve_signal_dispute, keeper_wins = true
+  Disputed --> Overturned: resolve_signal_dispute, keeper_wins = false
+  Overturned --> [*]: epoch re-opened for posting
+  Final --> [*]
+```
+
+The posting and dispute flow as a call sequence, matching Sections 5.3 and 5.4 step for step:
+
+```mermaid
+sequenceDiagram
+  participant Keeper
+  participant Store as Object storage (inputs bundle)
+  participant Oracle as RiskOracle
+  participant AMM as AMM adapter
+  participant Disputer
+  participant Committee
+
+  Keeper->>Store: upload inputs bundle
+  Store-->>Keeper: content hash
+  Keeper->>Oracle: post_signals(asset, signal_set { inputs_hash })
+  Oracle->>Oracle: check keeper bonded + active, epoch current/previous, sanity bounds (11.3)
+  Oracle->>AMM: spot_price(asset) [if adapter configured]
+  AMM-->>Oracle: (price, liquidity)
+  Oracle->>Oracle: reject if |peg_ratio - price| > amm_tolerance_bps and liquidity >= min_liquidity
+  Oracle-->>Keeper: signals_posted event, state = Pending
+
+  alt no dispute within signal_dispute_secs
+    Oracle->>Oracle: state = Final (anyone can call, or lazily on next read)
+    Oracle-->>Keeper: signals_final event
+  else disputed
+    Disputer->>Oracle: dispute_signals(asset, epoch, alt_hash) + bond
+    Oracle-->>Disputer: signals_disputed event, state = Disputed
+    Committee->>Committee: run anchorline-recompute on both bundles
+    Committee->>Oracle: resolve_signal_dispute(asset, epoch, keeper_wins, reason)
+    alt keeper_wins
+      Oracle->>Oracle: state = Final, disputer forfeits bond (50% to protocol, 50% to keeper)
+      Oracle-->>Keeper: signals_resolved event
+    else disputer_wins
+      Oracle->>Oracle: state = Overturned, slash keeper by keeper_slash, suspend after keeper_max_faults
+      Oracle-->>Disputer: signals_resolved event, disputer's bond returned plus 50% of keeper's forfeit
+    end
+  end
+```
+
+Note on the sequence above: Section 5.4's forfeiture rule is symmetric by role, not fixed to one side — whoever loses the dispute forfeits their bond, split 50% to the winner and 50% to the protocol treasury. The diagram's `alt` branches show each direction explicitly so the asymmetry (keeper also gets `keeper_slash`'d and risks suspension; a losing disputer only forfeits their dispute bond) is visible at a glance.
+
 ## 6. Risk score
 
 The score is a weighted sum of six component scores, each 0 to 100, computed onchain from the latest `SignalSet`. Formula version 1 is below; weights and targets are governance parameters, versioned so history stays comparable.
@@ -397,6 +512,65 @@ Reporters submit `submit_probe(reporter, report)` with `reporter.require_auth()`
 
 v1 reporters are permissioned by governance (target 5 to 9, from different organizations and regions). Open registration with higher stakes is a v2 item.
 
+### 7.7 Reporter lifecycle and probe aggregation
+
+A reporter's own state (separate from any one probe) moves between four states based on stake and fault history (Sections 7.5, 12.3):
+
+```mermaid
+stateDiagram-v2
+  [*] --> Registered: add_reporter (governor)
+  Registered --> Staked: stake >= reporter_stake
+  Staked --> Staked: submit_probe each epoch
+  Staked --> Suspended: faults > reporter_max_faults in 30d, or false evidence ruling
+  Staked --> Unstaking: unstake_request (cooldown starts)
+  Unstaking --> [*]: unstake, after cooldown
+  Suspended --> Staked: governor re-adds, re-stake
+  Suspended --> [*]: remove_reporter
+```
+
+Each epoch, every active reporter probes independently and the contract resolves one aggregate status from however many reports arrive:
+
+```mermaid
+sequenceDiagram
+  participant R1 as Reporter (eu)
+  participant R2 as Reporter (us)
+  participant R3 as Reporter (af)
+  participant Anchor as Anchor's stellar.toml / transfer server
+  participant Staking as ReporterStaking
+  participant Oracle as RiskOracle
+
+  par independent probes, every probe_secs
+    R1->>Anchor: GET stellar.toml, GET /info (7.1)
+    Anchor-->>R1: status, latency
+    R1->>Staking: submit_probe(asset, epoch, status, region="eu", evidence_hash)
+  and
+    R2->>Anchor: GET stellar.toml, GET /info
+    Anchor-->>R2: status, latency
+    R2->>Staking: submit_probe(asset, epoch, status, region="us", evidence_hash)
+  and
+    R3->>Anchor: GET stellar.toml, GET /info
+    Anchor-->>R3: status, latency
+    R3->>Staking: submit_probe(asset, epoch, status, region="af", evidence_hash)
+  end
+
+  Note over Staking: after epoch closes, needs >= min_reporters from >= 2 regions
+  alt strict majority on one status
+    Staking->>Staking: aggregate = that status
+  else no majority
+    Staking->>Staking: aggregate = Degraded (7.4)
+  end
+
+  alt keeper posts before aggregation is pulled
+    Oracle->>Staking: read aggregate during post_signals
+  else no keeper posting yet
+    Anyone->>Staking: finalize_endpoint(asset, epoch)
+  end
+  Staking-->>Oracle: EndpointStatus written into SignalSet.endpoint
+
+  Staking->>Staking: reporters matching aggregate earn reward share (7.5)
+  Staking->>Staking: reporters disagreeing with a 3+ majority accrue one fault
+```
+
 ## 8. Credit Event Registry
 
 `EventRegistry` is the only contract that can move an asset into the Declared state, and Declared is the only state that releases payouts. Each event moves through a fixed state machine; every transition is permissionless to trigger, but bonded and time locked.
@@ -467,6 +641,44 @@ Series contracts do not get pushed a message; they **pull** status via `event_st
 
 An event covers a series if: the series' `asset` matches; the event `kind` is in the series' `EventDefinition.kinds`; and `proposed_at` falls inside `[series.start, series.expiry]`. Using `proposed_at` (not `declared_at`) means cover bought before a failure still pays if the ruling lands after expiry.
 
+### 8.7 End to end: Tier 1 depeg to a buyer's payout
+
+This traces one concrete path through the state machine in Section 8's diagram: an uncontested Tier 1 proposal declared after its challenge window, then a series pulling that status to pay out a buyer. Tier 2 (bonded challenge, committee escalation) and Tier 3 (direct committee ruling) replace the middle section only; the pull based settlement at the end is identical for every tier.
+
+```mermaid
+sequenceDiagram
+  participant Oracle as RiskOracle
+  participant Registry as EventRegistry
+  participant Series as Series (covers this asset)
+  participant Buyer
+
+  Note over Oracle: 72h of Final signals already show peg_ratio < depeg_threshold (8.2)
+  Buyer->>Registry: propose_tier1(asset, Depeg)
+  Registry->>Oracle: read Final SignalSets for depeg_window_secs
+  Registry->>Registry: check passes (8.2), state = Proposed, emit event_proposed
+  Series->>Series: buy_cover blocked while Proposed (9.4 step 2)
+
+  Note over Registry: challenge_secs elapses, no challenge posted
+  Anyone->>Registry: finalize(event_id)
+  Registry->>Registry: state = Declared, declared_at = now
+  Registry->>Oracle: set_event_band(asset)
+  Registry-->>Anyone: event_declared { event_id, kind, proposed_at, declared_at }
+
+  Note over Series: no message is pushed, Series learns on its own next call (8.5)
+  Anyone->>Series: trigger()
+  Series->>Series: sync_state()
+  Series->>Registry: event_status(asset)
+  Registry-->>Series: Declared(event_id, Depeg, proposed_at, declared_at)
+  Series->>Series: check covers(event_id, event_def_hash, start, expiry) (8.6)
+  Series->>Series: state = Triggered, record event_id
+  Series-->>Anyone: triggered { event_id }
+
+  Buyer->>Series: claim(holder, amount)
+  Series->>Series: burn amount cover units from holder
+  Series->>Buyer: transfer amount USDC
+  Series-->>Buyer: claimed { amount }
+```
+
 ## 9. Protection Markets
 
 Each `Series` contract is a self contained market: sellers deposit USDC and post quotes, buyers fill those quotes to receive fungible cover units (1 unit pays 1 USDC on a covered event), and every unit of cover is backed by one unit of the seller's locked collateral at all times.
@@ -520,6 +732,43 @@ stateDiagram-v2
 5. Walk quotes from cheapest; skip any with `rate_bps > max_rate_bps`; fill until `amount` or quotes run out. For each fill, compute the premium (Section 10), add `fill` to the seller's `cover_written` and the premium net of fee to `premium_earned`.
 6. Transfer total premium from buyer to the series (USDC); transfer the fee part to the treasury; mint `filled` cover units to the buyer.
 7. Emit `CoverBought`. Partial fills are allowed; the caller sees `filled < amount`.
+
+Call sequence for the steps above, using the two seller example from Section 10.5 (Seller A quotes 400 bps, Seller B quotes 300 bps; buyer walks the book cheapest first):
+
+```mermaid
+sequenceDiagram
+  participant Buyer
+  participant Series
+  participant Factory as MarketFactory
+  participant Oracle as RiskOracle
+  participant Registry as EventRegistry
+  participant AssetSAC as Issued asset SAC
+  participant USDC as USDC SAC
+
+  Buyer->>Series: buy_cover(amount, max_rate_bps)
+  Series->>Series: require_auth(buyer), sync_state(), check state == Open
+  Series->>Oracle: is_stale(asset), band(asset)
+  Series->>Registry: event_status(asset)
+  Series->>Series: reject if stale, band in {Distress, Event}, or event in progress (step 2)
+
+  Series->>Factory: open_cover(asset), cover_cap(asset)
+  Series->>Series: check series cap and max_cover_per_buyer (step 3)
+
+  opt require_holding
+    Series->>AssetSAC: balance(buyer)
+    Series->>Series: check balance * peg_ratio >= resulting cover (step 4)
+  end
+
+  Series->>Series: walk quotes cheapest first (step 5)
+  Note over Series: fills 50,000 from Seller B @ 300 bps, then 30,000 from Seller A @ 400 bps
+  Series->>Series: compute premium per fill (10.1), credit each seller's premium_earned net of fee
+
+  Buyer->>USDC: approve / transfer total premium to Series
+  Series->>USDC: transfer fee share to treasury
+  Series->>Series: mint filled cover units to buyer (step 6)
+  Series->>Factory: reserve_cover(asset, filled)
+  Series-->>Buyer: cover_bought { filled, premium, fee, fills: [(B, 50000, 300), (A, 30000, 400)] }
+```
 
 ### 9.5 Triggering and claiming
 
@@ -982,6 +1231,47 @@ pub enum Action {
 
 Queued actions expire if not executed within `grace_secs` (default 14 days) after their ETA.
 
+Every `Action` goes through the same four states regardless of timelock length:
+
+```mermaid
+stateDiagram-v2
+  [*] --> Queued: queue(proposer, action)
+  Queued --> Queued: approve(signer) [below threshold]
+  Queued --> Approved: approve(signer) [threshold met]
+  Approved --> Executed: execute() [after timelock ETA]
+  Queued --> Cancelled: cancel() [threshold of signers]
+  Approved --> Cancelled: cancel()
+  Approved --> Expired: ETA + grace_secs passes, never executed
+  Executed --> [*]
+  Cancelled --> [*]
+  Expired --> [*]
+```
+
+As a call sequence for a representative `SetParam` change (7 day timelock, Section 17.2):
+
+```mermaid
+sequenceDiagram
+  participant P as Proposer (signer)
+  participant S2 as Signer 2
+  participant S3 as Signer 3
+  participant Gov as Governor
+  participant Target as Target contract
+
+  P->>Gov: queue(proposer, SetParam("liquidity_cover_ratio", 3_000_000))
+  Gov-->>P: action_queued { action_id, eta = now + 7d }
+  P->>Gov: approve(P, action_id)
+  S2->>Gov: approve(S2, action_id)
+  Note over Gov: threshold (4 of 7) not yet met
+  S3->>Gov: approve(S3, action_id)
+  Note over Gov: threshold met, state = Approved
+
+  Note over Gov: wait until eta (7 days)
+  Anyone->>Gov: execute(action_id)
+  Gov->>Gov: check threshold met and now >= eta
+  Gov->>Target: apply the parameter change
+  Gov-->>Anyone: action_executed { action_id, eta }
+```
+
 ### 17.3 Upgrades
 
 - Core contracts (`RiskOracle`, `EventRegistry`, `ReporterStaking`, `MarketFactory`, `Governor`) expose `upgrade(wasm_hash)`, callable only by the governor, which calls `env.deployer().update_current_contract_wasm(hash)`.
@@ -1261,6 +1551,61 @@ anchorline/
 6. Start keeper, reporter nodes, indexer and API; wait for at least `stale_after_epochs` clean epochs.
 7. Through governor: open the first series.
 8. Publish all contract ids and Wasm hashes in the docs and the repo `deployments/` file.
+
+### 22.2a Build sequence
+
+Deployment order (22.2) is the order contracts are *invoked* on a live network; it assumes every contract already exists. Build order is the order they get *written and tested*, and it is driven by the dependency graph in Section 3.5: a contract can only be implemented once the things it reads from compile.
+
+```mermaid
+flowchart LR
+  A["anchorline-types<br/>shared contracttypes (Section 4)"] --> B["RiskOracle<br/>signals, score, bands (5-6)"]
+  B --> C["ReporterStaking<br/>probes feed into SignalSet.endpoint (7)"]
+  B --> D["EventRegistry<br/>reads Final signals from Oracle (8)"]
+  D --> E["MarketFactory<br/>reads event_status via Series (9, 11.1)"]
+  E --> F["Series<br/>one Wasm, deployed per series (9-10)"]
+  F --> G["Governor<br/>wired in last: wraps every privileged call (16-17)"]
+
+  A -.-> H["adapters/amm-soroswap<br/>adapters/fx-reference (3.3)"]
+  H -.-> B
+
+  G -.-> I["Offchain services<br/>keeper, reporter-node, indexer, api (18)"]
+  F -.-> I
+  I -.-> J["packages/sdk<br/>wraps generated bindings (19)"]
+
+  classDef done fill:#dfe,stroke:#393;
+  classDef todo fill:#eee,stroke:#999;
+  class A done;
+  class B,C,D,E,F,G,H,I,J todo;
+```
+
+Green: scaffolded and compiling as of this revision (stub `lib.rs`, no business logic — Section 1.2 scope). Grey: not yet started. `ReporterStaking` and `EventRegistry` both depend only on `RiskOracle` being in place (not on each other), so they can be built in parallel once Section 5-6 are implemented; `Governor` has no functional dependency on the other five core contracts but is ordered last here because every privileged call across them is written against its `require_auth()` pattern (Section 16), so its interface should be stable before those calls are finalized.
+
+A calendar view of the same plan, mapped to the SCF tranches in `prd.md` Section 15.2:
+
+```mermaid
+gantt
+  dateFormat YYYY-MM-DD
+  axisFormat %b %d
+  title Anchorline build sequence vs. SCF tranches
+  section Tranche #1 (MVP, 20%)
+  anchorline-types            :done,    types, 2026-10-08, 3d
+  RiskOracle                  :active,  oracle, after types, 14d
+  ReporterStaking             :         staking, after oracle, 10d
+  EventRegistry (Tier 1 only) :         registry1, after oracle, 10d
+  MarketFactory + Series      :         markets1, after registry1, 14d
+  Web app alpha                :         webapp1, after markets1, 7d
+  section Tranche #2 (Testnet, 30%)
+  EventRegistry (Tier 2/3)    :         registry2, after markets1, 14d
+  Governor                    :         gov, after registry2, 10d
+  Manipulation limits (Sec 11) :         limits, after gov, 7d
+  Threat model + Audit Bank app :        audit, after limits, 10d
+  section Tranche #3 (Mainnet, 40%)
+  Offchain services (18)      :         svc, after gov, 14d
+  SDK (19)                    :         sdk, after svc, 10d
+  Mainnet deploy (22.2)        :         deploy, after sdk, 7d
+```
+
+Dates are illustrative scaffolding, not commitments; actual duration depends on team size (`prd.md` Section 16) and what the Phase 0 legal and partner gates (`prd.md` Section 14, 18.2) allow.
 
 ### 22.3 Configuration
 
