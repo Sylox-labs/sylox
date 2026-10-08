@@ -22,4 +22,16 @@ pub enum Error {
     WeightsInvalid = 107,
     ReferenceImmutable = 108,
     ReferenceRateUnavailable = 109,
+    /// Distinct from `SanityBoundFailed` (104), which is about one posted
+    /// `SignalSet`'s fields; this is about computing the score from the
+    /// ring (not enough history, or a required window read came back
+    /// empty), a different failure mode a caller may want to handle
+    /// differently (for example: retry later vs. a permanently bad
+    /// posting). Review item "Aggregation failures must not reuse
+    /// SanityBoundFailed."
+    AggregationFailed = 110,
+    /// `add_asset` / `update_asset` reject `Reference::Asset` in v1
+    /// (review decision D3): no USD rate is defined anywhere in the spec
+    /// for an asset pegged reference (see the PR's "Spec deviations").
+    ReferenceNotSupported = 111,
 }

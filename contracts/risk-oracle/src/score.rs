@@ -5,6 +5,7 @@ use soroban_sdk::{contracttype, Address, Env, Map, Symbol, Vec};
 use sylox_types::{Band, EndpointStatus, RiskScore, SCALE};
 
 use crate::error::Error;
+use crate::math;
 use crate::storage;
 
 /// Epochs the 24 hour and 7 day aggregates look back, and the slots
@@ -12,6 +13,14 @@ use crate::storage;
 /// the ring's 240 slots (Section 6.5, 5.8).
 const AGGREGATE_SLOTS_24H: u32 = 24;
 pub const AGGREGATE_SLOTS_7D: u32 = 168;
+
+/// Epochs in the Depeg window component P's `peg_ratio_p10` is computed
+/// over (the default `depeg_window_secs` = 72h at the default
+/// `epoch_secs`, Section 23). `RiskOracle` has no cross contract
+/// dependency on `EventRegistry`'s canonical `EventDefinition`, so this
+/// is the Section 23 default, fixed, the same way `AGGREGATE_SLOTS_24H`
+/// and `_7D` are; see the review's "Spec deviations" entry on this.
+pub const DEPEG_WINDOW_SLOTS: u32 = 72;
 
 #[contracttype]
 #[derive(Clone)]
@@ -69,10 +78,28 @@ fn clamp(x: i128) -> i128 {
     x.clamp(0, SCALE)
 }
 
+/// Checked `a * b / c`, as `(a.checked_mul(b)).checked_div(c)`. Every
+/// component below is this shape; this one helper keeps the overflow
+/// check consistent instead of repeating `checked_mul`/`checked_div`
+/// pairs six times. `MathOverflow` is also what a division by zero
+/// degrades to (checked_div returns None for both overflow and
+/// division by zero); every call site below guards its own divisor
+/// with a `<= 0` check first, so the zero case is already excluded on
+/// the callers that intend it to be a defined zero result.
+fn checked_mul_div(a: i128, b: i128, c: i128) -> Result<i128, Error> {
+    a.checked_mul(b)
+        .and_then(|product| product.checked_div(c))
+        .ok_or(Error::MathOverflow)
+}
+
 /// Component P: peg deviation. `100 * clamp(|1 - peg_ratio_p10| / d_max)`.
-fn component_p(peg_ratio_p10: i128, d_max: i128) -> i128 {
-    let deviation = (SCALE - peg_ratio_p10).abs();
-    100 * clamp(deviation * SCALE / d_max) / SCALE
+fn component_p(peg_ratio_p10: i128, d_max: i128) -> Result<i128, Error> {
+    let deviation = SCALE
+        .checked_sub(peg_ratio_p10)
+        .ok_or(Error::MathOverflow)?
+        .abs();
+    let ratio = checked_mul_div(deviation, SCALE, d_max)?;
+    checked_mul_div(100, clamp(ratio), SCALE)
 }
 
 /// Component E: endpoint health. Fixed table, not a ratio against SCALE.
@@ -87,15 +114,16 @@ fn component_e(endpoint: EndpointStatus) -> i128 {
 
 /// Component R: redemption pressure.
 /// `100 * clamp(redemption_net_24h / (supply * r_max))`.
-fn component_r(redemption_net_24h: i128, supply: i128, r_max: i128) -> i128 {
+fn component_r(redemption_net_24h: i128, supply: i128, r_max: i128) -> Result<i128, Error> {
     if supply <= 0 {
-        return 0;
+        return Ok(0);
     }
-    let denom = supply.saturating_mul(r_max) / SCALE;
+    let denom = checked_mul_div(supply, r_max, SCALE)?;
     if denom <= 0 {
-        return 0;
+        return Ok(0);
     }
-    100 * clamp(redemption_net_24h * SCALE / denom) / SCALE
+    let ratio = checked_mul_div(redemption_net_24h, SCALE, denom)?;
+    checked_mul_div(100, clamp(ratio), SCALE)
 }
 
 /// Component I: issuer actions.
@@ -106,11 +134,11 @@ fn component_i(
     supply: i128,
     c_max: i128,
     k_max: i128,
-) -> i128 {
+) -> Result<i128, Error> {
     let clawback_term = if supply > 0 {
-        let denom = supply.saturating_mul(c_max) / SCALE;
+        let denom = checked_mul_div(supply, c_max, SCALE)?;
         if denom > 0 {
-            clawback_amount_7d * SCALE / denom
+            checked_mul_div(clawback_amount_7d, SCALE, denom)?
         } else {
             0
         }
@@ -118,28 +146,34 @@ fn component_i(
         0
     };
     let revocation_term = if k_max > 0 {
-        (auth_revocations_7d as i128) * SCALE / k_max
+        checked_mul_div(auth_revocations_7d as i128, SCALE, k_max)?
     } else {
         0
     };
-    100 * clamp(clawback_term + revocation_term) / SCALE
+    let sum = clawback_term
+        .checked_add(revocation_term)
+        .ok_or(Error::MathOverflow)?;
+    checked_mul_div(100, clamp(sum), SCALE)
 }
 
 /// Component L: liquidity. `100 * clamp(1 - liquidity_2pct / L_target)`.
-fn component_l(liquidity_2pct: i128, l_target: i128) -> i128 {
+fn component_l(liquidity_2pct: i128, l_target: i128) -> Result<i128, Error> {
     if l_target <= 0 {
-        return 0;
+        return Ok(0);
     }
-    100 * clamp(SCALE - (liquidity_2pct * SCALE / l_target)) / SCALE
+    let ratio = checked_mul_div(liquidity_2pct, SCALE, l_target)?;
+    let deviation = SCALE.checked_sub(ratio).ok_or(Error::MathOverflow)?;
+    checked_mul_div(100, clamp(deviation), SCALE)
 }
 
 /// Component S: supply shock.
 /// `100 * clamp(|supply_change_24h_bps| / s_max_bps)`.
-fn component_s(supply_change_24h_bps: i128, s_max_bps: i128) -> i128 {
+fn component_s(supply_change_24h_bps: i128, s_max_bps: i128) -> Result<i128, Error> {
     if s_max_bps <= 0 {
-        return 0;
+        return Ok(0);
     }
-    100 * clamp(supply_change_24h_bps.abs() * SCALE / s_max_bps) / SCALE
+    let ratio = checked_mul_div(supply_change_24h_bps.abs(), SCALE, s_max_bps)?;
+    checked_mul_div(100, clamp(ratio), SCALE)
 }
 
 /// Everything read from the ring to feed the six components, for one
@@ -163,6 +197,12 @@ pub struct Aggregates {
 /// function only reads, it does not check finality beyond what
 /// `storage::get_window` already does by treating a non-matching or empty
 /// slot as missing).
+///
+/// Every failure here is `AggregationFailed` (110), never `SanityBoundFailed`
+/// (104): the latter is about one posted `SignalSet` failing a bound check,
+/// this is about the ring not having enough history or data to score from,
+/// a different condition a caller may want to handle differently (review
+/// item "Aggregation failures must not reuse SanityBoundFailed").
 pub fn aggregate_from_ring(
     env: &Env,
     asset: &Address,
@@ -171,7 +211,7 @@ pub fn aggregate_from_ring(
     if latest_epoch + 1 < AGGREGATE_SLOTS_7D as u64 {
         // Not enough history yet for a 7 day baseline; treat as stale
         // rather than scoring on a partial window silently.
-        return Err(Error::SanityBoundFailed);
+        return Err(Error::AggregationFailed);
     }
     let start = latest_epoch + 1 - AGGREGATE_SLOTS_7D as u64;
     let window = storage::get_window(env, asset, start, AGGREGATE_SLOTS_7D);
@@ -179,12 +219,14 @@ pub fn aggregate_from_ring(
     let latest = window
         .get(AGGREGATE_SLOTS_7D - 1)
         .flatten()
-        .ok_or(Error::SanityBoundFailed)?;
+        .ok_or(Error::AggregationFailed)?;
 
     let mut redemption_net_24h: i128 = 0;
     for i in (AGGREGATE_SLOTS_7D - AGGREGATE_SLOTS_24H)..AGGREGATE_SLOTS_7D {
         if let Some(slot) = window.get(i).flatten() {
-            redemption_net_24h += slot.redemption_net;
+            redemption_net_24h = redemption_net_24h
+                .checked_add(slot.redemption_net)
+                .ok_or(Error::MathOverflow)?;
         }
     }
 
@@ -192,8 +234,12 @@ pub fn aggregate_from_ring(
     let mut auth_revocations_7d: u32 = 0;
     for i in 0..AGGREGATE_SLOTS_7D {
         if let Some(slot) = window.get(i).flatten() {
-            clawback_amount_7d += slot.clawback_amount;
-            auth_revocations_7d += slot.auth_revocations;
+            clawback_amount_7d = clawback_amount_7d
+                .checked_add(slot.clawback_amount)
+                .ok_or(Error::MathOverflow)?;
+            auth_revocations_7d = auth_revocations_7d
+                .checked_add(slot.auth_revocations)
+                .ok_or(Error::MathOverflow)?;
         }
     }
 
@@ -202,15 +248,42 @@ pub fn aggregate_from_ring(
     // compares supply now against supply 24 slots ago, matching S's
     // definition ("supply_change_24h_bps") rather than reusing the
     // one-epoch field under a 24h sounding name.
-    let supply_change_24h_bps = window
-        .get(AGGREGATE_SLOTS_7D - AGGREGATE_SLOTS_24H)
-        .flatten()
-        .filter(|slot| slot.supply > 0)
-        .map(|slot| ((latest.supply - slot.supply) * 10_000) / slot.supply)
-        .unwrap_or(0);
+    let supply_change_24h_bps = match window.get(AGGREGATE_SLOTS_7D - AGGREGATE_SLOTS_24H).flatten()
+    {
+        Some(slot) if slot.supply > 0 => {
+            let diff = latest
+                .supply
+                .checked_sub(slot.supply)
+                .ok_or(Error::MathOverflow)?;
+            let scaled = diff.checked_mul(10_000).ok_or(Error::MathOverflow)?;
+            scaled.checked_div(slot.supply).ok_or(Error::MathOverflow)?
+        }
+        _ => 0,
+    };
+
+    // Review item C3: component P's peg_ratio_p10 is computed onchain as
+    // the 10th percentile of peg_ratio across the Depeg window (the
+    // newest DEPEG_WINDOW_SLOTS of the 7 day window already read above),
+    // with missing epochs excluded, not the keeper posted per-epoch field
+    // of the same name (Section 4.1). A single epoch's wick therefore
+    // cannot move the band through P: see
+    // percentile_p10_ignores_a_single_epoch_wick in test.rs.
+    let mut window_ratios: Vec<i128> = Vec::new(env);
+    for i in (AGGREGATE_SLOTS_7D - DEPEG_WINDOW_SLOTS)..AGGREGATE_SLOTS_7D {
+        if let Some(slot) = window.get(i).flatten() {
+            window_ratios.push_back(slot.peg_ratio);
+        }
+    }
+    if window_ratios.is_empty() {
+        // Every epoch in the Depeg window is missing: nothing to compute
+        // P from. This is a data availability failure, not a bound
+        // violation on any one posting.
+        return Err(Error::AggregationFailed);
+    }
+    let peg_ratio_p10 = math::percentile_10(&window_ratios);
 
     Ok(Aggregates {
-        peg_ratio_p10: latest.peg_ratio,
+        peg_ratio_p10,
         liquidity_2pct: latest.liquidity_2pct,
         endpoint: latest.endpoint,
         supply: latest.supply,
@@ -234,29 +307,42 @@ pub fn combined_score(
     let k_max = formula.params.get(K_MAX).unwrap_or(20);
     let s_max_bps = formula.params.get(S_MAX_BPS).unwrap_or(2_000);
 
-    let p = component_p(aggregates.peg_ratio_p10, d_max);
+    let p = component_p(aggregates.peg_ratio_p10, d_max)?;
     let e = component_e(aggregates.endpoint);
-    let r = component_r(aggregates.redemption_net_24h, aggregates.supply, r_max);
+    let r = component_r(aggregates.redemption_net_24h, aggregates.supply, r_max)?;
     let i = component_i(
         aggregates.clawback_amount_7d,
         aggregates.auth_revocations_7d,
         aggregates.supply,
         c_max,
         k_max,
-    );
-    let l = component_l(aggregates.liquidity_2pct, l_target);
-    let s = component_s(aggregates.supply_change_24h_bps, s_max_bps);
+    )?;
+    let l = component_l(aggregates.liquidity_2pct, l_target)?;
+    let s = component_s(aggregates.supply_change_24h_bps, s_max_bps)?;
 
-    let weighted = formula.weights.get(0).unwrap() as i128 * p
-        + formula.weights.get(1).unwrap() as i128 * e
-        + formula.weights.get(2).unwrap() as i128 * r
-        + formula.weights.get(3).unwrap() as i128 * i
-        + formula.weights.get(4).unwrap() as i128 * l
-        + formula.weights.get(5).unwrap() as i128 * s;
+    let weighted_term = |weight_index: u32, component: i128| -> Result<i128, Error> {
+        let weight = formula.weights.get(weight_index).unwrap() as i128;
+        weight.checked_mul(component).ok_or(Error::MathOverflow)
+    };
+    let weighted = weighted_term(0, p)?
+        .checked_add(weighted_term(1, e)?)
+        .ok_or(Error::MathOverflow)?
+        .checked_add(weighted_term(2, r)?)
+        .ok_or(Error::MathOverflow)?
+        .checked_add(weighted_term(3, i)?)
+        .ok_or(Error::MathOverflow)?
+        .checked_add(weighted_term(4, l)?)
+        .ok_or(Error::MathOverflow)?
+        .checked_add(weighted_term(5, s)?)
+        .ok_or(Error::MathOverflow)?;
 
     // Weighted sum is in bps-of-score units (weights sum to 10,000); divide
     // back down and round to the nearest point.
-    let rounded = (weighted + 5_000) / 10_000;
+    let rounded = weighted
+        .checked_add(5_000)
+        .ok_or(Error::MathOverflow)?
+        .checked_div(10_000)
+        .ok_or(Error::MathOverflow)?;
     rounded
         .clamp(0, 100)
         .try_into()

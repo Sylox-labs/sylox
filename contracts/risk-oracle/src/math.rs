@@ -34,3 +34,15 @@ pub fn median(values: &Vec<i128>) -> i128 {
     let s = sorted(values);
     s.get(s.len() / 2).unwrap()
 }
+
+/// 10th percentile of `values`, by index (`len / 10`), the same
+/// "take the element that actually occurred" reasoning as `median`: an
+/// interpolated percentile could introduce a value no slot ever posted,
+/// which component P (Section 6.1) should not be based on. Used for
+/// `peg_ratio_p10` computed onchain from the Depeg window (Section 6.1,
+/// review item C3), not the keeper-posted per-epoch field of the same
+/// name (Section 4.1), which this function's caller does not trust.
+pub fn percentile_10(values: &Vec<i128>) -> i128 {
+    let s = sorted(values);
+    s.get(s.len() / 10).unwrap()
+}

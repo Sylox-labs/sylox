@@ -673,6 +673,81 @@ fn score_is_normal_band_with_healthy_signals() {
     assert_eq!(score.score, 0);
 }
 
+/// Review item C3: a single epoch's bad `peg_ratio` inside the 72 epoch
+/// Depeg window must not move the band, because component P is the 10th
+/// percentile of the window, computed onchain, not a single value. One
+/// severely depegged epoch among 72 healthy ones sorts to the bottom of
+/// the window and falls below the `len / 10 = 7` index `percentile_10`
+/// reads, so it never reaches component P at all.
+#[test]
+fn percentile_p10_ignores_a_single_epoch_wick() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    for epoch in 0..168u64 {
+        staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s = signal_set(&env, epoch, sylox_types::SCALE);
+        s.liquidity_2pct = 100_000_000_000;
+        s.supply_change_bps = 0;
+        // The Depeg window is the newest 72 of the 168 posted (epochs
+        // 96..168); epoch 96, the oldest epoch inside it, carries the
+        // single wick.
+        if epoch == 96 {
+            s.peg_ratio = 1_000_000;
+            s.peg_ratio_p10 = 1_000_000; // severely depegged, one epoch only
+        }
+        fx.client.post_signals(&keeper, &asset, &s);
+    }
+
+    let score = fx.client.score(&asset);
+    assert!(!score.stale);
+    assert_eq!(
+        score.band,
+        Band::Normal,
+        "a single wick inside the Depeg window must not move the band through component P"
+    );
+    assert_eq!(score.score, 0);
+}
+
+/// The mirror case: enough bad epochs inside the Depeg window (more than
+/// 10% of it) DO reach the percentile and move component P, confirming
+/// the wick test above is not passing merely because component P is
+/// broken rather than because the wick is correctly excluded.
+#[test]
+fn percentile_p10_reflects_a_sustained_depeg_in_the_window() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    for epoch in 0..168u64 {
+        staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s = signal_set(&env, epoch, sylox_types::SCALE);
+        s.liquidity_2pct = 100_000_000_000;
+        s.supply_change_bps = 0;
+        // 20 of the newest 72 epochs (96..168) are depegged: well over
+        // the 10th percentile index (7), so it must land on a depegged
+        // value this time.
+        if (96..116).contains(&epoch) {
+            s.peg_ratio = 1_000_000;
+            s.peg_ratio_p10 = 1_000_000;
+        }
+        fx.client.post_signals(&keeper, &asset, &s);
+    }
+
+    let score = fx.client.score(&asset);
+    assert!(!score.stale);
+    assert_ne!(
+        score.band,
+        Band::Normal,
+        "a sustained depeg covering more than the 10th percentile must move the band"
+    );
+}
+
 /// Posts `epochs` epochs (starting at `start_epoch`) that max out every
 /// score component, so the weighted sum (weights sum to 10,000 bps = 100
 /// points) reaches Distress (>=75) with room to spare: P=100 (peg_ratio_p10
