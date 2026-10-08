@@ -39,6 +39,15 @@ const EPOCH_SECS: u64 = 3_600;
 /// `signal_dispute_secs`.
 const SIGNAL_DISPUTE_SECS: u64 = 7_200;
 
+/// ADR-010 (feat/staking, issue #4 fix): how long the committee has to
+/// rule on an open signal dispute, from `dispute_signals`, before
+/// `resolve_signal_dispute_timeout` becomes callable. Default 7 days,
+/// matching ADR-002's `ruling_deadline_secs` precedent for event
+/// disputes, though shorter: a signal dispute's underlying question
+/// (what did the endpoint report) is far narrower than an event
+/// definition's.
+const SIGNAL_DISPUTE_RULING_SECS: u64 = 604_800;
+
 /// technical-doc.md Section 23 `stale_after_epochs` default.
 const STALE_AFTER_EPOCHS: u64 = 3;
 
@@ -250,12 +259,15 @@ impl RiskOracle {
         if storage::get_dispute(&env, &asset, epoch).is_some() {
             return Err(Error::DisputeWindowClosed);
         }
+        let signals = storage::get_signals(&env, &asset, epoch).ok_or(Error::WrongEpoch)?;
 
         let bond = signal_dispute_bond();
+        let now = env.ledger().timestamp();
         StakingClient::new(&env, &config.staking).lock_bond(
             &sylox_types::BondKey::SignalDispute(asset.clone(), epoch),
             &disputer,
             &bond,
+            &Some(signals.poster.clone()),
         );
         storage::set_dispute(
             &env,
@@ -264,6 +276,7 @@ impl RiskOracle {
             &DisputeRecord {
                 disputer: disputer.clone(),
                 alt_hash: alt_hash.clone(),
+                opened_at: now,
             },
         );
         storage::set_slot_disputed(&env, &asset, epoch);
@@ -355,6 +368,60 @@ impl RiskOracle {
             epoch,
             keeper_wins,
             reason,
+        }
+        .publish(&env);
+        check_stale_internal(&env, &asset)?;
+        Ok(())
+    }
+
+    /// ADR-010 (issue #4 fix). Permissionless, callable once
+    /// `SIGNAL_DISPUTE_RULING_SECS` has passed since `dispute_signals`
+    /// opened this dispute, if the committee still has not ruled via
+    /// `resolve_signal_dispute`. Default outcome mirrors ADR-002's
+    /// rule for data backed claims: the keeper's posting stands (slot
+    /// `Final`, same as a `keeper_wins: true` committee ruling). "Both
+    /// bonds released in full, nobody slashed" (the task's own
+    /// wording): there is only one actual `BondKey::SignalDispute`
+    /// lock to release, the disputer's (technical-doc.md Section 24.2
+    /// notes a keeper has no symmetric per-signal bond in v1; only
+    /// `slash`, by address, ever touches a keeper's stake), so in
+    /// practice this means the disputer's bond is refunded
+    /// (`release_bond`, not `forfeit_bond`) AND the keeper's stake is
+    /// left untouched (no `slash` call either) — both parties come
+    /// out exactly as they would from a `keeper_wins: true` ruling,
+    /// which is the committee's silence being read as "no evidence
+    /// the posting was wrong", not as a loss for either side.
+    pub fn resolve_signal_dispute_timeout(env: Env, asset: Address, epoch: u64) -> Result<(), Error> {
+        let config = Self::require_config(&env)?;
+        let dispute = storage::get_dispute(&env, &asset, epoch).ok_or(Error::DisputeWindowClosed)?;
+        let now = env.ledger().timestamp();
+        if now < dispute.opened_at + SIGNAL_DISPUTE_RULING_SECS {
+            return Err(Error::RulingDeadlineNotReached);
+        }
+
+        let staking = StakingClient::new(&env, &config.staking);
+        let bond_key = sylox_types::BondKey::SignalDispute(asset.clone(), epoch);
+        staking.release_bond(&bond_key);
+        if storage::set_slot_final(&env, &asset, epoch) {
+            events::SignalsFinal {
+                asset: asset.clone(),
+                epoch,
+            }
+            .publish(&env);
+        }
+        if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+            recompute_score(&env, &asset, newest_final)?;
+        }
+        storage::clear_dispute(&env, &asset, epoch);
+
+        let committee = GovernorClient::new(&env, &config.governor).committee();
+        storage::record_committee_miss(&env, &committee);
+
+        events::SignalDisputeTimedOut {
+            asset: asset.clone(),
+            epoch,
+            disputer: dispute.disputer,
+            committee,
         }
         .publish(&env);
         check_stale_internal(&env, &asset)?;

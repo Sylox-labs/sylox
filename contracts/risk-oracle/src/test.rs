@@ -1249,6 +1249,172 @@ fn resolve_signal_dispute_disputer_wins_reopens_the_epoch() {
         .is_err());
 }
 
+// -- resolve_signal_dispute_timeout (ADR-010, issue #4 fix) --
+
+/// Shared setup for the timeout tests: a real `MockGovernor` (not just
+/// a plain `Address`, which `resolve_signal_dispute_requires_committee_auth_from_governor`
+/// shows has no `committee()` to call), one asset, one posted and
+/// disputed epoch.
+#[allow(clippy::type_complexity)]
+fn setup_disputed_epoch(
+    env: &Env,
+) -> (RiskOracleClient<'_>, Address, Address, Address, Address, Address) {
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(env, &contract_id);
+    let registry = Address::generate(env);
+    client.initialize(&governor, &registry, &staking);
+
+    let governor_client = crate::mocks::MockGovernorClient::new(env, &governor);
+    let committee = Address::generate(env);
+    governor_client.set_committee(&committee);
+
+    let asset = Address::generate(env);
+    let issuer = Address::generate(env);
+    client.add_asset(&asset_config(env, &asset, &issuer));
+    post(env, &client, &asset, 5, 9_900_000);
+
+    let disputer = Address::generate(env);
+    client.dispute_signals(&disputer, &asset, &5, &BytesN::from_array(env, &[9u8; 32]));
+
+    (client, asset, staking, committee, disputer, contract_id)
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_rejects_before_the_ruling_deadline() {
+    let env = Env::default();
+    let (client, asset, _staking, _committee, _disputer, _contract_id) =
+        setup_disputed_epoch(&env);
+
+    // Still inside signal_dispute_ruling_secs (7d) from the dispute.
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS - 1);
+    let result = client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert_eq!(result, Err(Ok(Error::RulingDeadlineNotReached)));
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_succeeds_exactly_at_the_deadline() {
+    let env = Env::default();
+    let (client, asset, _staking, _committee, _disputer, _contract_id) =
+        setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    client.resolve_signal_dispute_timeout(&asset, &5);
+
+    let slot = find_slot_by_epoch(&client.ring(&asset), 5);
+    assert_eq!(slot.state, SlotState::Final);
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_releases_the_bond_never_slashes() {
+    let env = Env::default();
+    let (client, asset, staking, _committee, _disputer, _contract_id) =
+        setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    client.resolve_signal_dispute_timeout(&asset, &5);
+
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &staking);
+    assert_eq!(
+        staking_client.call_count(&soroban_sdk::Symbol::new(&env, "release_bond")),
+        1
+    );
+    assert_eq!(
+        staking_client.call_count(&soroban_sdk::Symbol::new(&env, "forfeit_bond")),
+        0
+    );
+    assert_eq!(
+        staking_client.call_count(&soroban_sdk::Symbol::new(&env, "slash")),
+        0
+    );
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_records_a_committee_miss() {
+    let env = Env::default();
+    let (client, asset, _staking, committee, _disputer, contract_id) =
+        setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    client.resolve_signal_dispute_timeout(&asset, &5);
+
+    let misses = env.as_contract(&contract_id, || {
+        crate::storage::get_committee_misses(&env, &committee)
+    });
+    assert_eq!(misses, 1);
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_is_permissionless() {
+    let env = Env::default();
+    let (client, asset, _staking, _committee, _disputer, _contract_id) =
+        setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    // No require_auth set up for any particular caller beyond
+    // mock_all_auths (which setup_disputed_epoch already enabled);
+    // the call succeeding with no committee or governor auth proves
+    // this function checks no caller identity at all.
+    let result = client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_rejects_an_epoch_with_no_open_dispute() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    post(&env, &fx.client, &asset, 5, 9_900_000);
+
+    let result = fx.client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert_eq!(result, Err(Ok(Error::DisputeWindowClosed)));
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_cannot_run_twice() {
+    let env = Env::default();
+    let (client, asset, _staking, _committee, _disputer, _contract_id) =
+        setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    client.resolve_signal_dispute_timeout(&asset, &5);
+
+    // clear_dispute already ran; a second call finds no open dispute.
+    let result = client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert_eq!(result, Err(Ok(Error::DisputeWindowClosed)));
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_does_not_block_a_committee_ruling_that_arrives_first() {
+    let env = Env::default();
+    let (client, asset, _staking, committee, disputer, contract_id) =
+        setup_disputed_epoch(&env);
+
+    // The committee rules well before the deadline.
+    env.ledger().set_timestamp(time_at_epoch(5) + 3_600);
+    client.resolve_signal_dispute(&asset, &5, &true, &BytesN::from_array(&env, &[0u8; 32]));
+
+    // The dispute is already cleared; a late timeout call has nothing
+    // left to act on, and the committee's on-time ruling is not
+    // counted as a miss.
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    let result = client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert_eq!(result, Err(Ok(Error::DisputeWindowClosed)));
+    let misses = env.as_contract(&contract_id, || {
+        crate::storage::get_committee_misses(&env, &committee)
+    });
+    assert_eq!(misses, 0);
+    let _ = disputer;
+}
+
 // -- finalize_endpoint --
 
 #[test]

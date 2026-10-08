@@ -19,7 +19,7 @@ pub trait Staking {
     fn is_active_keeper(env: Env, keeper: Address) -> bool;
     fn aggregate(env: Env, asset: Address, epoch: u64) -> EndpointStatus;
     fn settle_probes(env: Env, asset: Address, epoch: u64);
-    fn lock_bond(env: Env, key: BondKey, owner: Address, amount: i128);
+    fn lock_bond(env: Env, key: BondKey, owner: Address, amount: i128, subject: Option<Address>);
     fn release_bond(env: Env, key: BondKey);
     fn forfeit_bond(env: Env, key: BondKey, winner: Option<Address>);
     fn slash(env: Env, who: Address, amount: i128, winner: Option<Address>, reason: BytesN<32>);

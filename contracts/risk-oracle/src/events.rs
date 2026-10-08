@@ -78,6 +78,17 @@ pub struct EndpointFinalized {
     pub status: EndpointStatus,
 }
 
+/// ADR-010 (feat/staking, issue #4 fix).
+#[contractevent(topics = ["sylox", "signal_dispute_timed_out"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignalDisputeTimedOut {
+    #[topic]
+    pub asset: Address,
+    pub epoch: u64,
+    pub disputer: Address,
+    pub committee: Address,
+}
+
 #[contractevent(topics = ["sylox", "score_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScoreUpdated {
