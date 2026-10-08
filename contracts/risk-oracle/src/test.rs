@@ -1630,3 +1630,115 @@ fn post_signals_reports_math_overflow_when_the_7d_clawback_sum_cannot_fit_i128()
     }
     unreachable!("loop always returns at epoch 169");
 }
+
+// -- Required test: backfill equivalence --
+
+/// One signal per epoch, varying slightly by epoch so a position or
+/// ordering bug in the ring would actually change the aggregates,
+/// unlike a constant signal.
+fn varying_signal_set(env: &Env, epoch: u64) -> SignalSet {
+    // peg_ratio oscillates a small amount around SCALE, never enough to
+    // move component P's band on its own; the point is per-epoch
+    // variation, not a depeg scenario.
+    let wobble = (epoch % 7) as i128 * 1_000;
+    let mut s = signal_set(env, epoch, sylox_types::SCALE + wobble);
+    s.liquidity_2pct = 100_000_000_000 + (epoch % 5) as i128 * 1_000_000;
+    s.supply_change_bps = 0;
+    s
+}
+
+/// Posts `epochs` (plus 2 flush epochs, review item C5) worth of
+/// `varying_signal_set`, in strict chronological order, with no gaps.
+fn post_all_in_order(env: &Env, client: &RiskOracleClient, staking: &Address, asset: &Address) {
+    let keeper = Address::generate(env);
+    let staking_client = crate::mocks::MockStakingClient::new(env, staking);
+    for epoch in 0..170u64 {
+        staking_client.set_aggregate(asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        client.post_signals(&keeper, asset, &varying_signal_set(env, epoch));
+    }
+    client.finalize_endpoint(asset, &167);
+}
+
+/// Posts the same 170 epochs as `post_all_in_order`, but skips epochs
+/// 50..56 during the first pass (simulating a 6 epoch keeper outage),
+/// continues posting epochs 56..76 on schedule, then backfills the
+/// skipped 50..56 (still well inside `WINDOW_SECS`'s 72 epoch lookback
+/// from epoch 50's own close), before continuing on through 170. Every
+/// epoch ends up posted with the exact same `SignalSet` content as
+/// `post_all_in_order`, just in a different order.
+fn post_with_an_outage_then_backfill(
+    env: &Env,
+    client: &RiskOracleClient,
+    staking: &Address,
+    asset: &Address,
+) {
+    let keeper = Address::generate(env);
+    let staking_client = crate::mocks::MockStakingClient::new(env, staking);
+    for epoch in &[&(0..50u64), &(56..76u64)] {
+        for e in (*epoch).clone() {
+            staking_client.set_aggregate(asset, &e, &EndpointStatus::Up);
+            env.ledger().set_timestamp((e + 1) * 3_600);
+            client.post_signals(&keeper, asset, &varying_signal_set(env, e));
+        }
+    }
+    // Backfill the outage. The clock does not move backward: these
+    // posts land at whatever "now" already is (end of the 56..76 pass),
+    // well inside WINDOW_SECS for epochs this recent.
+    for e in 50..56u64 {
+        staking_client.set_aggregate(asset, &e, &EndpointStatus::Up);
+        client.post_signals(&keeper, asset, &varying_signal_set(env, e));
+    }
+    for e in 76..170u64 {
+        staking_client.set_aggregate(asset, &e, &EndpointStatus::Up);
+        env.ledger().set_timestamp((e + 1) * 3_600);
+        client.post_signals(&keeper, asset, &varying_signal_set(env, e));
+    }
+    client.finalize_endpoint(asset, &167);
+}
+
+#[test]
+fn backfill_after_an_outage_matches_no_outage() {
+    let env_a = Env::default();
+    let (fx_a, asset_a) = setup_with_asset(&env_a);
+    post_all_in_order(&env_a, &fx_a.client, &fx_a.staking, &asset_a);
+
+    let env_b = Env::default();
+    let (fx_b, asset_b) = setup_with_asset(&env_b);
+    post_with_an_outage_then_backfill(&env_b, &fx_b.client, &fx_b.staking, &asset_b);
+
+    let ring_a = fx_a.client.ring(&asset_a);
+    let ring_b = fx_b.client.ring(&asset_b);
+    assert_eq!(
+        ring_a.len(),
+        ring_b.len(),
+        "both rings must hold the same number of written slots"
+    );
+    for epoch in 0..170u64 {
+        let slot_a = find_slot_by_epoch(&ring_a, epoch);
+        let slot_b = find_slot_by_epoch(&ring_b, epoch);
+        assert_eq!(
+            slot_a.peg_ratio, slot_b.peg_ratio,
+            "epoch {epoch}: peg_ratio must match regardless of posting order"
+        );
+        assert_eq!(
+            slot_a.liquidity_2pct, slot_b.liquidity_2pct,
+            "epoch {epoch}: liquidity_2pct must match regardless of posting order"
+        );
+        assert_eq!(
+            slot_a.state, slot_b.state,
+            "epoch {epoch}: final state must match regardless of posting order"
+        );
+    }
+
+    let score_a = fx_a.client.score(&asset_a);
+    let score_b = fx_b.client.score(&asset_b);
+    assert_eq!(
+        score_a.score, score_b.score,
+        "an outage followed by backfill must score identically to no outage at all"
+    );
+    assert_eq!(score_a.band, score_b.band);
+    assert_eq!(score_a.epoch, score_b.epoch);
+    assert!(!score_a.stale);
+    assert!(!score_b.stale);
+}
