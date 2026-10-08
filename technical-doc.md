@@ -1,10 +1,74 @@
-# Anchorline Protocol: Technical Documentation
+# Sylox Protocol: Technical Documentation
 
-Version: v1 draft, October 8, 2026 · Author: David Ejere
+Version: v1.1 draft, October 8, 2026 · Author: David Ejere
+
+## Changelog v1.1
+
+Every change from v1.0, with the decision record behind it (`docs/decisions/`) and the sections it touched. Section numbers are unchanged; new material is in new subsections.
+
+**ADR-001 Canonical event definitions**
+
+- One canonical, versioned `EventDefinition` per (asset, kind), registered by governance; events keyed by (asset, kind, def\_version); `event_status` per (asset, kind), so a Declared WithdrawalHalt never blocks a later Depeg. Sections 4.3, 8 (intro, 8.1, 8.5), new 8.8, 12.2, 15.1.
+- `SeriesTerms.def_versions` (one pinned version per covered kind) replaces the single definition hash. Sections 1.5, 4.4, 8.6, 9.2, 17.4, 20.3.
+- `propose_tier1` takes (asset, kind) and uses the current canonical version. Sections 8.1, 8.2, 8.8, 12.2.
+- After any Declared event, `MarketFactory` blocks new series on the asset until governance re-enables it by registering new versions; new `clear_event_band`. Sections 6.3, 8.5, 8.8, 9.7, 12.1, 12.4.
+- New invariant I13 (live series always pin the canonical version) and the `DefinitionInUse` rule. Sections 8.8, 21.1.
+
+**ADR-002 Ruling deadline and default outcome**
+
+- `ruling_deadline_secs` (default 14 days) from escalation; `resolve_timeout(event_id)` with default Declared for escalated Tier 1 Depeg and IssuerFreeze and Rejected for Tier 2, Tier 3 and MintWithoutBacking; all bonds refunded on timeout; misses recorded per committee. Sections 4.3, 8 (state diagram, 8.1), new 8.9, 12.2, 13, 14, 15.1, 22.4, 22.5, 23.
+- `challenge` escalates in the same call, so the deadline always runs; `escalate` and `withdraw_bond` removed. Sections 8.1, 12.2.
+- Bound on Pending: the ruling deadline plus one challenge window after the acceptance period. Sections 8.9, 9.2.
+
+**ADR-003 Coverage window and informed buying**
+
+- Cover gate: `buy_cover` blocked if any epoch in the trailing depeg window is below threshold, the endpoint was Down or Degraded in the trailing halt window, an issuer action counted by IssuerFreeze happened in the last 7 days, or any event is in progress. Sections 4.3 (`CoverGate`), 9.4 (step 2 and diagram), 12.2, 14.
+- An event covers a series if its failure window starts inside [start, expiry]; proposals accepted up to one window length after expiry, with the series Pending meanwhile (fixes the day 88 of 90 case). Sections 4.3 (`window_start`), 8.6, 9 (state diagram), 9.2, 20.3, 20.4.
+
+**ADR-004 Contract inventory**
+
+- `ReporterStaking` renamed `Staking`: keeper bonds, reporter stakes, signal dispute bonds, event proposal and challenge bonds, slashing on instruction from `RiskOracle` and `EventRegistry`. Sections 2, 3.1, 3.5, 5.3, 5.4, 5.6, 5.7, 7, new 7.8, 12.3, 16, 17.3, 22.1, 22.2.
+- New `Treasury` contract for protocol fees, slashed funds and the keeper and reporter reward pools. Sections 2, 3.1, 3.5, 4.5, 9.4, 10.2, new 12.7, 13, 14, 15.1, 16, 17.1, 17.2, 17.3, 21.1.
+- `Series` holds only collateral and premiums; `RiskOracle` and `EventRegistry` hold no funds. Sections 2, 3.1, 15.1, 21.1 (I16).
+- Roles (16), storage (15.1), events (13), errors (14), API (12) and both architecture diagrams (2, 3.5) updated for seven contracts.
+
+**ADR-005 Oracle robustness**
+
+- Backfill: any closed epoch inside `window_secs` that is not Final can be posted; an overturned epoch reopens. Sections 5.2, 5.3, 5.7, 11.3, 14, 18.1, 22.5.
+- `max_missing_epochs` (default 6 of 72): missing epochs count neither way. Sections 4.3, 8.2, 11.4, 23.
+- Disputes do not reset the window; a disputed epoch stays non final. Sections 5.4, 5.7, 5.8.
+- Liquidity floor compares `min_liquidity` with the median of the 7 days before the window; a live collapse is a signal, never a payout block. Sections 4.1, 6.5, 8.2, 11.4.
+- `peg_ratio_p10` replaces `peg_ratio_min`. Sections 4.1, 5.1, 6.1, 6.5, 11.3, 11.4.
+- Endpoint status only from the `Staking` aggregate; keeper value ignored; `finalize_endpoint` on `RiskOracle` reads `Staking.aggregate`; 7.7 diagram fixed. Sections 4.1, 5.1, 5.3, 7.4, 7.7, 12.1.
+- Supply is keeper posted from ledger asset stats; no SAC cross check (SEP-41 has no `total_supply`). Sections 4.1, 5.1.
+- Tier 1 checks read the ring buffer (one entry, per slot finality flag), with a write cost benchmark and a paging fallback. Sections 4.1 (`RingSlot`), new 5.8, 8.2, 15.1, 15.3.
+- Reporter aggregation: the status reported by a strict majority, else Degraded. Sections 7.4, 7.7.
+
+**ADR-006 Event definition content and v1 scope**
+
+- `Reference::Fiat` carries an `FxRateSource` (Official or Market), fixed in the event definition and immutable on the asset; ARS official vs market rate documented. Sections 4.1, 4.3, 5.1, 17.4, 24.
+- `AssetConfig.issuer_flags`; IssuerFreeze definitions only for assets whose flags allow a freeze. Sections 4.1, 8.2, 8.8, 11.6, 14, 17.1.
+- WithdrawalHalt documented as the least reliable type, Tier 2 only, with its evidence model. Sections 8.3, 11.6, 20.5, 20.6.
+- First build: Depeg and IssuerFreeze; Tier 2, Tier 3 and MintWithoutBacking in a later phase. Sections 1.2, 8.2, 8.3, 8.4, 22.2a.
+
+**Other fixes**
+
+- `require_holding` value = balance × peg\_ratio × fx\_rate, compared to cover in USDC; new `reference_rate`. Sections 9.4, 12.1, 14.
+- `open_series` rejects a settlement asset equal to, or from the same issuer as, the covered asset. Sections 4.4, new 9.7, 12.4, 14.
+- Series salt from a factory series counter. Sections 3.2, 9.7, 12.4, 15.1.
+- `reserve_cover` checks and reserves the asset cap atomically; the 9.4 diagram no longer reads the cap first. Sections 9.4, 11.1, 12.4, 21.1.
+- `transfer_position` rejects a recipient that already holds a position. Sections 9.1, 12.5, 14, 20.4.
+- Adapter interfaces `PriceAdapter.spot_price` and `FxAdapter.rate`; `AssetConfig.fx_adapter`. Sections 3.3, 4.1.
+- `QueuedAction` fields and `ActionState` specified to match `governance.rs`. Section 17.1, 17.2.
+- New Section 21.5 Libraries (OpenZeppelin Stellar contracts check).
+- New Section 1.7 Phase 0 data pull.
+- Honest framing of the v1 trust root and the decentralization path: new Section 1.6, cross referenced from 5.4, 5.6, 7.6, 8.4.
+- Purely technical: the calendar chart is removed, the build sequence is relabelled as build phases A, B and C, and the document carries no project planning or cost material. Sections 21.4, 22.2a.
+- Currency examples use USD, EUR and ARS. Sections 4.1, 19, 24.2.
 
 ## 1. Overview and conventions
 
-This document specifies how Anchorline is built: the Soroban contracts, their data, math, interfaces and events, the offchain services that feed them, and how to integrate, deploy and operate the system. It is the engineering companion to the Anchorline PRD and is written against a v1 design that has not yet been implemented, so every interface here is a draft to be validated in Phase 1.
+This document specifies how Sylox is built: the Soroban contracts, their data, math, interfaces and events, the offchain services that feed them, and how to integrate, deploy and operate the system. It is the engineering companion to the Sylox PRD and is written against a v1 design that has not yet been implemented, so every interface here is a draft to be validated in Phase 1.
 
 ### 1.1 Audience
 
@@ -13,18 +77,29 @@ This document specifies how Anchorline is built: the Soroban contracts, their da
 | Contract engineers | Sections 4 to 17, 21 |
 | Offchain and infra engineers | Sections 5, 7, 18, 22 |
 | Wallet and lender integrators | Sections 6, 12, 13, 19, 20 |
-| Auditors | Sections 10, 11, 15, 16, 21 |
-| Reporters and committee members | Sections 7, 8, 20 |
+| Auditors | Sections 1.6, 7.8, 10, 11, 12.7, 15, 16, 21 |
+| Reporters and committee members | Sections 1.6, 7, 8, 20 |
 
 ### 1.2 Scope of v1
 
-In scope: risk signals and score for issued assets on Stellar mainnet; credit event detection across three tiers; fully collateralized protection series settled in USDC; reporter staking and disputes; committee rulings; governance with timelock.
+In scope: risk signals and score for issued assets on Stellar mainnet; credit event detection across three tiers; fully collateralized protection series settled in USDC; keeper and reporter staking, bonds and disputes; committee rulings with a ruling deadline; a protocol treasury; governance with timelock.
+
+Event scope by build phase (Section 22.2a):
+
+| Build phase | Event kinds | Tier |
+| --- | --- | --- |
+| First build (Phases A and B) | Depeg, IssuerFreeze, each with one canonical definition per asset (Section 8.8) | 1 |
+| Later build (Phase C) | WithdrawalHalt | 2 |
+| Later build (Phase C) | Insolvency | 3 |
+| Later build (Phase C) | MintWithoutBacking (Tier 1 flag, committee to confirm) | 1, confirmed by 3 |
+
+The data model and the state machine cover every kind from the start, so the later kinds need no type changes, only their checks, evidence handling and committee tooling.
 
 Out of scope for v1: recovery based payouts, cross margining, multiple settlement assets, a pricing model, onchain token governance, cross chain reference prices.
 
 ### 1.3 A design correction to the PRD
 
-Soroban contracts cannot read classic Stellar DEX order books, classic liquidity pool reserves or most classic account state directly. So the PRD's "Tier 1: onchain" triggers are implemented here as **keeper posted, publicly recomputable** signals: a keeper computes them from public ledger data, posts the result with a hash of its inputs, and anyone can recompute and dispute within a window. Where a Soroban native source exists (for example a Soroban AMM pair's reserves, or Stellar Asset Contract balances), the contract reads it directly as a cross check. Section 5 details this.
+Soroban contracts cannot read classic Stellar DEX order books, classic liquidity pool reserves or most classic account state directly. So the PRD's Tier 1 triggers ("data verified": keeper posted, publicly recomputable) are implemented here as **keeper posted, publicly recomputable** signals: a keeper computes them from public ledger data, posts the result with a hash of its inputs, and anyone can recompute and dispute within a window. Where a Soroban native source exists (for example a Soroban AMM pair's reserves, or Stellar Asset Contract balances), the contract reads it directly as a cross check. Section 5 details this.
 
 ### 1.4 Conventions
 
@@ -37,7 +112,7 @@ Soroban contracts cannot read classic Stellar DEX order books, classic liquidity
 | Identifiers | `AssetId` = the Stellar Asset Contract address of the issued asset. `SeriesId`, `EventId`, `ClaimId` = `u64` counters per contract |
 | Hashes | SHA-256, `BytesN<32>` |
 | Rounding | Always in favour of the pool: round premiums up, payouts and withdrawals down |
-| Naming | Contracts in PascalCase, functions in snake\_case, events as `("anchorline", "<contract>", "<event>")` topics |
+| Naming | Contracts in PascalCase, functions in snake\_case, events as `("sylox", "<contract>", "<event>")` topics |
 
 ### 1.5 Terms used throughout
 
@@ -45,48 +120,77 @@ Soroban contracts cannot read classic Stellar DEX order books, classic liquidity
 - **Signal:** one measured input about an issued asset (peg deviation, liquidity, redemption flow, issuer actions, supply change, endpoint health).
 - **Epoch:** one signal posting interval for one asset.
 - **Credit event:** a declared failure of an issuer under a fixed definition.
-- **Series:** one protection market for one asset, one event definition and one term.
+- **Series:** one protection market for one asset and one term, pinning one event definition version for each event kind it covers.
 - **Cover:** the USDC amount a buyer is paid if the event is declared.
 - **Collateral:** USDC sellers lock to back cover.
 
 A full glossary is in Section 24.
 
+### 1.6 Trust model in v1
+
+In v1 the trust root for payouts is a set of permissioned, bonded keepers plus a 4 of 7 committee. Every step is permissionless to trigger and every signal is recomputable, but keepers and reporters are permissioned and the committee resolves disputes.
+
+Concretely: keepers (Section 5.6) and reporters (Section 7.6) are added by governance and bonded in `Staking`; anyone can recompute a posting from its inputs bundle and dispute it with a bond (Section 5.4); the committee decides signal disputes and escalated events, under a ruling deadline with a fixed default outcome (Section 8.9). Nothing in this design hides that trust: it is bounded by bonds, public recomputation and deadlines, not removed.
+
+Decentralization path, in later versions:
+
+1. Open keeper and reporter registration, with higher stakes in place of governance approval (Sections 5.6, 7.6).
+2. Onchain verifiable signal disputes, replacing committee recomputation where the inputs can be proven onchain (Section 5.4).
+3. An onchain recusal list for committee conflicts (Section 8.4).
+
+### 1.7 Phase 0 data pull
+
+Before any contract work, pull mainnet data to decide which assets launch and whether the asset wide cover cap (Section 11.1) is meaningful for them. This is a concrete task with a written output, not a diagram:
+
+1. List every mainnet issued asset referencing USD, EUR, ARS and other fiat currencies, with issuer account and home domain.
+2. For each asset: circulating supply from ledger asset stats; 90 days of classic DEX and AMM trade history against USDC and XLM; order book and pool depth within 2% of peg sampled hourly (the `liquidity_2pct` signal, Section 5.1).
+3. For each issuer: `AUTH_REVOCABLE` and `CLAWBACK_ENABLED` flags (decides whether an IssuerFreeze definition is possible, Section 8.2) and any clawback or authorization revocation in the period.
+4. For each fiat reference: which FX feeds on Stellar publish it, at what frequency, and whether they publish an official rate, a market rate, or both (Section 4.1, ARS example).
+5. Output: a table of candidate launch assets with median `liquidity_2pct`, the cover cap it implies at `liquidity_cover_ratio`, and a recommendation. An asset whose implied cap is too small to matter is a feed only asset at launch.
+
 ## 2. System architecture
 
-Data moves top to bottom: reporters and the keeper feed the oracle, the oracle feeds the event registry, and the registry's status decides how each series settles. Only `Series` contracts hold buyer and seller money.
+Data moves left to right: reporters and keepers feed the oracle, the oracle feeds the event registry, and the registry's status decides how each series settles. Money sits in exactly three places: `Series` holds buyer and seller money (collateral and premiums only), `Staking` holds bonds and stakes, and `Treasury` holds protocol fees, slashed funds and the reward pools. `RiskOracle` and `EventRegistry` hold no funds.
 
 ```mermaid
 flowchart LR
-  RN[Reporter nodes<br/>probe anchors] --> RS
-  KP[Keeper<br/>computes signals] --> RO
+  RN[Reporter nodes<br/>probe anchors] -->|submit_probe| ST
+  KP[Keepers<br/>compute signals] -->|post_signals| RO
   subgraph Soroban contracts
-    RS[ReporterStaking<br/>stakes, probe reports] -->|endpoint status| RO[RiskOracle<br/>signals, score, bands]
-    RO -->|final signals| ER[EventRegistry<br/>definitions, proposals, disputes]
-    MF[MarketFactory<br/>opens series, cover caps] -->|deploys| SE[Series<br/>collateral, quotes, cover, claims]
-    ER -->|event status| SE
+    ST[Staking<br/>keeper bonds, reporter stakes,<br/>dispute and event bonds] -->|endpoint aggregate| RO[RiskOracle<br/>signals, ring buffer, score, bands]
+    RO -->|ring buffer reads| ER[EventRegistry<br/>canonical definitions, proposals, rulings]
+    RO -->|lock bonds, slash keepers, reward keepers| ST
+    ER -->|lock, release, forfeit event bonds| ST
+    MF[MarketFactory<br/>opens series, atomic cover caps] -->|deploys| SE[Series<br/>collateral and premiums only]
+    ER -->|event status, cover gate| SE
+    SE -->|protocol fees| TR[Treasury<br/>fees, slashed funds,<br/>keeper and reporter reward pools]
+    ST -->|slashed funds, reward accruals| TR
     GV[Governor<br/>params, timelocks, upgrades]
   end
+  TR -->|keeper rewards| KP
+  TR -->|reporter rewards| RN
   RO -->|scores| RD[Readers<br/>wallets, lenders]
   CM[Committee<br/>rules on disputes] -->|rulings| ER
   BS[Buyers, sellers] <-->|USDC| SE
   SE -->|events| IX[Indexer, API]
 ```
 
-The Governor (dashed) governs every contract through timelocked actions. The indexer reads events from all contracts; the arrow shows it reading the series, the busiest source.
+The Governor governs every contract through timelocked actions; its arrows are omitted for readability. The indexer reads events from all contracts; the arrow shows it reading the series, the busiest source. Section 3.5 shows the same contracts as a build and runtime dependency graph.
 
 ## 3. Contract inventory and deployment topology
 
-Anchorline v1 is six Soroban contracts plus the Stellar Asset Contracts (SACs) of the assets it references. Three are core (oracle, registry, market factory), one is instantiated per series, and two are supporting (staking and governance).
+Sylox v1 is seven Soroban contracts plus the Stellar Asset Contracts (SACs) of the assets it references. Three are core (oracle, registry, market factory), one is instantiated per series, and three are supporting (staking, treasury and governance).
 
 ### 3.1 Contracts
 
 | Contract | Instances | Responsibility | Holds funds? |
 | --- | --- | --- | --- |
-| `RiskOracle` | 1 per network | Stores per asset signals per epoch, computes the score, exposes bands and staleness | No |
-| `EventRegistry` | 1 per network | Event definitions, Tier 1 proposals, Tier 2 claims and disputes, Tier 3 rulings, final event status | Holds reporter and disputer bonds (USDC) |
-| `ReporterStaking` | 1 per network | Reporter registration, stake, slashing, reward accrual | Holds reporter stake (USDC) |
-| `MarketFactory` | 1 per network | Opens series, tracks the series index, enforces global caps, deploys `Series` contracts | No |
-| `Series` | 1 per series | Collateral pool, quotes, cover tokens, share tokens, premiums, claims, withdrawals | Holds collateral and premiums (USDC) |
+| `RiskOracle` | 1 per network | Stores per asset signals per epoch and the ring buffer, computes the score, exposes bands, staleness and reference rates; keeps signal dispute records | No |
+| `EventRegistry` | 1 per network | Canonical versioned event definitions, Tier 1 proposals, Tier 2 claims, challenges, Tier 3 rulings, ruling deadlines, per (asset, kind) event status, the cover gate; keeps proposal and challenge records | No |
+| `Staking` | 1 per network | Keeper and reporter registration and stake, probe reports and aggregation, bond escrow for signal disputes, event proposals and challenges, slashing on instruction from `RiskOracle` and `EventRegistry` | Holds keeper bonds, reporter stakes, signal dispute bonds, event proposal and challenge bonds (USDC) |
+| `Treasury` | 1 per network | Receives protocol fees and slashed funds, keeps the keeper and reporter reward pools, pays accrued rewards, spends only by governance | Holds protocol fees, slashed funds, keeper and reporter reward pools (USDC) |
+| `MarketFactory` | 1 per network | Opens series, tracks the series index and counter, enforces global caps atomically, deploys `Series` contracts | No |
+| `Series` | 1 per series | Collateral pool, quotes, cover tokens, share tokens, premiums, claims, withdrawals | Holds collateral and premiums only (USDC) |
 | `Governor` | 1 per network | Multisig owned parameter store, timelock queue, upgrade execution, pause switches | No |
 
 ### 3.2 Why one contract per series
@@ -95,19 +199,42 @@ Anchorline v1 is six Soroban contracts plus the Stellar Asset Contracts (SACs) o
 - **Bounded state:** each series has a fixed lifetime, so its storage can expire cleanly after final settlement.
 - **Simple invariants:** one pool, one asset, one event definition, one term.
 
-The factory deploys `Series` from a single uploaded Wasm hash using `env.deployer()`, with a deterministic salt derived from `(asset, event_def_hash, term_start)`.
+The factory deploys `Series` from a single uploaded Wasm hash using `env.deployer()`, with a salt derived from a monotonically increasing series counter maintained by `MarketFactory` (`SeriesCounter`, Section 15.1). A counter can never collide, whereas a salt built from series terms would collide for two series with the same asset, definitions and start time.
 
 ### 3.3 External dependencies
 
 | Dependency | Used for | Access |
 | --- | --- | --- |
-| USDC SAC | Collateral, premiums, bonds, payouts | `token::Client` transfer and balance |
+| USDC SAC | Collateral, premiums, bonds, fees, rewards, payouts | `token::Client` transfer and balance |
 | Issued asset SACs | Reference asset identity; optional balance reads for insurable interest checks | `token::Client` balance |
-| Soroban AMM pairs (where they exist for the asset) | Onchain spot price cross check | Cross contract `get_reserves` style call, adapter per AMM |
-| Reference FX oracle | Fiat reference rate for non USD assets | Adapter contract wrapping the chosen oracle's interface |
+| Soroban AMM pairs (where they exist for the asset) | Onchain spot price cross check | `PriceAdapter`, one adapter per AMM |
+| Reference FX oracle | Fiat reference rate for non USD assets | `FxAdapter` wrapping the chosen oracle's interface |
 | Soroban Optimistic Oracle (optional) | Tier 2 dispute escalation, if adopted after review | Adapter contract |
 
-Every external read goes through an **adapter** with a fixed interface, so a dependency can be swapped by governance without changing core contracts.
+Every external read goes through an **adapter** with a fixed interface, so a dependency can be swapped by governance without changing core contracts. The two adapter interfaces the core contracts call:
+
+```rust
+/// One per Soroban AMM (contracts/adapters/amm-*). Listed per asset in
+/// AssetConfig.amm_adapters.
+pub trait PriceAdapter {
+    /// price: USDC per one unit of `asset`, SCALE 1e7.
+    /// liquidity: pool depth within 2% of that price, USDC units.
+    /// timestamp: ledger timestamp of the reserves the price was read from.
+    fn spot_price(env: Env, asset: Address) -> (i128, i128, u64); // (price, liquidity, timestamp)
+}
+
+/// Wraps an external FX feed (contracts/adapters/fx-*). Set per asset in
+/// AssetConfig.fx_adapter when the reference is Fiat.
+pub trait FxAdapter {
+    /// rate: USD per one unit of the ISO 4217 currency `code`, SCALE 1e7,
+    /// on the requested basis (FxRateSource::Official or ::Market, Section 4.1).
+    /// timestamp: time of the source observation.
+    /// Fails if the wrapped feed does not publish that basis for `code`.
+    fn rate(env: Env, code: Symbol, rate_source: FxRateSource) -> (i128, u64); // (rate, timestamp)
+}
+```
+
+Callers treat a price or rate whose `timestamp` is older than `stale_after_epochs × epoch_secs` as unavailable and fail closed: a stale AMM price is skipped in the cross check (Section 5.3), and a stale FX rate fails `RiskOracle.reference_rate` (Section 12.1).
 
 ### 3.4 Networks
 
@@ -126,10 +253,11 @@ The repository is a single Cargo workspace (Section 22.1) plus independent offch
 ```mermaid
 flowchart TB
   subgraph WS["Cargo workspace: contracts/"]
-    TY[anchorline-types<br/>rlib, shared contracttypes]
+    TY[sylox-types<br/>rlib, shared contracttypes]
     RO[risk-oracle]
     ER[event-registry]
-    RS[reporter-staking]
+    ST[staking]
+    TR[treasury]
     MF[market-factory]
     SE[series]
     GV[governor]
@@ -139,19 +267,27 @@ flowchart TB
 
   TY --> RO
   TY --> ER
-  TY --> RS
+  TY --> ST
+  TY --> TR
   TY --> MF
   TY --> SE
   TY --> GV
 
   RO -. cross contract call .-> AD1
   RO -. cross contract call .-> AD2
-  RO -. contract address .-> ER
-  RS -. contract address .-> RO
-  ER -. contract address .-> SE
+  ER -. "ring reads, set and clear event band" .-> RO
+  RO -. "bonds, keeper slash and reward" .-> ST
+  ER -. "event bonds" .-> ST
+  ST -. "endpoint aggregate" .-> RO
+  ST -. "slashed funds, reward accruals" .-> TR
+  ER -. "live series check" .-> MF
+  ER -. "event status, cover gate" .-> SE
+  SE -. "reserve_cover, release_cover" .-> MF
+  SE -. "fees" .-> TR
+  SE -. "staleness, band, reference rate" .-> RO
   MF -. deploys from Wasm hash .-> SE
-  MF -. contract address .-> RO
-  MF -. contract address .-> ER
+  MF -. "open_series checks" .-> RO
+  MF -. "open_series checks" .-> ER
 
   subgraph SVC["services/ (offchain, independent processes)"]
     KP[keeper]
@@ -166,7 +302,7 @@ flowchart TB
   end
 
   KP -- "post_signals via RPC" --> RO
-  RN -- "submit_probe via RPC" --> RS
+  RN -- "submit_probe via RPC" --> ST
   IX -- "getEvents via RPC" --> RO
   IX -- "getEvents via RPC" --> ER
   IX -- "getEvents via RPC" --> SE
@@ -177,11 +313,11 @@ flowchart TB
   KP -. "same recompute library" .-> RC
 ```
 
-Solid arrows are compile time (Cargo) dependencies; dashed arrows are runtime cross contract calls or RPC calls, not Cargo dependencies. No service is trusted for payouts (Section 18): everything a service posts is checked or disputable onchain, which is why the diagram has no arrow from a service into `Series`.
+Solid arrows are compile time (Cargo) dependencies; dashed arrows are runtime cross contract calls or RPC calls, not Cargo dependencies, and point from the caller to the callee. No service is trusted for payouts (Section 18): everything a service posts is checked or disputable onchain, which is why the diagram has no arrow from a service into `Series`. Runtime calls between `RiskOracle` and `Staking`, and between `EventRegistry` and `MarketFactory`, go in both directions, so their addresses are computed before deployment and passed to each `initialize` (Section 22.2).
 
 ## 4. Core data model
 
-All shared types live in a `anchorline-types` crate imported by every contract, so encodings never drift between contracts. Types are `#[contracttype]` unless noted.
+All shared types live in a `sylox-types` crate imported by every contract, so encodings never drift between contracts. Types are `#[contracttype]` unless noted.
 
 ### 4.1 Assets and signals
 
@@ -190,32 +326,43 @@ All shared types live in a `anchorline-types` crate imported by every contract, 
 pub struct AssetConfig {
     pub asset: Address,            // SAC address of the issued asset
     pub issuer: Address,           // classic issuer account (G...)
-    pub reference: Reference,      // what the asset should be worth
+    pub reference: Reference,      // what the asset should be worth; fixed at add_asset
     pub home_domain: String,       // for SEP-1 / SEP-24 probing
-    pub amm_adapters: Vec<Address>,// optional Soroban AMM price adapters
-    pub min_liquidity: i128,       // in USDC units, below this depeg cannot trigger
+    pub amm_adapters: Vec<Address>,// optional PriceAdapters (Section 3.3)
+    pub fx_adapter: Option<Address>,// FxAdapter (Section 3.3); required for Fiat references
+    pub min_liquidity: i128,       // USDC units; compared with the 7 day median before a depeg window
+    pub issuer_flags: IssuerFlags, // decides whether IssuerFreeze is definable
     pub enabled: bool,
+}
+
+#[contracttype]
+pub struct IssuerFlags {
+    pub auth_revocable: bool,      // AUTH_REVOCABLE
+    pub clawback_enabled: bool,    // CLAWBACK_ENABLED
 }
 
 #[contracttype]
 pub enum Reference {
     Usd,                           // 1 unit = 1 USD
-    Fiat(Symbol),                  // ISO 4217 code, priced via FX adapter
+    Fiat(Symbol, FxRateSource),    // ISO 4217 code and rate basis, priced via FxAdapter
     Asset(Address),                // pegged to another onchain asset
 }
+
+#[contracttype]
+pub enum FxRateSource { Official, Market }
 
 #[contracttype]
 pub struct SignalSet {
     pub epoch: u64,
     pub posted_at: u64,            // ledger timestamp
     pub peg_ratio: i128,           // TWAP price / reference, SCALE 1e7
-    pub peg_ratio_min: i128,       // lowest window value, SCALE 1e7
+    pub peg_ratio_p10: i128,       // 10th percentile of the window's volume weighted prices / reference, SCALE 1e7
     pub liquidity_2pct: i128,      // depth within 2% of peg, USDC units
     pub redemption_net: i128,      // net burned minus issued this epoch, asset units
-    pub supply: i128,              // total circulating supply, asset units
+    pub supply: i128,              // total circulating supply from ledger asset stats, asset units
     pub supply_change_bps: i32,    // vs previous epoch
     pub issuer_actions: IssuerActions,
-    pub endpoint: EndpointStatus,
+    pub endpoint: EndpointStatus,  // overwritten from Staking.aggregate; keeper value ignored
     pub inputs_hash: BytesN<32>,   // hash of raw inputs, for recomputation
     pub poster: Address,
 }
@@ -230,6 +377,37 @@ pub struct IssuerActions {
 
 #[contracttype]
 pub enum EndpointStatus { Unknown, Up, Degraded, Down }
+```
+
+Field notes:
+
+- **`reference` and `FxRateSource`.** Some currencies have two live exchange rates. Argentina is the standard example: for long periods the official ARS rate and the market (parallel) rate have differed by tens of percent, and at times the market rate has been more than double the official one. An ARS token redeemable at the official rate looks deeply depegged if it is measured against the market rate, and a token that trades at the market rate looks deeply depegged against the official one. So `Reference::Fiat` names its basis, and that basis is part of every event definition for the asset (Section 4.3). `update_asset` rejects any change to `reference`, so a basis can never change under a live definition.
+- **`issuer_flags`.** Recorded from the issuer account when the asset is added and kept current by governance (a change shows up in `issuer_actions.flag_changes`). Revoking authorization needs `AUTH_REVOCABLE`; clawback needs `CLAWBACK_ENABLED`. If neither is set an issuer freeze is impossible, so `register_definition` rejects an IssuerFreeze definition for that asset (Section 8.2).
+- **`min_liquidity`.** Compared with the median `liquidity_2pct` of the 7 days before a Depeg window starts, never with live liquidity (Sections 8.2, 11.4).
+- **`peg_ratio_p10`.** Replaces the old lowest window value: one wick at a bad price moves a minimum but not a 10th percentile, so a single trade cannot force a band change through component P (Section 6.1).
+- **`supply`.** Keeper posted from ledger asset stats. SEP-41 tokens expose no `total_supply` function, so supply cannot be cross checked against the SAC onchain; it is checked by recomputation like every other keeper value.
+- **`endpoint`.** Comes only from the `Staking` aggregate of reporter probes (Section 7.4). `RiskOracle` overwrites the field in `post_signals` and `finalize_endpoint`; whatever a keeper puts there is ignored, so keepers post `Unknown`.
+
+The per asset ring buffer that Tier 1 checks read is described in Section 5.8; its slot type is:
+
+```rust
+#[contracttype]
+pub enum SlotState { Empty, Pending, Disputed, Final }
+
+#[contracttype]
+pub struct RingSlot {
+    pub epoch: u64,
+    pub state: SlotState,          // per slot finality flag
+    pub pending_until: u64,        // a Pending slot reads as Final after this
+    pub peg_ratio: i128,
+    pub liquidity_2pct: i128,
+    pub redemption_net: i128,
+    pub supply: i128,
+    pub supply_change_bps: i32,
+    pub clawback_amount: i128,
+    pub auth_revocations: u32,
+    pub endpoint: EndpointStatus,
+}
 ```
 
 ### 4.2 Scores
@@ -253,16 +431,22 @@ pub enum Band { Normal, Watch, Warning, Distress, Event }
 ```rust
 #[contracttype]
 pub struct EventDefinition {
-    pub kinds: Vec<EventKind>,     // which failures trigger
-    pub depeg_threshold: i128,     // e.g. 9_500_000 = 0.95
-    pub depeg_window_secs: u64,    // e.g. 259_200 = 72h
-    pub freeze_pct_bps: u32,       // X in the PRD
-    pub mint_spike_bps: u32,       // Y in the PRD
-    pub halt_window_secs: u64,
-    pub challenge_secs: u64,       // e.g. 86_400
-    pub cure_threshold: i128,      // e.g. 9_800_000, only during challenge
+    pub asset: Address,
+    pub kind: EventKind,           // one canonical definition per (asset, kind)
+    pub version: u32,              // def_version, assigned by register_definition: previous + 1, from 1
+    pub reference: Reference,      // copy of AssetConfig.reference, fixes the FX rate source
+    pub depeg_threshold: i128,     // Depeg: e.g. 9_500_000 = 0.95
+    pub depeg_window_secs: u64,    // Depeg: e.g. 259_200 = 72h
+    pub max_missing_epochs: u32,   // Depeg: e.g. 6 of 72
+    pub cure_threshold: i128,      // Depeg: e.g. 9_800_000, only during challenge
+    pub freeze_pct_bps: u32,       // IssuerFreeze: X in the PRD
+    pub mint_spike_bps: u32,       // MintWithoutBacking: Y in the PRD
+    pub halt_window_secs: u64,     // WithdrawalHalt: e.g. 259_200 = 72h
+    pub challenge_secs: u64,       // all kinds: e.g. 86_400
+    pub ruling_deadline_secs: u64, // all kinds: e.g. 1_209_600 = 14 days from escalation
 }
-// stored by hash: event_def_hash = sha256(xdr(EventDefinition))
+// stored by (asset, kind, version); Canonical(asset, kind) names the current version.
+// Parameters that do not apply to `kind` must be zero.
 
 #[contracttype]
 pub enum EventKind { Depeg, IssuerFreeze, MintWithoutBacking, WithdrawalHalt, Insolvency }
@@ -275,15 +459,32 @@ pub struct EventRecord {
     pub id: u64,
     pub asset: Address,
     pub kind: EventKind,
+    pub def_version: u32,          // events are keyed by (asset, kind, def_version)
     pub tier: u32,                 // 1, 2 or 3
     pub state: EventState,
+    pub window_start: u64,         // start of the failure window (Section 8.6)
     pub proposed_at: u64,
+    pub escalated_at: Option<u64>, // ruling deadline = escalated_at + ruling_deadline_secs
     pub declared_at: Option<u64>,
     pub evidence_hash: BytesN<32>,
     pub proposer: Address,
-    pub bond: i128,
+    pub bond: i128,                // proposer bond held by Staking; 0 for Tier 1 and Tier 3
+}
+
+#[contracttype]
+pub enum AssetEventStatus {        // per (asset, kind), for the canonical version
+    None,
+    InProgress(u64),               // event_id
+    Declared(u64, u32, u64, u64),  // event_id, def_version, window_start, declared_at
+}
+
+#[contracttype]
+pub enum CoverGate {               // EventRegistry.cover_gate(asset), Section 9.4 step 2
+    Clear, EventInProgress, RecentDepeg, RecentEndpointOutage, RecentIssuerAction,
 }
 ```
+
+The `reference` copy is what "fixed in the event definition" means for the FX rate source: a buyer reading one definition sees exactly which rate the peg is measured against, and because `AssetConfig.reference` cannot change after `add_asset`, the copy and the oracle's live configuration always agree. `register_definition` rejects a definition whose `reference` differs from the asset's.
 
 ### 4.4 Series
 
@@ -291,8 +492,8 @@ pub struct EventRecord {
 #[contracttype]
 pub struct SeriesTerms {
     pub asset: Address,
-    pub event_def_hash: BytesN<32>,
-    pub settlement: Address,       // USDC SAC
+    pub def_versions: Map<EventKind, u32>, // covered kinds, one pinned def_version each
+    pub settlement: Address,       // USDC SAC; never `asset`, never the same issuer as `asset`
     pub start: u64,
     pub expiry: u64,               // start + 30 or 90 days
     pub claim_window_secs: u64,    // e.g. 30 days
@@ -313,38 +514,59 @@ pub struct Quote {
 }
 ```
 
+`def_versions` replaces the single definition hash of v1.0. Its keys are the event kinds the series covers; each value must equal the canonical version for `(asset, kind)` when the series opens (Section 9.7), and stays fixed for the life of the series (invariant I11).
+
+### 4.5 Staking and Treasury
+
+```rust
+#[contracttype]
+pub enum BondKey {                 // one bond in Staking escrow
+    SignalDispute(Address, u64),   // (asset, epoch), locked by RiskOracle
+    EventProposal(u64),            // event_id, Tier 2 proposer bond, locked by EventRegistry
+    EventChallenge(u64),           // event_id, challenger bond, locked by EventRegistry
+}
+
+#[contracttype]
+pub enum TreasuryBucket { Fees, Slashed, KeeperRewards, ReporterRewards }
+```
+
+`RiskOracle` and `EventRegistry` keep the dispute, proposal and challenge records; the USDC behind each record sits in `Staking` under its `BondKey` (Section 7.8). `Treasury` accounts its USDC in the four buckets (Section 12.7).
+
 ## 5. Anchor Risk Oracle
 
-The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by bonded keepers, and derives the score and band onchain from those signals. Any posting can be disputed within a window by anyone who recomputes it from public data and gets a different result.
+The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by bonded keepers, and derives the score and band onchain from those signals. Any posting can be disputed within a window by anyone who recomputes it from public data and gets a different result. `RiskOracle` holds no funds: keeper bonds and dispute bonds sit in `Staking` (Section 7.8).
 
 ### 5.1 Where each signal comes from
 
 | Signal | Computed from | How it is verified |
 | --- | --- | --- |
-| `peg_ratio`, `peg_ratio_min` | Trades on the classic DEX and classic AMM pools for the asset against USDC and XLM, over the window, volume weighted; divided by the reference rate | Recompute from Horizon or RPC trade history; onchain cross check against Soroban AMM adapters where present |
+| `peg_ratio`, `peg_ratio_p10` | Trades on the classic DEX and classic AMM pools for the asset against USDC and XLM, over the window, volume weighted; divided by the reference rate on the asset's `FxRateSource` basis (Section 4.1). `peg_ratio_p10` is the 10th percentile of the volume weighted price series in the window | Recompute from Horizon or RPC trade history; onchain cross check against `PriceAdapter`s where present |
 | `liquidity_2pct` | Classic order book offers and pool reserves within 2% of peg, valued in USDC | Recompute from a ledger snapshot at the epoch's closing ledger |
-| `redemption_net`, `supply` | Payments to and from the issuer account and burns, from ledger operations and SAC events | Recompute from ledger history; `supply` cross checked against SAC data where available |
+| `redemption_net` | Payments to and from the issuer account and burns, from ledger operations and SAC events | Recompute from ledger history |
+| `supply` | Keeper posted from ledger asset stats at the epoch's closing ledger | Recompute from ledger history. SEP-41 tokens expose no `total_supply` function, so this cannot be cross checked onchain |
 | `issuer_actions` | Clawback, set trustline flags and set options operations by the issuer | Recompute from issuer account operations |
-| `endpoint` | Majority of reporter probes for this epoch (Section 7) | Reporter signatures stored in `ReporterStaking` |
+| `endpoint` | Not keeper posted. `RiskOracle` writes the `Staking` aggregate of reporter probes for this epoch (Section 7.4) and ignores any keeper value | Reporter signatures and evidence bundles stored in `Staking` |
 
 ### 5.2 Epochs
 
 - Epoch length per asset: `epoch_secs` (default 3,600). Epoch `n` covers `[genesis + n * epoch_secs, genesis + (n + 1) * epoch_secs)`.
-- One accepted `SignalSet` per asset per epoch. Later postings for the same epoch are rejected unless the first is overturned by a dispute.
-- Windowed signals (peg TWAP) look back `window_secs` (default 72 hours) ending at the epoch close.
+- One accepted `SignalSet` per asset per epoch. Later postings for the same epoch are rejected unless the first is overturned by a dispute, which reopens the epoch for reposting.
+- Windowed signals (peg TWAP, `peg_ratio_p10`) look back `window_secs` (default 72 hours) ending at the epoch close.
+- **Backfill:** a keeper may post any epoch that closed inside the current `window_secs` and is not yet Final. A keeper outage therefore leaves no gap if keepers catch up within the window, and an overturned epoch is reposted rather than becoming a gap.
 
 ### 5.3 Posting flow
 
-1. Keeper computes the `SignalSet` offchain and stores the raw inputs bundle (trades, offers, operations, probe results) at a content addressed location (IPFS or object storage).
-2. Keeper calls `post_signals(asset, signal_set)`. The contract checks: keeper is bonded and active; epoch is current or the previous one; values are within sanity bounds (Section 11); `inputs_hash` is present.
-3. If Soroban AMM adapters exist for the asset, the contract reads their spot price and rejects a posting whose `peg_ratio` deviates more than `amm_tolerance_bps` from it, unless the AMM's liquidity is below `min_liquidity`.
-4. The posting enters `Pending` for `signal_dispute_secs` (default 2 hours), then becomes `Final`. Scores use `Pending` values immediately for display, but credit event checks only use `Final` values.
+1. Keeper computes the `SignalSet` offchain and stores the raw inputs bundle (trades, offers, operations) at a content addressed location (IPFS or object storage).
+2. Keeper calls `post_signals(asset, signal_set)`. The contract checks: keeper is bonded and active in `Staking`; the epoch closed inside the current `window_secs` and has no Pending, Disputed or Final posting; values are within sanity bounds (Section 11); `inputs_hash` is present. The keeper's `endpoint` value is discarded: if the epoch has closed and `Staking` has an aggregate for it, that aggregate is stored, otherwise `Unknown` until `finalize_endpoint` (Section 7.4).
+3. If `PriceAdapter`s exist for the asset, the contract reads each `spot_price`, converts it to a peg ratio with `reference_rate(asset)`, and rejects a posting whose `peg_ratio` deviates more than `amm_tolerance_bps` from it, unless that adapter's liquidity is below `min_liquidity` or its timestamp is stale.
+4. The posting enters `Pending` for `signal_dispute_secs` (default 2 hours), then becomes `Final`. The ring buffer slot for the epoch is written in the same call (Section 5.8). Scores use `Pending` values immediately for display, but credit event checks only use `Final` values.
 
 ### 5.4 Disputing a posting
 
-- Anyone calls `dispute_signals(asset, epoch, alt_hash)` with a bond of `signal_dispute_bond` USDC and a hash of their own inputs bundle.
-- The dispute is decided by the committee multisig in v1 (a recomputation is deterministic, so the committee runs the open source recomputation tool on both bundles). In v2, move this to an onchain verifiable recomputation where feasible.
-- Loser forfeits bond: 50% to the winner, 50% to the protocol treasury. A keeper that loses is slashed by `keeper_slash` and suspended after `keeper_max_faults`.
+- Anyone calls `dispute_signals(asset, epoch, alt_hash)` with a hash of their own inputs bundle. `RiskOracle` records the dispute and has `Staking` lock a bond of `signal_dispute_bond` USDC from the disputer under `BondKey::SignalDispute(asset, epoch)`.
+- A dispute does not reset any window. The disputed epoch stays non final (Pending in the sense of Section 5.7, `Disputed` in its ring slot) until resolved; if overturned it reopens for reposting (Section 5.2).
+- The dispute is decided by the committee multisig in v1 (a recomputation is deterministic, so the committee runs the open source recomputation tool on both bundles). Moving this to onchain verifiable recomputation is on the decentralization path (Section 1.6).
+- Loser forfeits: 50% to the winner, 50% to the `Treasury`. If the keeper wins, `RiskOracle` instructs `Staking` to forfeit the disputer's bond to the keeper. If the disputer wins, `RiskOracle` instructs `Staking` to release the disputer's bond and slash the keeper by `keeper_slash` with the disputer as winner; `Staking` suspends a keeper after `keeper_max_faults`.
 
 ### 5.5 Staleness
 
@@ -354,13 +576,13 @@ The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by 
 
 ### 5.6 Keepers
 
-- v1: up to 5 permissioned keepers, each bonded (`keeper_bond`, default 5,000 USDC), added by governance.
-- Any keeper may post for any asset; the first valid posting for an epoch wins and earns `keeper_reward` from the protocol fee pool.
-- Reference keeper implementation is open source (Section 18), so third parties can run one.
+- v1: up to 5 permissioned keepers, each added by governance and bonded in `Staking` (`keeper_bond`, default 5,000 USDC). Together with the committee they are the v1 trust root for payouts (Section 1.6).
+- Any keeper may post for any asset; the first valid posting for an epoch wins. When it becomes Final, `RiskOracle` calls `Staking.reward_keeper`, which accrues `keeper_reward` from the `Treasury` keeper reward pool.
+- Reference keeper implementation is open source (Section 18), so third parties can run one. Open keeper registration with higher stakes is a later version item (Section 1.6).
 
 ### 5.7 Signal lifecycle
 
-Every epoch's `SignalSet` moves through the same three states, independent of every other epoch. `Final` is a precondition for a Tier 1 credit event check (Section 8.2); a signal that is still `Pending` cannot trigger one.
+Every epoch's `SignalSet` moves through the same states, independent of every other epoch. `Final` is a precondition for a Tier 1 credit event check (Section 8.2); a signal that is still `Pending` or `Disputed` cannot count toward one. A dispute never resets a window: the disputed epoch simply stays non final until resolved.
 
 ```mermaid
 stateDiagram-v2
@@ -369,7 +591,7 @@ stateDiagram-v2
   Pending --> Disputed: dispute_signals (5.4)
   Disputed --> Final: resolve_signal_dispute, keeper_wins = true
   Disputed --> Overturned: resolve_signal_dispute, keeper_wins = false
-  Overturned --> [*]: epoch re-opened for posting
+  Overturned --> Pending: epoch reopened, any keeper reposts inside window_secs
   Final --> [*]
 ```
 
@@ -381,37 +603,56 @@ sequenceDiagram
   participant Store as Object storage (inputs bundle)
   participant Oracle as RiskOracle
   participant AMM as AMM adapter
+  participant Staking
   participant Disputer
   participant Committee
 
   Keeper->>Store: upload inputs bundle
   Store-->>Keeper: content hash
   Keeper->>Oracle: post_signals(asset, signal_set { inputs_hash })
-  Oracle->>Oracle: check keeper bonded + active, epoch current/previous, sanity bounds (11.3)
+  Oracle->>Staking: is_active_keeper(keeper)
+  Oracle->>Oracle: check epoch inside window_secs and not posted, sanity bounds (11.3)
+  Oracle->>Staking: aggregate(asset, epoch), keeper endpoint value ignored
   Oracle->>AMM: spot_price(asset) [if adapter configured]
-  AMM-->>Oracle: (price, liquidity)
-  Oracle->>Oracle: reject if |peg_ratio - price| > amm_tolerance_bps and liquidity >= min_liquidity
-  Oracle-->>Keeper: signals_posted event, state = Pending
+  AMM-->>Oracle: (price, liquidity, timestamp)
+  Oracle->>Oracle: reject if peg ratio gap above amm_tolerance_bps and liquidity >= min_liquidity
+  Oracle->>Oracle: write Signals(asset, epoch) and ring slot, state = Pending
+  Oracle-->>Keeper: signals_posted event
 
   alt no dispute within signal_dispute_secs
     Oracle->>Oracle: state = Final (anyone can call, or lazily on next read)
+    Oracle->>Staking: reward_keeper(keeper)
     Oracle-->>Keeper: signals_final event
   else disputed
-    Disputer->>Oracle: dispute_signals(asset, epoch, alt_hash) + bond
+    Disputer->>Oracle: dispute_signals(asset, epoch, alt_hash)
+    Oracle->>Staking: lock_bond(SignalDispute(asset, epoch), disputer, signal_dispute_bond)
     Oracle-->>Disputer: signals_disputed event, state = Disputed
-    Committee->>Committee: run anchorline-recompute on both bundles
+    Committee->>Committee: run sylox-recompute on both bundles
     Committee->>Oracle: resolve_signal_dispute(asset, epoch, keeper_wins, reason)
     alt keeper_wins
-      Oracle->>Oracle: state = Final, disputer forfeits bond (50% to protocol, 50% to keeper)
+      Oracle->>Oracle: state = Final
+      Oracle->>Staking: forfeit_bond(SignalDispute, winner = keeper), 50% keeper, 50% Treasury
       Oracle-->>Keeper: signals_resolved event
     else disputer_wins
-      Oracle->>Oracle: state = Overturned, slash keeper by keeper_slash, suspend after keeper_max_faults
-      Oracle-->>Disputer: signals_resolved event, disputer's bond returned plus 50% of keeper's forfeit
+      Oracle->>Oracle: state = Overturned, epoch reopened for reposting
+      Oracle->>Staking: release_bond(SignalDispute), disputer refunded
+      Oracle->>Staking: slash(keeper, keeper_slash, winner = disputer), 50% disputer, 50% Treasury
+      Oracle-->>Disputer: signals_resolved event
     end
   end
 ```
 
-Note on the sequence above: Section 5.4's forfeiture rule is symmetric by role, not fixed to one side — whoever loses the dispute forfeits their bond, split 50% to the winner and 50% to the protocol treasury. The diagram's `alt` branches show each direction explicitly so the asymmetry (keeper also gets `keeper_slash`'d and risks suspension; a losing disputer only forfeits their dispute bond) is visible at a glance.
+Note on the sequence above: the forfeiture rule in Section 5.4 is symmetric by role, not fixed to one side. Whoever loses the dispute forfeits, split 50% to the winner and 50% to the `Treasury`. The `alt` branches show each direction explicitly so the asymmetry is visible at a glance: a losing keeper is slashed by `keeper_slash` and risks suspension, while a losing disputer only forfeits the dispute bond. In both branches the USDC moves inside `Staking`; `RiskOracle` only sends instructions.
+
+### 5.8 Ring buffer
+
+Tier 1 checks (Section 8.2), the cover gate (Section 9.4) and the 24 hour and 7 day score aggregates (Section 6.5) all read one entry per asset: `Ring(asset)`, a ring buffer of `RingSlot`s (Section 4.1), one slot per epoch. They never read the 72 or more separate `Signals(asset, epoch)` entries a window spans.
+
+- **Size:** 240 slots at the default `epoch_secs`, which is 10 days: the longest v1 depeg window (72 hours) plus the 7 day liquidity baseline before it (Section 8.2). The 24 hour and 7 day aggregates use the newest 168 slots.
+- **Per slot finality flag:** `post_signals` writes the slot as `Pending` with `pending_until = posted_at + signal_dispute_secs`; a reader treats a `Pending` slot past `pending_until` as Final without a write. `dispute_signals` sets `Disputed`; a resolution sets `Final`, or `Empty` when overturned so the epoch can be reposted. A slot whose stored `epoch` is not the epoch expected at that position is treated as `Empty`.
+- **Missing epochs:** an `Empty` slot, or one still `Pending` or `Disputed` when a check runs, is missing. Missing epochs count neither for nor against a Depeg; at most `max_missing_epochs` of them are tolerated (Section 8.2).
+- **Encoding:** slots are stored packed as fixed width fields (about 120 bytes per slot, so about 29 KB for 240 slots). The `ring(asset)` read returns them decoded as `Vec<RingSlot>`. Storing each slot as a `contracttype` map with field names would be several times larger.
+- **Write cost:** one ring write per accepted posting, plus the `Signals(asset, epoch)` entry kept for 30 days of direct history (Section 15.2). Rewriting a 29 KB entry every epoch is the dominant cost of `post_signals`, so it must be benchmarked in the first week of the `RiskOracle` build. Fallback if it is too expensive: page the ring into entries of 24 slots each (one day per entry), so a posting rewrites one page and a 72 hour check reads 3 pages plus 7 for the baseline (Section 15.3).
 
 ## 6. Risk score
 
@@ -423,7 +664,7 @@ Let `clamp(x) = min(max(x, 0), 1)`. All divisions are fixed point with `SCALE = 
 
 | Component | Symbol | Formula | Default parameters |
 | --- | --- | --- | --- |
-| Peg deviation | P | 100 × clamp(\|1 − peg\_ratio\_min\| / d\_max) | d\_max = 0.10 |
+| Peg deviation | P | 100 × clamp(\|1 − peg\_ratio\_p10\| / d\_max) | d\_max = 0.10 |
 | Endpoint health | E | Up 0, Unknown 30, Degraded 50, Down 100 |  |
 | Redemption pressure | R | 100 × clamp(redemption\_net\_24h / (supply × r\_max)) | r\_max = 0.10 |
 | Issuer actions | I | 100 × clamp(clawback\_amount\_7d / (supply × c\_max) + auth\_revocations\_7d / k\_max) | c\_max = 0.01, k\_max = 20 |
@@ -445,8 +686,8 @@ Default weights (sum to 1): w\_P 0.35, w\_E 0.20, w\_R 0.15, w\_I 0.15, w\_L 0.1
 | Normal | 0 to 24 |  |
 | Watch | 25 to 49 |  |
 | Warning | 50 to 74 | Forced to at least Warning if P = 100 or E = 100 |
-| Distress | 75 to 100 | Forced to Distress if a credit event is Proposed or Challenged for this asset |
-| Event | n/a | Set when a credit event is Declared; sticky until governance re-enables the asset |
+| Distress | 75 to 100 | Forced to Distress if a credit event of any kind is Proposed, Challenged or Escalated for this asset |
+| Event | n/a | Set when a credit event is Declared; sticky until governance re-enables the asset by registering a new canonical version for every Declared kind (Section 8.8) |
 
 ### 6.4 Hysteresis
 
@@ -454,13 +695,14 @@ To stop bands flapping, an upward move (towards Distress) applies immediately, b
 
 ### 6.5 Implementation notes
 
-- 24 hour and 7 day aggregates (`redemption_net_24h`, `clawback_amount_7d`) are computed onchain from a ring buffer of the last 168 hourly `SignalSet`s per asset (Section 15), not trusted from the keeper.
+- 24 hour and 7 day aggregates (`redemption_net_24h`, `clawback_amount_7d`, `auth_revocations_7d`) are computed onchain from the newest 168 slots of the asset's ring buffer (Section 5.8), not trusted from the keeper. This is the same ring Tier 1 checks read.
+- Component P uses `peg_ratio_p10`, not a window minimum, so one wick at a bad price cannot force a band change. A live liquidity collapse raises component L; it never blocks a payout (Section 8.2).
 - All math in `i128`; intermediate products are bounded by sanity checks on inputs (Section 11), so overflow is unreachable for realistic supplies. Use checked arithmetic anyway and return `MathOverflow`.
 - The score is advisory data. Only credit events (Section 8), never the score, release payouts.
 
 ## 7. Reporter network and endpoint probing
 
-Endpoint health is the one signal that cannot be read from the ledger, so it comes from a set of staked reporters who each probe every anchor independently and sign what they saw. The contract accepts the majority result per epoch.
+Endpoint health is the one signal that cannot be read from the ledger, so it comes from a set of staked reporters who each probe every anchor independently and sign what they saw. `Staking` stores the reports and computes the majority result per epoch; `RiskOracle` takes the endpoint status only from that aggregate, never from a keeper. `Staking` is also the escrow for every bond in the protocol (Section 7.8).
 
 ### 7.1 What a probe checks
 
@@ -498,19 +740,20 @@ Reporters submit `submit_probe(reporter, report)` with `reporter.require_auth()`
 ### 7.4 Aggregation
 
 - At least `min_reporters` (default 3) reports from at least 2 distinct regions are needed for a status other than Unknown.
-- Status = the most severe status reported by a strict majority. With no majority, status is Degraded.
-- The aggregate is written into the epoch's `SignalSet.endpoint` when the keeper posts, or by anyone calling `finalize_endpoint(asset, epoch)` after the epoch closes.
+- Status = the status reported by a strict majority; if no strict majority, Degraded. "Strict majority" means more than half of the reports received for that asset and epoch.
+- `Staking.aggregate(asset, epoch)` computes this; it is a read with no side effects.
+- The endpoint status comes only from this aggregate. `RiskOracle` writes it into the epoch's `SignalSet.endpoint` and ring slot during `post_signals` if the aggregate exists by then, or when anyone calls `RiskOracle.finalize_endpoint(asset, epoch)` after the epoch closes. `finalize_endpoint` lives on `RiskOracle`, reads `Staking.aggregate`, and then calls `Staking.settle_probes(asset, epoch)` so rewards and faults are booked exactly once. A keeper can never set the endpoint status.
 
 ### 7.5 Incentives and slashing
 
-- Stake: `reporter_stake` (default 1,000 USDC) in `ReporterStaking`.
-- Reward: an equal share of `reporter_reward_pool` per epoch among reporters who agreed with the majority.
-- Fault: a report that disagrees with the majority in an epoch where the majority had at least 3 reporters counts one fault. More than `reporter_max_faults` (default 10) faults in 30 days triggers a slash of `reporter_slash_bps` (default 1,000 = 10%) and suspension.
+- Stake: `reporter_stake` (default 1,000 USDC), held in `Staking`.
+- Reward: an equal share of `reporter_reward_pool` per asset epoch among reporters who agreed with the majority. `Staking.settle_probes` books it by calling `Treasury.accrue_reward` against the `ReporterRewards` bucket; reporters claim with `Treasury.claim_reward`. If the bucket runs short, an accrual is capped at what it holds; nothing is owed beyond that.
+- Fault: a report that disagrees with the majority in an epoch where the majority had at least 3 reporters counts one fault. More than `reporter_max_faults` (default 10) faults in 30 days triggers a slash of `reporter_slash_bps` (default 1,000 = 10%) and suspension. The slashed amount goes to the `Treasury` (`Slashed`).
 - Provably false evidence (an evidence bundle that contradicts the signed status) is slashed fully after a committee ruling.
 
 ### 7.6 Sybil resistance
 
-v1 reporters are permissioned by governance (target 5 to 9, from different organizations and regions). Open registration with higher stakes is a v2 item.
+v1 reporters are permissioned by governance (target 5 to 9, from different organizations and regions). Open registration with higher stakes is a later version item on the decentralization path (Section 1.6).
 
 ### 7.7 Reporter lifecycle and probe aggregation
 
@@ -536,8 +779,9 @@ sequenceDiagram
   participant R2 as Reporter (us)
   participant R3 as Reporter (af)
   participant Anchor as Anchor's stellar.toml / transfer server
-  participant Staking as ReporterStaking
+  participant Staking
   participant Oracle as RiskOracle
+  participant Treasury
 
   par independent probes, every probe_secs
     R1->>Anchor: GET stellar.toml, GET /info (7.1)
@@ -555,25 +799,50 @@ sequenceDiagram
 
   Note over Staking: after epoch closes, needs >= min_reporters from >= 2 regions
   alt strict majority on one status
-    Staking->>Staking: aggregate = that status
-  else no majority
+    Staking->>Staking: aggregate = the status reported by the strict majority
+  else no strict majority
     Staking->>Staking: aggregate = Degraded (7.4)
   end
 
-  alt keeper posts before aggregation is pulled
-    Oracle->>Staking: read aggregate during post_signals
-  else no keeper posting yet
-    Anyone->>Staking: finalize_endpoint(asset, epoch)
+  Note over Oracle: endpoint status comes only from Staking.aggregate, a keeper value is always ignored
+  alt keeper posts after the epoch closed
+    Keeper->>Oracle: post_signals(asset, signal_set)
+    Oracle->>Staking: aggregate(asset, epoch)
+  else anyone finalizes, for example when the keeper posted before probes were in
+    Anyone->>Oracle: finalize_endpoint(asset, epoch)
+    Oracle->>Staking: aggregate(asset, epoch)
   end
-  Staking-->>Oracle: EndpointStatus written into SignalSet.endpoint
+  Staking-->>Oracle: EndpointStatus
+  Oracle->>Oracle: write SignalSet.endpoint and ring slot
 
-  Staking->>Staking: reporters matching aggregate earn reward share (7.5)
+  Oracle->>Staking: settle_probes(asset, epoch), once per asset epoch
+  Staking->>Treasury: accrue_reward for each reporter matching the aggregate (7.5)
   Staking->>Staking: reporters disagreeing with a 3+ majority accrue one fault
 ```
 
+### 7.8 Bond escrow and slashing
+
+`Staking` holds every bond and stake in the protocol; `RiskOracle` and `EventRegistry` keep the records that decide who wins, and send `Staking` instructions. Neither of them ever holds USDC.
+
+| Bond or stake | `BondKey` or record | Locked by | Settled by |
+| --- | --- | --- | --- |
+| Keeper bond | `Keeper(addr)` stake | Keeper, via `stake` | `slash` from `RiskOracle` on a lost signal dispute |
+| Reporter stake | `Reporter(addr)` stake | Reporter, via `stake` | Fault slashes inside `Staking` (7.5); false evidence slash after a committee ruling |
+| Signal dispute bond | `SignalDispute(asset, epoch)` | `RiskOracle.dispute_signals` | `release_bond` or `forfeit_bond` from `resolve_signal_dispute` |
+| Tier 2 proposer bond | `EventProposal(event_id)` | `EventRegistry.propose_tier2` | `release_bond` or `forfeit_bond` from `finalize`, `rule` or `resolve_timeout` |
+| Challenger bond | `EventChallenge(event_id)` | `EventRegistry.challenge` | `release_bond` or `forfeit_bond` from `rule` or `resolve_timeout` |
+
+Settlement rules:
+
+- `release_bond(key)` credits the full bond back to its owner.
+- `forfeit_bond(key, winner)` credits 50% to the winner and sends 50% to the `Treasury` (`Slashed`). With no bonded counterparty (a challenge against a Tier 1 or Tier 3 proposal), `winner` is `None` and 100% goes to the `Treasury`.
+- `slash(who, amount, winner, reason)` takes from a keeper or reporter stake with the same 50/50 split, and suspends the keeper or reporter once its fault limit is reached.
+- Refunds and winnings are credited to a claimable balance and paid by `claim(who)`, never pushed, so a recipient whose USDC trustline is missing or frozen cannot block a resolution.
+- On a ruling deadline timeout (Section 8.9) every bond on the event is released; nobody is slashed.
+
 ## 8. Credit Event Registry
 
-`EventRegistry` is the only contract that can move an asset into the Declared state, and Declared is the only state that releases payouts. Each event moves through a fixed state machine; every transition is permissionless to trigger, but bonded and time locked.
+`EventRegistry` is the only contract that can move an event into the Declared state, and Declared is the only state that releases payouts. It holds one canonical, versioned definition per (asset, kind) (Section 8.8), keys every event by (asset, kind, def_version), and keeps event status per (asset, kind), so a Declared WithdrawalHalt never blocks a later Depeg on the same asset. Each event moves through a fixed state machine; every transition is permissionless to trigger, but bonded and time locked. `EventRegistry` holds no funds: proposal and challenge bonds sit in `Staking` (Section 7.8).
 
 ```mermaid
 stateDiagram-v2
@@ -582,9 +851,11 @@ stateDiagram-v2
   Proposed --> Declared: no challenge before window ends
   Proposed --> Cured: price recovers
   Proposed --> Challenged: challenged
-  Challenged --> Escalated: auto
+  Challenged --> Escalated: auto, same call in v1
   Escalated --> Declared: committee declares
   Escalated --> Rejected: committee rejects
+  Escalated --> Declared: resolve_timeout, Tier 1 data met the definition
+  Escalated --> Rejected: resolve_timeout, Tier 2 or 3 claim
   Cured --> None: after cooldown
   Rejected --> None: after cooldown
   Declared --> [*]
@@ -594,56 +865,86 @@ stateDiagram-v2
 
 | From | To | Trigger | Who |
 | --- | --- | --- | --- |
-| None | Proposed | `propose_tier1` passes checks, or `propose_tier2` with bond, or `propose_tier3` by committee | Anyone (T1, T2), committee (T3) |
+| None | Proposed | `propose_tier1` passes checks, or `propose_tier2` with bond, or `propose_tier3` by committee, always against the canonical definition for (asset, kind) | Anyone (T1, T2), committee (T3) |
 | Proposed | Challenged | `challenge` with bond inside `challenge_secs` | Anyone |
 | Proposed | Declared | `finalize` after `challenge_secs` with no challenge | Anyone |
 | Proposed | Cured | Depeg only: `finalize` sees `peg_ratio` above `cure_threshold` for the whole challenge window | Anyone |
-| Challenged | Escalated | `escalate` immediately (v1 always escalates to committee) | Anyone |
-| Escalated | Declared or Rejected | `rule(event_id, outcome, reason_hash)` | Committee multisig |
-| Cured, Rejected | None | Automatic; the asset can be proposed again after `cooldown_secs` |  |
-| Declared | (terminal) | No reversal |  |
+| Challenged | Escalated | Automatic inside the same `challenge` call (v1 always escalates to the committee); sets `escalated_at`, which starts the ruling deadline | Anyone (the challenger) |
+| Escalated | Declared or Rejected | `rule(event_id, outcome, reason_hash)` before the ruling deadline | Committee multisig |
+| Escalated | Declared or Rejected | `resolve_timeout(event_id)` after the ruling deadline: Declared for escalated Tier 1 Depeg and IssuerFreeze, Rejected for everything else (Section 8.9) | Anyone |
+| Cured, Rejected | None | Automatic; the (asset, kind) can be proposed again after `cooldown_secs` |  |
+| Declared | (terminal) | No reversal for this (asset, kind, def_version) |  |
+
+Escalation happens in the same call as the challenge so that no event can sit in Challenged with no clock running: if escalation were a separate call, a challenger could stall a Tier 1 event indefinitely by never escalating.
 
 ### 8.2 Tier 1 checks (keeper data, recomputable)
 
-`propose_tier1(asset, kind)` reads `Final` signals from `RiskOracle` and checks:
+`propose_tier1(caller, asset, kind)` takes only (asset, kind) and always uses the current canonical definition for that pair (Section 8.8); the caller cannot pick a version. It reads the asset's ring buffer from `RiskOracle` in one call (`ring(asset)`, Section 5.8), never the 72 or more separate `Signals` entries a window spans, and checks only Final slots:
 
-- **Depeg:** every epoch in the last `depeg_window_secs` has `peg_ratio < depeg_threshold` and `liquidity_2pct >= min_liquidity`. Missing epochs count as failing the check, not passing it.
-- **IssuerFreeze:** over the last 7 days, `clawback_amount / supply >= freeze_pct_bps` or `auth_revocations` above the threshold, and no governance flag marks the issuer's action as a declared compliance action.
-- **MintWithoutBacking:** `supply_change_bps >= mint_spike_bps` within 24 hours and `redemption_net` shows no matching inflow. Proposed as Tier 1 but always escalated to the committee before Declared.
+- **Depeg:** the window is the `depeg_window_secs` ending at the close of the latest Final epoch. It passes if every present (Final) slot in the window has `peg_ratio < depeg_threshold`, and the number of missing slots (no Final posting, Section 5.8) is at most `max_missing_epochs` (default 6 of 72). Missing epochs count neither for nor against. Liquidity floor: the median `liquidity_2pct` of the Final slots in the 7 days before the window started must be at least `min_liquidity`; liquidity inside the window is never checked. A live liquidity collapse is its own signal (component L, Section 6.1) and an input for the committee if the event is challenged, never a reason to block a payout. `window_start` = the start of the window's first epoch.
+- **IssuerFreeze:** only definable for an asset whose `AssetConfig.issuer_flags` has `auth_revocable` or `clawback_enabled` set; `register_definition` rejects it otherwise (Section 8.8). Over the 7 days ending at the latest Final epoch, `clawback_amount / supply >= freeze_pct_bps` or `auth_revocations` above the threshold, and no governance flag marks the issuer's action as a declared compliance action. `window_start` = the start of the epoch holding the first counted clawback or revocation in those 7 days.
+- **MintWithoutBacking** (later build phase, Section 1.2): `supply_change_bps >= mint_spike_bps` within 24 hours and `redemption_net` shows no matching inflow. Proposed as Tier 1 but always escalated to the committee before Declared, so for the ruling deadline it is treated as a claim (Section 8.9). `window_start` = the start of the 24 hour window.
 
-No bond is required for Tier 1 proposals, because the data is already final and bonded at the oracle layer.
+No bond is required for Tier 1 proposals, because the data is already final and bonded at the oracle layer. Any challenge to a Tier 1 proposal still posts `challenge_bond`.
 
 ### 8.3 Tier 2: reporter claims
 
-- `propose_tier2(proposer, asset, kind, evidence_hash)` for **WithdrawalHalt**, with `claim_bond` (default 2,000 USDC).
+WithdrawalHalt is the least reliable event type: an anchor's endpoints can fail for reasons that are not a halt, and a real halt can sit behind endpoints that still answer. It is therefore Tier 2 only, never Tier 1, and comes in a later build phase (Section 1.2).
+
+- `propose_tier2(proposer, asset, kind, evidence_hash)` for **WithdrawalHalt**, with `claim_bond` (default 2,000 USDC) locked in `Staking` under `BondKey::EventProposal(event_id)`.
+- Evidence: reporter probes (the `Staking` aggregate and the reporters' evidence bundles); user submitted SEP-24 transactions stuck in a pending status beyond a threshold, with their transaction ids and status history; and anchor cooperation where available (the anchor confirming or denying the halt). The bundle is referenced by `evidence_hash`.
 - Auto support: if the oracle's aggregated endpoint status has been Down for every epoch in `halt_window_secs`, the proposal is marked `supported` and no challenge bond multiplier applies.
-- Challengers post `challenge_bond = claim_bond × challenge_multiplier` (default 1).
-- Bond outcomes: winner gets their bond back plus 50% of the loser's; 50% goes to the treasury.
+- Challengers post `challenge_bond = claim_bond × challenge_multiplier` (default 1), locked under `BondKey::EventChallenge(event_id)`.
+- Bond outcomes: winner gets their bond back plus 50% of the loser's; 50% goes to the `Treasury` (Section 7.8). On a ruling deadline timeout all bonds are refunded.
+- `window_start` = `proposed_at − halt_window_secs`: the claim asserts that the whole halt window failed.
 
 ### 8.4 Tier 3: committee
 
-- Committee: an M of N multisig address (default 4 of 7) registered in `Governor`.
-- Handles **Insolvency** directly through `propose_tier3`, and all escalated disputes through `rule`.
+- Committee: an M of N multisig address (default 4 of 7) registered in `Governor`. Together with the keepers it is the v1 trust root for payouts (Section 1.6).
+- Handles **Insolvency** directly through `propose_tier3` (later build phase), and all escalated disputes through `rule`, before each event's ruling deadline (Section 8.9).
 - Every ruling stores `reason_hash` pointing to a published written reason.
-- Committee members must declare conflicts; a member with a conflict must not sign (enforced socially in v1, by an onchain recusal list in v2).
+- Committee members must declare conflicts; a member with a conflict must not sign (enforced socially in v1, by an onchain recusal list later, Section 1.6).
+- Insolvency has no measurement window: its `window_start` is `proposed_at`.
 
 ### 8.5 Effects of Declared
 
 On Declared, the registry:
 
-1. Sets `event_status(asset) = Declared { event_id, kind, declared_at }`.
+1. Sets `event_status(asset, kind) = Declared(event_id, def_version, window_start, declared_at)`. Other kinds on the same asset are unaffected.
 2. Calls `RiskOracle.set_event_band(asset)`.
-3. Emits `EventDeclared`.
+3. Settles the event's bonds in `Staking` (Section 7.8).
+4. Emits `event_declared`.
 
-Series contracts do not get pushed a message; they **pull** status via `event_status(asset)` when someone calls `trigger` or `claim` (Section 9), which keeps the registry independent of how many series exist.
+From then on `MarketFactory` refuses new series on the asset (`EventRegistry.has_declared(asset)`, Section 9.7) until governance re-enables it by registering a new canonical version for every Declared kind on the asset (Section 8.8).
+
+Series contracts do not get pushed a message; they **pull** status via `event_status(asset, kind)` for each kind they cover when someone calls `trigger` or `sync` (Section 9), which keeps the registry independent of how many series exist.
 
 ### 8.6 Which series an event covers
 
-An event covers a series if: the series' `asset` matches; the event `kind` is in the series' `EventDefinition.kinds`; and `proposed_at` falls inside `[series.start, series.expiry]`. Using `proposed_at` (not `declared_at`) means cover bought before a failure still pays if the ruling lands after expiry.
+An event covers a series if all of these hold:
+
+1. The series' `asset` matches.
+2. The event's `kind` is a key of the series' `def_versions`, and the event's `def_version` equals the version pinned for that kind.
+3. The event's failure window starts inside the term: `series.start <= window_start <= series.expiry`.
+4. The event was proposed no later than one window length after expiry: `proposed_at <= series.expiry + window_len(kind)`.
+
+During that post expiry acceptance period the series stays Pending (Section 9.2), so sellers cannot withdraw collateral that a late but valid proposal might need.
+
+| Kind | `window_start` | `window_len(kind)` |
+| --- | --- | --- |
+| Depeg | Start of the first epoch of the evaluated window | `depeg_window_secs` |
+| IssuerFreeze | Start of the epoch of the first counted clawback or revocation | 7 days |
+| MintWithoutBacking | Start of the 24 hour window | 24 hours |
+| WithdrawalHalt | `proposed_at − halt_window_secs` | `halt_window_secs` |
+| Insolvency | `proposed_at` | 0 (must be proposed by expiry) |
+
+Why the failure window start and not the proposal time: a 90 day series whose asset starts to depeg on day 88 cannot be proposed before expiry, because a 72 hour window needs 72 hours of failing epochs and only 48 remain. Keying coverage on `proposed_at` would let that series expire unpaid even though the failure began while the cover was live. With this rule the window starts on day 88, inside the term; the proposal becomes possible on day 91 and is accepted until day 93 (expiry plus 72 hours); the series waits in Pending and pays. Conversely, a depeg that starts after expiry is never covered, however long the acceptance period runs, because its window starts outside the term.
+
+Combined with the cover gate (Section 9.4 step 2), which blocks buying while any posted epoch in the trailing depeg window is below threshold, this also guarantees that any depeg window that triggers a payout started after the purchase: a Depeg needs every present epoch of its window to fail, and the buyer could only buy when every posted epoch of the trailing window passed. The one precise caveat is epochs not yet posted at the moment of purchase (the open epoch plus any keeper backlog, which the staleness rule in Section 5.5 caps below `stale_after_epochs`); a window can start that many epochs before the purchase only if those epochs later post as failing.
 
 ### 8.7 End to end: Tier 1 depeg to a buyer's payout
 
-This traces one concrete path through the state machine in Section 8's diagram: an uncontested Tier 1 proposal declared after its challenge window, then a series pulling that status to pay out a buyer. Tier 2 (bonded challenge, committee escalation) and Tier 3 (direct committee ruling) replace the middle section only; the pull based settlement at the end is identical for every tier.
+This traces one concrete path through the state machine in Section 8's diagram: an uncontested Tier 1 proposal declared after its challenge window, then a series pulling that status to pay out a buyer. A challenged event (escalation to the committee, ruling or ruling deadline timeout, Section 8.9) and Tier 3 (direct committee ruling) replace the middle section only; the pull based settlement at the end is identical for every tier.
 
 ```mermaid
 sequenceDiagram
@@ -652,24 +953,27 @@ sequenceDiagram
   participant Series as Series (covers this asset)
   participant Buyer
 
-  Note over Oracle: 72h of Final signals already show peg_ratio < depeg_threshold (8.2)
+  Note over Oracle: ring buffer, every Final slot in the last 72h has peg_ratio < depeg_threshold, at most 6 missing (8.2)
   Buyer->>Registry: propose_tier1(asset, Depeg)
-  Registry->>Oracle: read Final SignalSets for depeg_window_secs
-  Registry->>Registry: check passes (8.2), state = Proposed, emit event_proposed
+  Registry->>Registry: load canonical Depeg definition for asset (8.8)
+  Registry->>Oracle: ring(asset), one read
+  Registry->>Registry: check passes, 7 day baseline liquidity >= min_liquidity (8.2)
+  Registry->>Registry: state = Proposed, record def_version and window_start, emit event_proposed
   Series->>Series: buy_cover blocked while Proposed (9.4 step 2)
 
   Note over Registry: challenge_secs elapses, no challenge posted
   Anyone->>Registry: finalize(event_id)
   Registry->>Registry: state = Declared, declared_at = now
   Registry->>Oracle: set_event_band(asset)
-  Registry-->>Anyone: event_declared { event_id, kind, proposed_at, declared_at }
+  Registry-->>Anyone: event_declared { event_id, kind, def_version, window_start, declared_at }
 
   Note over Series: no message is pushed, Series learns on its own next call (8.5)
   Anyone->>Series: trigger()
   Series->>Series: sync_state()
-  Series->>Registry: event_status(asset)
-  Registry-->>Series: Declared(event_id, Depeg, proposed_at, declared_at)
-  Series->>Series: check covers(event_id, event_def_hash, start, expiry) (8.6)
+  Series->>Registry: event_status(asset, Depeg)
+  Registry-->>Series: Declared(event_id, def_version, window_start, declared_at)
+  Series->>Registry: covers(event_id, def_versions[Depeg], start, expiry) (8.6)
+  Registry-->>Series: true
   Series->>Series: state = Triggered, record event_id
   Series-->>Anyone: triggered { event_id }
 
@@ -677,6 +981,62 @@ sequenceDiagram
   Series->>Series: burn amount cover units from holder
   Series->>Buyer: transfer amount USDC
   Series-->>Buyer: claimed { amount }
+```
+
+### 8.8 Canonical definitions and versions
+
+There is exactly one canonical `EventDefinition` per (asset, kind), registered by governance through the `RegisterDefinition` action (7 day timelock). Definitions are never edited; a change registers a new version.
+
+- **Registration:** `register_definition(def)` stores the definition under `(asset, kind, version)` with `version` = the current canonical version plus one (1 for the first), and points `Canonical(asset, kind)` at it. It rejects the definition if:
+  - the asset is not registered in `RiskOracle`, or `def.reference` differs from `AssetConfig.reference`;
+  - a parameter that does not apply to `kind` is non zero, or the Depeg window plus the 7 day baseline does not fit in the ring buffer (Section 5.8);
+  - `kind` is IssuerFreeze and the asset's `issuer_flags` has neither `auth_revocable` nor `clawback_enabled` (`FreezeImpossible`);
+  - an event for (asset, kind) is in progress;
+  - any live series on the asset still pins the current version for `kind` (`DefinitionInUse`). The registry checks this by reading `MarketFactory.series_for(asset)` (at most `max_series_per_asset` entries) and each series' `terms()`.
+- **Invariant I13:** every live series pins the current canonical version of each kind it covers. It follows from the last rejection rule plus `open_series` accepting only current versions (Section 9.7). Because of it, `event_status(asset, kind)` is unambiguous: the status a series reads is always the status of the version it pinned. To change a definition, governance stops opening series that pin the old version, lets the live ones expire or trigger (and calls `sync` on them), then executes the queued `RegisterDefinition`.
+- **Proposals:** `propose_tier1`, `propose_tier2` and `propose_tier3` take (asset, kind) and always use the current canonical version. Nobody can choose a more favourable version.
+- **Status:** `event_status(asset, kind)` reports the status of (asset, kind) under its canonical version. A new version starts at `None`.
+- **Re-enabling after Declared:** after any Declared event on an asset, `MarketFactory` blocks new series on that asset. Governance re-enables it by registering a new canonical version (possibly with identical parameters) for every Declared kind on the asset. When the last Declared kind on the asset gets a new version, the registry calls `RiskOracle.clear_event_band(asset)`, the band returns to its score, and `open_series` works again. The old Declared event stays on record under its old version.
+
+### 8.9 Ruling deadline and default outcome
+
+The committee must rule within `ruling_deadline_secs` (default 14 days) of escalation, which in v1 is the moment of the challenge. If it has not, anyone can call `resolve_timeout(event_id)`:
+
+| Event | Default on timeout | Why |
+| --- | --- | --- |
+| Escalated Tier 1: Depeg, IssuerFreeze | Declared | The data already met the definition; the challenger carries the burden of proof |
+| Tier 2: WithdrawalHalt | Rejected | Based on claims |
+| Tier 3: Insolvency | Rejected | Based on claims |
+| MintWithoutBacking | Rejected | The Tier 1 data is only a flag; the definition requires committee confirmation, so it is treated as a claim |
+
+On timeout every bond on the event is refunded through `Staking.release_bond`; nobody is slashed for the committee's silence. The registry records the miss against the committee address that was registered at escalation (`CommitteeMisses(committee)`), emits `ruling_timed_out`, and missed deadlines are grounds for rotating the committee through governance (`SetCommittee`). A declared outcome on timeout has the same effects as any other Declared (Section 8.5).
+
+Bound on Pending: once a series' post expiry acceptance period (Section 8.6) has ended, the latest possible proposal can be challenged for at most one challenge window and then ruled on or timed out within the ruling deadline. So no series can sit in Pending beyond the ruling deadline plus one challenge window after its acceptance period; with the default Depeg definition that is at most 3 + 1 + 14 = 18 days after expiry. `resolve_timeout` is permissionless, so the bound does not depend on the committee acting.
+
+```mermaid
+sequenceDiagram
+  participant Challenger
+  participant Registry as EventRegistry
+  participant Staking
+  participant Committee
+  participant Anyone
+
+  Challenger->>Registry: challenge(event_id, evidence)
+  Registry->>Staking: lock_bond(EventChallenge(event_id), challenger, challenge_bond)
+  Registry->>Registry: state = Escalated, escalated_at = now
+  Registry-->>Challenger: event_escalated { event_id, ruling_deadline }
+
+  alt committee rules before the deadline
+    Committee->>Registry: rule(event_id, declare, reason)
+    Registry->>Registry: state = Declared or Rejected
+    Registry->>Staking: release_bond for the winner, forfeit_bond for the loser
+  else deadline passes with no ruling
+    Anyone->>Registry: resolve_timeout(event_id)
+    Registry->>Registry: Declared if escalated Tier 1 Depeg or IssuerFreeze, else Rejected
+    Registry->>Staking: release_bond for every bond on the event
+    Registry->>Registry: CommitteeMisses(committee) += 1
+    Registry-->>Anyone: ruling_timed_out { event_id, outcome, committee }
+  end
 ```
 
 ## 9. Protection Markets
@@ -687,9 +1047,8 @@ Each `Series` contract is a self contained market: sellers deposit USDC and post
 stateDiagram-v2
   [*] --> Open
   Open --> Closed: sale end
-  Closed --> Pending: expiry, event still open
-  Closed --> Expired: expiry, no event open
-  Pending --> Expired: event rejected or cured
+  Closed --> Pending: expiry, acceptance period starts
+  Pending --> Expired: acceptance period over, no covering event open
   Open --> Triggered: event declared
   Closed --> Triggered: event declared
   Pending --> Triggered: event declared
@@ -699,7 +1058,7 @@ stateDiagram-v2
 
 ### 9.1 Positions
 
-- **Seller position** (non fungible, keyed by seller address): `collateral`, `cover_written`, `premium_earned`, `quote`. Invariant: `cover_written <= collateral`. Transferable with `transfer_position(from, to)`, which moves the whole position.
+- **Seller position** (non fungible, keyed by seller address): `collateral`, `cover_written`, `premium_earned`, `quote`. Invariant: `cover_written <= collateral`. Transferable with `transfer_position(from, to)`, which moves the whole position. In v1 it rejects with `RecipientHasPosition` if `to` already holds a position in the series, because merging two positions (and their quotes) is not defined; the recipient must withdraw or transfer its own position first.
 - **Cover units** (fungible within the series): the `Series` contract implements the SEP-41 token interface for cover units, so wallets can show and transfer them. Symbol `CVR-<asset code>-<expiry yyyymmdd>`, 7 decimals to match USDC.
 
 ### 9.2 Series states
@@ -709,11 +1068,11 @@ stateDiagram-v2
 | Open | Before `sale_end` | Deposit, quote, buy, withdraw unencumbered collateral |
 | Closed | `sale_end` to `expiry`; no new cover | Withdraw unencumbered collateral |
 | Triggered | A covered event is Declared | Claims; sellers withdraw `collateral − cover_written` plus premiums |
-| Pending | After `expiry`, a covering event is still Proposed, Challenged or Escalated | Nothing until it resolves |
+| Pending | After `expiry`, while the acceptance period runs (one window length per covered kind, the longest one counts, Section 8.6) or while an event that could cover the series is still Proposed, Challenged or Escalated | Nothing until it resolves; bounded by Section 8.9 |
 | Expired | After `expiry`, no covering event | Sellers withdraw everything; cover units are worthless |
 | Finalized | All seller balances withdrawn | Read only; storage may lapse |
 
-`sale_end = expiry − sale_cutoff_secs` (default 3 days). Transitions are lazy: any state changing call first runs `sync_state()`, which reads the clock and `EventRegistry.event_status(asset)`.
+`sale_end = expiry − sale_cutoff_secs` (default 3 days). Transitions are lazy: any state changing call first runs `sync_state()`, which reads the clock and `EventRegistry.event_status(asset, kind)` for each kind in `def_versions`. When a series reaches Expired or Triggered, `sync_state()` calls `MarketFactory.release_cover`, which also removes the series from the factory's live list.
 
 ### 9.3 Quotes and the order book
 
@@ -726,12 +1085,27 @@ stateDiagram-v2
 `buy_cover(buyer, amount, max_rate_bps) -> (filled, premium_paid)`:
 
 1. `buyer.require_auth()`; `sync_state()`; series must be Open.
-2. Reject if the asset is stale, its band is Distress or Event, or any event is Proposed, Challenged or Escalated for the asset. This blocks buying cover on a failure already in progress.
-3. Check caps: series total cover plus `amount` is at most `cap`; buyer's cover plus `amount` is at most `max_cover_per_buyer`; asset wide open cover across all series is at most the liquidity cap (Section 11).
-4. If `require_holding`: buyer's issued asset balance (read from the asset's SAC) times the latest `peg_ratio` must be at least the buyer's resulting cover.
+2. Reject if any of these holds (this blocks informed buying, ADR-003):
+   - the asset is stale (`AssetStale`), or its band is Distress or Event (`AssetDistressed`);
+   - `EventRegistry.cover_gate(asset)` is not `Clear`:
+     - `EventInProgress`: any event of any kind is Proposed, Challenged or Escalated for the asset (`AssetDistressed`);
+     - `RecentDepeg`: any posted epoch (Pending or Final) in the trailing `depeg_window_secs` has `peg_ratio < depeg_threshold` (`RecentFailureSignals`);
+     - `RecentEndpointOutage`: the endpoint status was Down or Degraded in any epoch of the trailing `halt_window_secs` (`RecentFailureSignals`);
+     - `RecentIssuerAction`: any clawback or authorization revocation, the actions IssuerFreeze counts, occurred in the last 7 days (`RecentFailureSignals`).
+
+   The gate reads the ring buffer once (Section 5.8). Thresholds and windows come from the asset's canonical definitions, which for the kinds a live series covers are exactly the versions it pins (invariant I13); where the asset has no definition of a kind, the Section 23 default for that parameter applies. Because a Depeg requires every present epoch in its window to fail, this guarantees that any depeg window that triggers a payout started after the purchase (Section 8.6 states the exact caveat).
+3. Check the series' own caps: series total cover plus `amount` is at most `cap`; buyer's cover plus `amount` is at most `max_cover_per_buyer`. The series never reads the asset wide cap.
+4. If `require_holding`: the USD value of the buyer's issued asset balance must be at least the buyer's resulting cover in USDC:
+
+   ```math
+   \text{balance} \times \text{peg\_ratio} \times \text{fx\_rate} \ge \text{resulting cover}
+   ```
+
+   `balance` is read from the asset's SAC, `peg_ratio` is the latest posted value, and `fx_rate` is the reference to USD rate from `RiskOracle.reference_rate(asset)`: `SCALE` for a `Usd` reference, `FxAdapter.rate(code, rate_source)` for a `Fiat` reference. A stale rate fails closed. All factors are fixed point with `SCALE`, rounded down. `open_series` rejects `require_holding` for an asset with an `Asset` reference in v1 (Section 9.7), so that case never reaches this step.
 5. Walk quotes from cheapest; skip any with `rate_bps > max_rate_bps`; fill until `amount` or quotes run out. For each fill, compute the premium (Section 10), add `fill` to the seller's `cover_written` and the premium net of fee to `premium_earned`.
-6. Transfer total premium from buyer to the series (USDC); transfer the fee part to the treasury; mint `filled` cover units to the buyer.
-7. Emit `CoverBought`. Partial fills are allowed; the caller sees `filled < amount`.
+6. Call `MarketFactory.reserve_cover(series, filled)`. The factory checks `open_cover(asset) + filled <= cover_cap(asset)` and reserves in the same call, or fails with `CoverCapExceeded` and the whole purchase reverts. There is no separate read of the cap, so there is no window between checking and reserving.
+7. Transfer total premium from buyer to the series (USDC); pay the fee part into the `Treasury` with `Treasury.deposit(series, Fees, fee)`; mint `filled` cover units to the buyer.
+8. Emit `cover_bought`. Partial fills are allowed; the caller sees `filled < amount`.
 
 Call sequence for the steps above, using the two seller example from Section 10.5 (Seller A quotes 400 bps, Seller B quotes 300 bps; buyer walks the book cheapest first):
 
@@ -739,40 +1113,47 @@ Call sequence for the steps above, using the two seller example from Section 10.
 sequenceDiagram
   participant Buyer
   participant Series
-  participant Factory as MarketFactory
   participant Oracle as RiskOracle
   participant Registry as EventRegistry
+  participant Factory as MarketFactory
   participant AssetSAC as Issued asset SAC
   participant USDC as USDC SAC
+  participant Treasury
 
   Buyer->>Series: buy_cover(amount, max_rate_bps)
   Series->>Series: require_auth(buyer), sync_state(), check state == Open
   Series->>Oracle: is_stale(asset), band(asset)
-  Series->>Registry: event_status(asset)
-  Series->>Series: reject if stale, band in {Distress, Event}, or event in progress (step 2)
+  Series->>Registry: cover_gate(asset)
+  Registry->>Oracle: ring(asset), one read
+  Registry-->>Series: Clear, or the first failing check
+  Series->>Series: reject if stale, band Distress or Event, or gate not Clear (step 2)
 
-  Series->>Factory: open_cover(asset), cover_cap(asset)
   Series->>Series: check series cap and max_cover_per_buyer (step 3)
 
   opt require_holding
     Series->>AssetSAC: balance(buyer)
-    Series->>Series: check balance * peg_ratio >= resulting cover (step 4)
+    Series->>Oracle: latest(asset).peg_ratio, reference_rate(asset)
+    Series->>Series: check balance x peg_ratio x fx_rate >= resulting cover (step 4)
   end
 
   Series->>Series: walk quotes cheapest first (step 5)
   Note over Series: fills 50,000 from Seller B @ 300 bps, then 30,000 from Seller A @ 400 bps
   Series->>Series: compute premium per fill (10.1), credit each seller's premium_earned net of fee
 
-  Buyer->>USDC: approve / transfer total premium to Series
-  Series->>USDC: transfer fee share to treasury
-  Series->>Series: mint filled cover units to buyer (step 6)
-  Series->>Factory: reserve_cover(asset, filled)
+  Series->>Factory: reserve_cover(series, filled)
+  Factory->>Factory: check open_cover + filled <= cover_cap and reserve, one call (step 6)
+  Factory-->>Series: ok, or CoverCapExceeded and the whole call reverts
+
+  Buyer->>USDC: transfer total premium to Series
+  Series->>Treasury: deposit(series, Fees, fee)
+  Treasury->>USDC: transfer fee from Series to Treasury
+  Series->>Series: mint filled cover units to buyer (step 7)
   Series-->>Buyer: cover_bought { filled, premium, fee, fills: [(B, 50000, 300), (A, 30000, 400)] }
 ```
 
 ### 9.5 Triggering and claiming
 
-- `trigger()`: anyone; succeeds if the registry reports a Declared event covering this series (Section 8.6). Moves to Triggered and records `event_id`.
+- `trigger()`: anyone; succeeds if, for some kind the series covers, the registry reports a Declared event covering this series (Section 8.6). Moves to Triggered and records `event_id`. If several covered kinds are Declared, the first in `EventKind` order is recorded; the payout is the same.
 - `claim(holder, amount)`: burns `amount` cover units from `holder` (with `holder.require_auth()`) and transfers `amount` USDC to `holder`.
 - `claim_for(holder)`: anyone may push a holder's full balance to them after `claim_window_secs`, so funds are never stuck because a holder is inactive.
 - Payouts come from the pooled collateral. Because each seller's `cover_written` is at most their collateral, total collateral always covers total cover units (Section 21 invariant I1).
@@ -787,6 +1168,25 @@ sequenceDiagram
 | Pending | Nothing |
 
 Premiums are not withdrawable before Triggered or Expired, so a seller cannot take premiums and run before the outcome is known.
+
+### 9.7 Opening a series
+
+`MarketFactory.open_series(terms)` (governor only in v1) validates the terms, then deploys the series. It rejects, in this order:
+
+| Check | Error |
+| --- | --- |
+| Asset unknown, disabled or stale in `RiskOracle` | `InvalidTerms` |
+| Any event on the asset is Declared under its canonical version (`EventRegistry.has_declared(asset)`); new series stay blocked until governance re-enables the asset (Section 8.8) | `AssetBlocked` |
+| `def_versions` is empty, or any pinned version is not the current canonical version for (asset, kind) | `DefinitionNotCurrent` |
+| `settlement == asset` | `InvalidSettlement` |
+| The settlement asset has the same issuer as the covered asset. The factory reads the settlement SAC's `name()`, which is `CODE:ISSUER` for a classic asset, and compares the issuer with `AssetConfig.issuer` | `InvalidSettlement` |
+| `require_holding` is set and the asset's reference is `Asset(_)` | `InvalidTerms` |
+| Dates, cap, claim window or fee invalid | `InvalidTerms` |
+| The asset already has `max_series_per_asset` live series | `TooManySeries` |
+
+The two settlement rules stop a series from paying out in the very asset whose failure it covers, or in an asset that fails together with it because the same issuer stands behind both.
+
+On success the factory increments `SeriesCounter`, derives the deployment salt from it (Section 3.2), deploys the `Series` Wasm with constructor arguments `(terms, factory, oracle, registry, treasury)`, adds the series to `Deployed` and `SeriesList(asset)`, and emits `series_opened`.
 
 ## 10. Settlement and accounting math
 
@@ -808,7 +1208,7 @@ For a fill of `c` cover units from a quote at `r` basis points, with `t` seconds
 \text{fee} = \left\lceil \frac{\text{premium} \times f}{10{,}000} \right\rceil, \qquad \text{seller credit} = \text{premium} - \text{fee}
 ```
 
-`f` = `fee_bps` from the series terms (default 750 = 7.5%). The fee is sent to the treasury at purchase.
+`f` = `fee_bps` from the series terms (default 750 = 7.5%). The fee is paid into the `Treasury` contract's `Fees` bucket at purchase (Section 9.4 step 7).
 
 ### 10.3 Series balance identity
 
@@ -855,7 +1255,7 @@ Open cover on an asset, summed over all live series, is capped by its measured l
 \text{open\_cover}(a) \le \min\left(\text{hard\_cap}(a),\; k \times \overline{\text{liquidity\_2pct}}(a)\right)
 ```
 
-`k` = `liquidity_cover_ratio` (default 0.25). The liquidity term is the median of the last 168 hourly values, so a short burst of fake liquidity cannot raise the cap. `MarketFactory` keeps `open_cover(a)`; each `Series` calls `factory.reserve_cover(asset, amount)` before minting, and `release_cover` at Expired or Triggered.
+`k` = `liquidity_cover_ratio` (default 0.25). The liquidity term is the median of the last 168 hourly values, so a short burst of fake liquidity cannot raise the cap. `MarketFactory` keeps `open_cover(a)`. Each `Series` calls `factory.reserve_cover(series, amount)` before minting; the factory checks the cap and reserves atomically in that one call, or fails with `CoverCapExceeded`. A series never reads the cap and then reserves. `release_cover` runs at Expired or Triggered.
 
 ### 11.2 Why this makes manipulation unprofitable
 
@@ -867,18 +1267,21 @@ To hold the price below 0.95 for 72 hours, an attacker must keep absorbing the b
 
 | Field | Bound |
 | --- | --- |
-| `peg_ratio`, `peg_ratio_min` | 0 to 2 × SCALE; `peg_ratio_min <= peg_ratio` |
+| `peg_ratio`, `peg_ratio_p10` | 0 to 2 × SCALE each. No ordering between them: a 10th percentile can sit above a volume weighted mean when a few large trades print far below the rest |
 | `liquidity_2pct`, `supply` | 0 to `i128::MAX / SCALE` |
 | `supply_change_bps` | Matches `supply` vs previous epoch within 1 bps |
-| Epoch | Current or previous only |
-| AMM cross check | Within `amm_tolerance_bps` (default 300) of each adapter with enough liquidity |
+| Epoch | Closed inside the current `window_secs`, and not already posted (Pending, Disputed or Final) |
+| `endpoint` | Not checked: always replaced by the `Staking` aggregate |
+| AMM cross check | Within `amm_tolerance_bps` (default 300) of each adapter with enough liquidity and a fresh timestamp |
 
 ### 11.4 Event side defences
 
-- Depeg requires every epoch in the window to fail, and missing epochs count against triggering.
-- Liquidity floor: an epoch with `liquidity_2pct < min_liquidity` cannot count toward a depeg.
+- Depeg requires every present (Final) epoch in the window to fail. Up to `max_missing_epochs` missing epochs are ignored, counting neither for nor against; with more missing than that, no Depeg can be proposed for that window.
+- Liquidity floor: the median `liquidity_2pct` over the 7 days before the window started must be at least `min_liquidity`, so a market that was already empty cannot trigger. Liquidity inside the window is never compared: a live collapse is captured by component L and is a committee input, never a reason to block a payout.
+- Component P and the band use `peg_ratio_p10`, so one wick cannot force a band change.
 - Challenge window and cure threshold (Section 8).
-- No new cover while an event is in progress (Section 9.4).
+- Informed buying block: no new cover while an event is in progress or while any trailing failure signal is present (Section 9.4 step 2), and coverage keyed to the failure window start (Section 8.6).
+- Ruling deadline with fixed default outcomes (Section 8.9).
 
 ### 11.5 Buyer and seller limits
 
@@ -894,86 +1297,120 @@ To hold the price below 0.95 for 72 hours, an attacker must keep absorbing the b
 
 - A buyer can split across many addresses to bypass per buyer caps; the asset wide cap still holds.
 - `require_holding` can be gamed by borrowing the asset briefly; treat it as a legal signal, not a security control.
-- An issuer that genuinely fails slowly may never trip a depeg; WithdrawalHalt and Insolvency events cover that case.
+- An issuer that genuinely fails slowly may never trip a depeg; WithdrawalHalt and Insolvency events cover that case, and both arrive in a later build phase (Section 1.2).
+- WithdrawalHalt is the least reliable event type: endpoint probes can misread a halt in either direction, which is why it is Tier 2 only and relies on stuck SEP-24 transactions and anchor cooperation as well as probes (Section 8.3).
+- An issuer whose flags allow neither revocation nor clawback cannot be covered for IssuerFreeze at all (Section 8.8); if it later sets one of those flags, governance must update `issuer_flags` before such a definition can be registered.
 
 ## 12. Contract API reference
 
-Every public function per contract, with who may call it. "Auth" names the address whose `require_auth()` is checked. Read only functions need no auth and cost no state writes.
+Every public function per contract, with who may call it. "Auth" names the address whose `require_auth()` is checked. Read only functions need no auth and cost no state writes. Every core contract (all except `Series`) also exposes `upgrade(wasm_hash)`, governor only (Section 17.3). Subsections 12.1 to 12.6 keep their v1.0 numbering; `Treasury` is added as 12.7.
 
 ### 12.1 RiskOracle
 
 ```rust
 fn initialize(env, governor: Address, registry: Address, staking: Address);
 fn add_asset(env, cfg: AssetConfig);                       // auth: governor
-fn update_asset(env, asset: Address, cfg: AssetConfig);    // auth: governor
+fn update_asset(env, asset: Address, cfg: AssetConfig);    // auth: governor; rejects a change to cfg.reference
 fn disable_asset(env, asset: Address);                     // auth: governor
-fn post_signals(env, keeper: Address, asset: Address, s: SignalSet); // auth: keeper
-fn dispute_signals(env, disputer: Address, asset: Address, epoch: u64, alt_hash: BytesN<32>); // auth: disputer
-fn resolve_signal_dispute(env, asset: Address, epoch: u64, keeper_wins: bool, reason: BytesN<32>); // auth: committee
-fn finalize_endpoint(env, asset: Address, epoch: u64);     // anyone
+fn post_signals(env, keeper: Address, asset: Address, s: SignalSet); // auth: keeper; any closed, non Final epoch inside window_secs; s.endpoint ignored
+fn dispute_signals(env, disputer: Address, asset: Address, epoch: u64, alt_hash: BytesN<32>); // auth: disputer; bond locked in Staking
+fn resolve_signal_dispute(env, asset: Address, epoch: u64, keeper_wins: bool, reason: BytesN<32>); // auth: committee; instructs Staking
+fn finalize_endpoint(env, asset: Address, epoch: u64);     // anyone, after the epoch closes; reads Staking.aggregate, then Staking.settle_probes
 fn set_event_band(env, asset: Address);                    // auth: registry contract
+fn clear_event_band(env, asset: Address);                  // auth: registry contract (re-enable, Section 8.8)
 fn set_formula(env, version: u32, weights: Vec<u32>, params: Map<Symbol, i128>); // auth: governor
 
 // reads
 fn signals(env, asset: Address, epoch: u64) -> Option<SignalSet>;
 fn latest(env, asset: Address) -> Option<SignalSet>;
+fn ring(env, asset: Address) -> Vec<RingSlot>;             // oldest first, one storage read (Section 5.8)
 fn score(env, asset: Address) -> RiskScore;
 fn band(env, asset: Address) -> Band;
 fn is_stale(env, asset: Address) -> bool;
-fn median_liquidity(env, asset: Address) -> i128;
+fn median_liquidity(env, asset: Address) -> i128;          // last 168 slots, for the cover cap (11.1)
+fn reference_rate(env, asset: Address) -> i128;            // reference to USD, SCALE 1e7: Usd = SCALE, Fiat via FxAdapter; fails if stale or Asset
+fn asset_config(env, asset: Address) -> Option<AssetConfig>;
 fn assets(env) -> Vec<Address>;
 ```
 
 ### 12.2 EventRegistry
 
 ```rust
-fn initialize(env, governor: Address, oracle: Address, usdc: Address);
-fn register_definition(env, def: EventDefinition) -> BytesN<32>; // auth: governor
-fn propose_tier1(env, caller: Address, asset: Address, kind: EventKind) -> u64; // anyone
-fn propose_tier2(env, proposer: Address, asset: Address, kind: EventKind, evidence: BytesN<32>) -> u64; // auth: proposer, posts bond
+fn initialize(env, governor: Address, oracle: Address, staking: Address, factory: Address);
+fn register_definition(env, def: EventDefinition) -> u32;  // auth: governor; returns the new canonical version (8.8)
+fn propose_tier1(env, caller: Address, asset: Address, kind: EventKind) -> u64; // anyone; canonical version, ring checks (8.2)
+fn propose_tier2(env, proposer: Address, asset: Address, kind: EventKind, evidence: BytesN<32>) -> u64; // auth: proposer; claim_bond locked in Staking
 fn propose_tier3(env, asset: Address, kind: EventKind, evidence: BytesN<32>) -> u64; // auth: committee
-fn challenge(env, challenger: Address, event_id: u64, evidence: BytesN<32>); // auth: challenger, posts bond
-fn escalate(env, event_id: u64);                          // anyone
-fn finalize(env, event_id: u64);                          // anyone, after challenge window
-fn rule(env, event_id: u64, declare: bool, reason: BytesN<32>); // auth: committee
-fn withdraw_bond(env, who: Address, event_id: u64) -> i128; // auth: who
+fn challenge(env, challenger: Address, event_id: u64, evidence: BytesN<32>); // auth: challenger; challenge_bond locked in Staking; escalates in the same call
+fn finalize(env, event_id: u64);                           // anyone, after challenge window; Declared or Cured
+fn rule(env, event_id: u64, declare: bool, reason: BytesN<32>); // auth: committee; before the ruling deadline
+fn resolve_timeout(env, event_id: u64);                    // anyone, after the ruling deadline; default outcome, all bonds refunded (8.9)
 
 // reads
-fn definition(env, hash: BytesN<32>) -> Option<EventDefinition>;
+fn definition(env, asset: Address, kind: EventKind, version: u32) -> Option<EventDefinition>;
+fn current_version(env, asset: Address, kind: EventKind) -> u32; // 0 if none registered
 fn event(env, event_id: u64) -> Option<EventRecord>;
-fn event_status(env, asset: Address) -> AssetEventStatus; // None | InProgress(id) | Declared(id, kind, proposed_at, declared_at)
-fn covers(env, event_id: u64, def_hash: BytesN<32>, start: u64, expiry: u64) -> bool;
+fn event_status(env, asset: Address, kind: EventKind) -> AssetEventStatus; // per (asset, kind), canonical version
+fn in_progress(env, asset: Address) -> bool;               // any kind
+fn has_declared(env, asset: Address) -> bool;              // any kind, canonical versions
+fn cover_gate(env, asset: Address) -> CoverGate;           // Section 9.4 step 2
+fn covers(env, event_id: u64, def_version: u32, start: u64, expiry: u64) -> bool; // Section 8.6
+fn ruling_deadline(env, event_id: u64) -> Option<u64>;     // escalated_at + ruling_deadline_secs
+fn committee_misses(env, committee: Address) -> u32;
 ```
 
-### 12.3 ReporterStaking
+v1.0's `escalate` is folded into `challenge` (Section 8.1) and `withdraw_bond` is gone: bonds are settled inside `Staking` when an event resolves and paid out by `Staking.claim` (Section 7.8).
+
+### 12.3 Staking
 
 ```rust
-fn add_reporter(env, reporter: Address, region: Symbol);  // auth: governor
-fn remove_reporter(env, reporter: Address);               // auth: governor
-fn stake(env, reporter: Address, amount: i128);           // auth: reporter
-fn unstake_request(env, reporter: Address, amount: i128); // auth: reporter, starts cooldown
-fn unstake(env, reporter: Address) -> i128;               // auth: reporter, after cooldown
-fn submit_probe(env, reporter: Address, r: ProbeReport);  // auth: reporter
-fn slash(env, reporter: Address, bps: u32, reason: BytesN<32>); // auth: committee or oracle
-fn claim_rewards(env, reporter: Address) -> i128;         // auth: reporter
+fn initialize(env, governor: Address, oracle: Address, registry: Address, treasury: Address, usdc: Address);
+
+// membership
+fn add_keeper(env, keeper: Address);                       // auth: governor
+fn remove_keeper(env, keeper: Address);                    // auth: governor
+fn add_reporter(env, reporter: Address, region: Symbol);   // auth: governor
+fn remove_reporter(env, reporter: Address);                // auth: governor
+
+// keeper bonds and reporter stakes
+fn stake(env, who: Address, amount: i128);                 // auth: who (a registered keeper or reporter)
+fn unstake_request(env, who: Address, amount: i128);       // auth: who, starts cooldown
+fn unstake(env, who: Address) -> i128;                     // auth: who, after cooldown
+
+// probes
+fn submit_probe(env, reporter: Address, r: ProbeReport);   // auth: reporter
+fn settle_probes(env, asset: Address, epoch: u64);         // anyone, once per asset epoch after it closes; books faults, accrues rewards in Treasury
+
+// bond escrow (Section 7.8)
+fn lock_bond(env, key: BondKey, owner: Address, amount: i128); // auth: RiskOracle for SignalDispute, EventRegistry for EventProposal and EventChallenge; pulls USDC from owner
+fn release_bond(env, key: BondKey);                        // auth: the contract that locked it; full amount to owner's claimable balance
+fn forfeit_bond(env, key: BondKey, winner: Option<Address>); // auth: the contract that locked it; 50% to winner (if any), rest to Treasury Slashed
+fn slash(env, who: Address, amount: i128, winner: Option<Address>, reason: BytesN<32>); // auth: RiskOracle or EventRegistry, or committee for false probe evidence (7.5)
+fn reward_keeper(env, keeper: Address);                    // auth: RiskOracle; accrues keeper_reward in Treasury
+fn claim(env, who: Address) -> i128;                       // auth: who; pays refunds and winnings
 
 // reads
+fn keeper(env, keeper: Address) -> Option<KeeperInfo>;
+fn is_active_keeper(env, keeper: Address) -> bool;
 fn reporter(env, reporter: Address) -> Option<ReporterInfo>;
+fn bond(env, key: BondKey) -> Option<(Address, i128)>;     // (owner, amount)
+fn claimable(env, who: Address) -> i128;
 fn probes(env, asset: Address, epoch: u64) -> Vec<ProbeReport>;
-fn aggregate(env, asset: Address, epoch: u64) -> EndpointStatus;
+fn aggregate(env, asset: Address, epoch: u64) -> EndpointStatus; // strict majority, else Degraded (7.4)
 ```
 
 ### 12.4 MarketFactory
 
 ```rust
-fn initialize(env, governor: Address, oracle: Address, registry: Address, usdc: Address, series_wasm: BytesN<32>);
-fn open_series(env, terms: SeriesTerms) -> Address;       // auth: governor in v1; permissionless in v2
-fn reserve_cover(env, series: Address, amount: i128);     // auth: series contract
-fn release_cover(env, series: Address, amount: i128);     // auth: series contract
+fn initialize(env, governor: Address, oracle: Address, registry: Address, treasury: Address, usdc: Address, series_wasm: BytesN<32>);
+fn open_series(env, terms: SeriesTerms) -> Address;       // auth: governor in v1; permissionless later. Validation in Section 9.7
+fn reserve_cover(env, series: Address, amount: i128);     // auth: series contract; checks the asset cap and reserves in one call, else CoverCapExceeded
+fn release_cover(env, series: Address, amount: i128);     // auth: series contract; also drops the series from the live list at Expired or Triggered
 fn set_series_wasm(env, hash: BytesN<32>);                // auth: governor (affects new series only)
 
 // reads
-fn series_for(env, asset: Address) -> Vec<Address>;
+fn series_for(env, asset: Address) -> Vec<Address>;       // live series only
+fn series_count(env) -> u64;                              // the deployment salt counter (3.2)
 fn open_cover(env, asset: Address) -> i128;
 fn cover_cap(env, asset: Address) -> i128;
 ```
@@ -981,12 +1418,15 @@ fn cover_cap(env, asset: Address) -> i128;
 ### 12.5 Series
 
 ```rust
+// deployed by MarketFactory, constructor arguments set once
+fn __constructor(env, terms: SeriesTerms, factory: Address, oracle: Address, registry: Address, treasury: Address);
+
 // seller side
 fn deposit(env, seller: Address, amount: i128);           // auth: seller
 fn quote(env, seller: Address, rate_bps: u32, available: i128); // auth: seller
 fn cancel_quote(env, seller: Address);                    // auth: seller
 fn withdraw(env, seller: Address, amount: i128) -> i128;  // auth: seller
-fn transfer_position(env, from: Address, to: Address);    // auth: from
+fn transfer_position(env, from: Address, to: Address);    // auth: from; rejects if `to` already holds a position (RecipientHasPosition)
 
 // buyer side
 fn buy_cover(env, buyer: Address, amount: i128, max_rate_bps: u32) -> (i128, i128); // auth: buyer
@@ -1021,13 +1461,36 @@ fn unpause(env, scope: PauseScope);                       // via queue + timeloc
 
 // reads
 fn param(env, key: Symbol) -> i128;
-fn action(env, id: u64) -> Option<QueuedAction>;
+fn action(env, id: u64) -> Option<QueuedAction>;          // state reported as Expired once now > expires_at (Section 17.1)
 fn committee(env) -> Address;
 ```
 
+### 12.7 Treasury
+
+`Treasury` holds protocol fees, slashed funds and the keeper and reporter reward pools, accounted in four `TreasuryBucket`s (Section 4.5). It pays out in exactly two ways: accrued rewards claimed by the keeper or reporter who earned them, and governance actions.
+
+```rust
+fn initialize(env, governor: Address, staking: Address, usdc: Address);
+fn deposit(env, from: Address, bucket: TreasuryBucket, amount: i128); // auth: from; pulls USDC into the bucket (Series fees, Staking slashed funds, top ups)
+fn accrue_reward(env, to: Address, bucket: TreasuryBucket, amount: i128) -> i128; // auth: staking; KeeperRewards or ReporterRewards only; accrues min(amount, bucket balance), returns it
+fn claim_reward(env, who: Address) -> i128;                // auth: who; pays everything accrued to who
+fn allocate(env, from: TreasuryBucket, to: TreasuryBucket, amount: i128); // auth: governor (TreasuryAllocate action)
+fn spend(env, bucket: TreasuryBucket, to: Address, amount: i128); // auth: governor (TreasurySpend action)
+
+// reads
+fn balance(env, bucket: TreasuryBucket) -> i128;           // unallocated balance of the bucket
+fn accrued(env, who: Address) -> i128;                     // accrued and not yet claimed
+```
+
+- **Fees in:** `Series.buy_cover` calls `deposit(series, Fees, fee)` (Section 9.4 step 7). When a contract is the `from`, it authorizes the nested USDC transfer with `env.authorize_as_current_contract` before the call, because the token sees `Treasury`, not the depositor, as its direct invoker.
+- **Slashed funds in:** `Staking` deposits the protocol half of every forfeited bond and slash into `Slashed` (Section 7.8).
+- **Rewards out:** only `Staking` can accrue rewards, for keepers (`reward_keeper`, on instruction from `RiskOracle`) and reporters (`settle_probes`). An accrual moves funds from the reward bucket into the recipient's accrued balance, so accrued rewards are always fully backed. A short bucket caps the accrual; it never fails the calling flow.
+- **Governance:** `allocate` moves funds between buckets (typically from `Fees` into the reward pools); `spend` pays maintenance or committee costs out of a bucket. Both are timelocked `Governor` actions (Section 17.2).
+- **Invariant I15:** the USDC balance of `Treasury` is at least the sum of the bucket balances plus all accrued, unclaimed rewards.
+
 ## 13. Events reference
 
-Every state change emits a contract event. Topics are `("anchorline", <contract>, <event>, <primary key>)`; data is a single `#[contracttype]` struct. Indexers and the SDK subscribe through Soroban RPC `getEvents`, filtering on the first two topics.
+Every state change emits a contract event. Topics are `("sylox", <contract>, <event>, <primary key>)`; data is a single `#[contracttype]` struct. Indexers and the SDK subscribe through Soroban RPC `getEvents`, filtering on the first two topics.
 
 | Contract | Event | Primary key topic | Data fields |
 | --- | --- | --- | --- |
@@ -1035,38 +1498,55 @@ Every state change emits a contract event. Topics are `("anchorline", <contract>
 | RiskOracle | `signals_final` | asset | epoch |
 | RiskOracle | `signals_disputed` | asset | epoch, disputer, alt\_hash |
 | RiskOracle | `signals_resolved` | asset | epoch, keeper\_wins, reason |
+| RiskOracle | `endpoint_finalized` | asset | epoch, status |
 | RiskOracle | `score_updated` | asset | epoch, score, formula\_version |
 | RiskOracle | `band_changed` | asset | from, to, epoch |
 | RiskOracle | `asset_stale` | asset | last\_epoch |
-| EventRegistry | `event_proposed` | asset | event\_id, kind, tier, proposer, evidence |
+| EventRegistry | `definition_registered` | asset | kind, version, previous\_version |
+| EventRegistry | `event_proposed` | asset | event\_id, kind, def\_version, tier, window\_start, proposer, evidence |
 | EventRegistry | `event_challenged` | asset | event\_id, challenger, evidence |
-| EventRegistry | `event_escalated` | asset | event\_id |
-| EventRegistry | `event_declared` | asset | event\_id, kind, proposed\_at, declared\_at |
+| EventRegistry | `event_escalated` | asset | event\_id, escalated\_at, ruling\_deadline |
+| EventRegistry | `event_declared` | asset | event\_id, kind, def\_version, window\_start, declared\_at |
 | EventRegistry | `event_rejected` | asset | event\_id, reason |
 | EventRegistry | `event_cured` | asset | event\_id |
-| ReporterStaking | `probe_submitted` | asset | reporter, epoch, status, region |
-| ReporterStaking | `reporter_slashed` | reporter | bps, amount, reason |
-| MarketFactory | `series_opened` | asset | series, terms\_hash, start, expiry, cap |
+| EventRegistry | `ruling_timed_out` | asset | event\_id, outcome (Declared or Rejected), committee, misses\_after |
+| Staking | `staked` / `unstaked` | who | amount, total\_after |
+| Staking | `probe_submitted` | asset | reporter, epoch, status, region |
+| Staking | `probes_settled` | asset | epoch, aggregate, rewarded, faulted |
+| Staking | `bond_locked` | owner | key, amount |
+| Staking | `bond_released` | owner | key, amount |
+| Staking | `bond_forfeited` | owner | key, amount, winner, to\_treasury |
+| Staking | `slashed` | who | amount, winner, to\_treasury, reason, suspended |
+| Staking | `claimed` | who | amount |
+| Treasury | `deposited` | bucket | from, amount |
+| Treasury | `reward_accrued` | to | bucket, requested, accrued |
+| Treasury | `reward_claimed` | who | amount |
+| Treasury | `allocated` | from\_bucket | to\_bucket, amount |
+| Treasury | `spent` | bucket | to, amount |
+| MarketFactory | `series_opened` | asset | series, series\_id, def\_versions, start, expiry, cap |
 | Series | `deposited` | seller | amount, collateral\_after |
 | Series | `quoted` | seller | rate\_bps, available |
 | Series | `cover_bought` | buyer | filled, premium, fee, fills (vector of seller, amount, rate) |
+| Series | `position_transferred` | from | to |
 | Series | `triggered` | series | event\_id |
 | Series | `claimed` | holder | amount |
 | Series | `withdrawn` | seller | amount |
 | Series | `state_changed` | series | from, to |
-| Governor | `action_queued` / `action_executed` / `action_cancelled` | action\_id | action, eta |
+| Governor | `action_queued` / `action_approved` / `action_executed` / `action_cancelled` | action\_id | action, eta, expires\_at, state |
 | Governor | `paused` / `unpaused` | scope | by |
 
 ### 13.1 Indexer guidance
 
 - Order by ledger sequence, then by event index within the ledger.
 - `cover_bought.fills` gives per seller attribution without reading storage.
-- Treat `signals_posted` values as provisional until `signals_final`.
-- `band_changed` and `event_declared` are the two events wallets and lenders should alert on.
+- Treat `signals_posted` values as provisional until `signals_final`, and the endpoint field as `Unknown` until `endpoint_finalized`.
+- Event status is per (asset, kind): key event history on (asset, kind, def\_version), not on asset alone.
+- `band_changed` and `event_declared` are the two events wallets and lenders should alert on; `event_escalated` carries the ruling deadline committee tooling should track.
+- Money movements reconcile per contract: `Series` events against collateral and premiums, `Staking` events against bonds and stakes, `Treasury` events against fees, slashed funds and rewards.
 
 ## 14. Error codes
 
-Each contract defines a `#[contracterror]` enum with `u32` codes in its own range, so a code alone identifies the contract. The SDK maps codes to these names and messages.
+Each contract defines a `#[contracterror]` enum with `u32` codes in its own range, so a code alone identifies the contract. The SDK maps codes to these names and messages. v1.0 codes keep their numbers; `Staking` keeps the 300 range of the contract it replaces, `Treasury` takes 700, and new codes are appended at the end of each range.
 
 | Code | Name | Contract | Meaning |
 | --- | --- | --- | --- |
@@ -1076,34 +1556,49 @@ Each contract defines a `#[contracterror]` enum with `u32` codes in its own rang
 | 4 | `Paused` | all | Scope is paused by the guardian |
 | 5 | `MathOverflow` | all | Checked arithmetic failed |
 | 100 | `UnknownAsset` | RiskOracle | Asset not registered or disabled |
-| 101 | `KeeperNotActive` | RiskOracle | Keeper not bonded or suspended |
-| 102 | `WrongEpoch` | RiskOracle | Epoch not current or previous |
-| 103 | `EpochAlreadyPosted` | RiskOracle | An accepted posting exists |
+| 101 | `KeeperNotActive` | RiskOracle | Keeper not registered, bonded or active in `Staking` |
+| 102 | `WrongEpoch` | RiskOracle | Epoch not yet closed, closed before the current `window_secs`, or already Final |
+| 103 | `EpochAlreadyPosted` | RiskOracle | A Pending, Disputed or Final posting exists for the epoch |
 | 104 | `SanityBoundFailed` | RiskOracle | A field is outside Section 11.3 bounds |
-| 105 | `AmmCrossCheckFailed` | RiskOracle | Peg ratio too far from Soroban AMM price |
+| 105 | `AmmCrossCheckFailed` | RiskOracle | Peg ratio too far from a `PriceAdapter` price |
 | 106 | `DisputeWindowClosed` | RiskOracle | Too late to dispute |
 | 107 | `WeightsInvalid` | RiskOracle | Formula weights do not sum to 10,000 |
-| 200 | `UnknownDefinition` | EventRegistry | Definition hash not registered |
-| 201 | `EventInProgress` | EventRegistry | Another event is open for this asset |
-| 202 | `Tier1CheckFailed` | EventRegistry | Signals do not meet the definition |
-| 203 | `InsufficientBond` | EventRegistry | Bond transfer failed or too small |
+| 108 | `ReferenceImmutable` | RiskOracle | `update_asset` tried to change `reference` |
+| 109 | `ReferenceRateUnavailable` | RiskOracle | `reference_rate` has no fresh rate: FX adapter missing or stale, or the reference is `Asset` |
+| 200 | `UnknownDefinition` | EventRegistry | No canonical definition for (asset, kind), or no such version |
+| 201 | `EventInProgress` | EventRegistry | Another event is open for this (asset, kind) |
+| 202 | `Tier1CheckFailed` | EventRegistry | Ring buffer data does not meet the definition, including too many missing epochs or a low baseline liquidity |
+| 203 | `InsufficientBond` | EventRegistry | Bond lock in `Staking` failed |
 | 204 | `ChallengeWindowOpen` | EventRegistry | `finalize` called too early |
 | 205 | `ChallengeWindowClosed` | EventRegistry | `challenge` called too late |
 | 206 | `WrongState` | EventRegistry | Transition not allowed from current state |
-| 207 | `CooldownActive` | EventRegistry | Asset in cooldown after cure or reject |
-| 300 | `NotReporter` | ReporterStaking | Address not a registered reporter |
-| 301 | `DuplicateProbe` | ReporterStaking | Already reported this asset and epoch |
-| 302 | `StakeTooLow` | ReporterStaking | Below `reporter_stake` |
-| 303 | `UnstakeCooldown` | ReporterStaking | Cooldown not over |
+| 207 | `CooldownActive` | EventRegistry | (asset, kind) in cooldown after cure or reject |
+| 208 | `InvalidDefinition` | EventRegistry | Reference differs from the asset's, a parameter unused by the kind is non zero, or the window does not fit the ring buffer |
+| 209 | `FreezeImpossible` | EventRegistry | IssuerFreeze definition for an asset whose `issuer_flags` allow neither revocation nor clawback |
+| 210 | `DefinitionInUse` | EventRegistry | A live series still pins the current version for this (asset, kind) |
+| 211 | `RulingDeadlinePassed` | EventRegistry | `rule` called after the ruling deadline; use `resolve_timeout` |
+| 212 | `RulingDeadlineNotReached` | EventRegistry | `resolve_timeout` called before the ruling deadline |
+| 300 | `NotReporter` | Staking | Address not a registered reporter |
+| 301 | `DuplicateProbe` | Staking | Already reported this asset and epoch |
+| 302 | `StakeTooLow` | Staking | Below `reporter_stake` or `keeper_bond` |
+| 303 | `UnstakeCooldown` | Staking | Cooldown not over |
+| 304 | `NotKeeper` | Staking | Address not a registered keeper |
+| 305 | `BondExists` | Staking | A bond is already locked under this `BondKey` |
+| 306 | `UnknownBond` | Staking | No locked bond under this `BondKey` |
+| 307 | `NothingToClaim` | Staking | Claimable balance is zero |
+| 308 | `EpochNotClosed` | Staking | Probe for a future epoch, or `settle_probes` before the epoch closed |
 | 400 | `TooManySeries` | MarketFactory | Asset at max open series |
-| 401 | `CoverCapExceeded` | MarketFactory | Asset wide cap reached |
-| 402 | `InvalidTerms` | MarketFactory | Term, cap or dates invalid |
+| 401 | `CoverCapExceeded` | MarketFactory | Asset wide cap reached in `reserve_cover` |
+| 402 | `InvalidTerms` | MarketFactory | Asset unknown or stale; term, cap, dates or fee invalid; `require_holding` with an `Asset` reference |
+| 403 | `InvalidSettlement` | MarketFactory | Settlement asset equals the covered asset or shares its issuer |
+| 404 | `AssetBlocked` | MarketFactory | A Declared event on the asset; new series blocked until governance re-enables it |
+| 405 | `DefinitionNotCurrent` | MarketFactory | `def_versions` empty, or a pinned version is not the canonical one |
 | 500 | `WrongSeriesState` | Series | Action not allowed in this state |
 | 501 | `AssetStale` | Series | Oracle stale, no new cover |
-| 502 | `AssetDistressed` | Series | Band Distress or Event, or event in progress |
+| 502 | `AssetDistressed` | Series | Band Distress or Event, or an event in progress |
 | 503 | `BuyerCapExceeded` | Series | Over `max_cover_per_buyer` |
 | 504 | `SeriesCapExceeded` | Series | Over series `cap` |
-| 505 | `HoldingTooLow` | Series | Insurable interest check failed |
+| 505 | `HoldingTooLow` | Series | Insurable interest check failed: balance × peg\_ratio × fx\_rate below the resulting cover |
 | 506 | `NoFill` | Series | No quote at or below `max_rate_bps` |
 | 507 | `QuoteExceedsFree` | Series | Quote above unencumbered collateral |
 | 508 | `QuoteBookFull` | Series | Rate does not beat the worst quote |
@@ -1112,14 +1607,19 @@ Each contract defines a `#[contracterror]` enum with `u32` codes in its own rang
 | 511 | `NotTriggered` | Series | Claim outside Triggered |
 | 512 | `ClaimWindowOpen` | Series | `claim_for` called too early |
 | 513 | `BelowMinDeposit` | Series | Deposit under minimum |
+| 514 | `RecentFailureSignals` | Series | Cover gate failed: recent below threshold epoch, endpoint outage, or issuer action |
+| 515 | `RecipientHasPosition` | Series | `transfer_position` to an address that already holds a position |
 | 600 | `NotSigner` | Governor | Not a multisig signer |
 | 601 | `TimelockActive` | Governor | Execute before ETA |
 | 602 | `ThresholdNotMet` | Governor | Not enough approvals |
-| 603 | `ActionExpired` | Governor | Grace period passed |
+| 603 | `ActionExpired` | Governor | `expires_at` passed |
+| 700 | `InsufficientBucket` | Treasury | `allocate` or `spend` above the bucket balance |
+| 701 | `WrongBucket` | Treasury | `accrue_reward` against a bucket other than `KeeperRewards` or `ReporterRewards` |
+| 702 | `NothingToClaim` | Treasury | No accrued rewards |
 
 ## 15. Storage layout and TTL strategy
 
-Soroban storage has three classes with different lifetimes and costs: instance (lives with the contract), persistent (archived when its TTL runs out, restorable) and temporary (deleted when its TTL runs out). Anchorline puts anything that guards money in persistent storage and keeps its TTL extended by every touching call.
+Soroban storage has three classes with different lifetimes and costs: instance (lives with the contract), persistent (archived when its TTL runs out, restorable) and temporary (deleted when its TTL runs out). Sylox puts anything that guards money in persistent storage and keeps its TTL extended by every touching call.
 
 ### 15.1 Keys per contract
 
@@ -1127,16 +1627,29 @@ Soroban storage has three classes with different lifetimes and costs: instance (
 | --- | --- | --- | --- |
 | RiskOracle | `Config` | instance | governor, registry, staking addresses, formula version |
 | RiskOracle | `Asset(asset)` | persistent | `AssetConfig` |
-| RiskOracle | `Signals(asset, epoch)` | persistent | `SignalSet` plus `Pending` or `Final` |
-| RiskOracle | `Ring(asset)` | persistent | Ring buffer of the last 168 epochs' compact signals for 24h and 7d aggregates and the liquidity median |
+| RiskOracle | `Signals(asset, epoch)` | persistent | `SignalSet` plus `Pending`, `Disputed` or `Final` |
+| RiskOracle | `Ring(asset)` | persistent | Ring buffer of 240 packed `RingSlot`s with a per slot finality flag: Tier 1 checks, cover gate, 24h and 7d aggregates, liquidity median and baseline (Section 5.8) |
 | RiskOracle | `Score(asset)` | persistent | Latest `RiskScore`, band, hysteresis counter |
-| RiskOracle | `Dispute(asset, epoch)` | persistent | Dispute record and bonds |
-| EventRegistry | `Def(hash)` | persistent | `EventDefinition` |
-| EventRegistry | `Event(id)` | persistent | `EventRecord` |
-| EventRegistry | `Status(asset)` | persistent | Current `AssetEventStatus` |
-| EventRegistry | `Bond(id, who)` | persistent | Bond amount and outcome |
-| ReporterStaking | `Reporter(addr)` | persistent | Stake, region, faults, rewards |
-| ReporterStaking | `Probe(asset, epoch, reporter)` | temporary | `ProbeReport`, kept 7 days |
+| RiskOracle | `Dispute(asset, epoch)` | persistent | Dispute record only (disputer, alt hash, outcome); the bond is in `Staking` |
+| EventRegistry | `Config` | instance | governor, oracle, staking, factory addresses; next event id |
+| EventRegistry | `Def(asset, kind, version)` | persistent | `EventDefinition`, never overwritten |
+| EventRegistry | `Canonical(asset, kind)` | persistent | Current canonical version (`u32`) |
+| EventRegistry | `Event(id)` | persistent | `EventRecord`, including bond records but no funds |
+| EventRegistry | `Status(asset, kind)` | persistent | `AssetEventStatus` for the canonical version |
+| EventRegistry | `CommitteeMisses(committee)` | persistent | Missed ruling deadlines for that committee address |
+| Staking | `Config` | instance | governor, oracle, registry, treasury, USDC addresses |
+| Staking | `Keeper(addr)` | persistent | Bond, faults, active or suspended, unstake cooldown |
+| Staking | `Reporter(addr)` | persistent | Stake, region, faults, active or suspended, unstake cooldown |
+| Staking | `Probe(asset, epoch, reporter)` | temporary | `ProbeReport`, kept 7 days |
+| Staking | `ProbesSettled(asset, epoch)` | temporary | Marker so `settle_probes` books rewards and faults once, kept 7 days |
+| Staking | `Bond(key)` | persistent | Owner and amount for a `BondKey` (signal dispute, event proposal or challenge bond) |
+| Staking | `Claimable(addr)` | persistent | Refunds and winnings awaiting `claim` |
+| Treasury | `Config` | instance | governor, staking, USDC addresses |
+| Treasury | `Buckets` | instance | Balance of each `TreasuryBucket` |
+| Treasury | `Accrued(addr)` | persistent | Rewards accrued to a keeper or reporter, awaiting `claim_reward` |
+| MarketFactory | `Config` | instance | governor, oracle, registry, treasury, USDC addresses, series Wasm hash |
+| MarketFactory | `SeriesCounter` | instance | Monotonic counter; the deployment salt (Section 3.2) |
+| MarketFactory | `Deployed(series)` | persistent | Asset of a series this factory deployed (auth check, Section 16.1) |
 | MarketFactory | `OpenCover(asset)` | persistent | Sum of open cover |
 | MarketFactory | `SeriesList(asset)` | persistent | Live series addresses |
 | Series | `Terms`, `State`, `Totals` | instance | Fixed terms and running totals |
@@ -1144,7 +1657,9 @@ Soroban storage has three classes with different lifetimes and costs: instance (
 | Series | `Quotes` | instance | Sorted quote vector (capped at 64) |
 | Series | `Balance(holder)`, `Allowance(from, spender)` | persistent, temporary | SEP-41 cover token state |
 | Governor | `Params` | instance | Parameter map |
-| Governor | `Action(id)` | persistent | Queued action |
+| Governor | `Action(id)` | persistent | `QueuedAction` (Section 17.1) |
+
+Funds sit only where the "Holds funds?" column of Section 3.1 says: `Series` (collateral and premiums), `Staking` (bonds and stakes), `Treasury` (fees, slashed funds, reward pools). No `RiskOracle` or `EventRegistry` key guards a balance.
 
 ### 15.2 TTL policy
 
@@ -1153,35 +1668,49 @@ Soroban storage has three classes with different lifetimes and costs: instance (
 | Contract instance and code | Indefinite | Every call; plus an ops job (Section 22) |
 | Asset config, score, ring buffer | Indefinite while asset is enabled | Every `post_signals` |
 | Individual `Signals(asset, epoch)` | 30 days | On write; history beyond that lives in the indexer and the inputs bundles |
-| Event records and bonds | 1 year after resolution | Every touch; ops job |
+| Definitions, canonical pointers, event status | Indefinite while the asset is enabled | Every touch; ops job |
+| Event records (`EventRegistry`) and bonds (`Staking`) | 1 year after resolution | Every touch; ops job |
+| Keeper and reporter records, claimable balances (`Staking`), accrued rewards (`Treasury`) | Until withdrawn or claimed, minimum 1 year after the last change | Every touch; ops job |
 | Series positions and cover balances | Until withdrawn or claimed, minimum 1 year after expiry | Every touch; anyone can call `extend(holder)` |
-| Probe reports | 7 days | None (temporary) |
+| Probe reports, probe settlement markers | 7 days | None (temporary) |
 
 A claimant whose balance entry was archived can restore it with a standard restore footprint transaction before claiming. The SDK does this automatically when simulation reports an archived entry.
 
 ### 15.3 Size limits
 
-- Ring buffer entries are compact (8 fields, about 120 bytes each); 168 entries stay well under the per entry size limit. Confirm limits against the current network configuration in Phase 1.
+- The ring buffer holds 240 slots packed at about 120 bytes each, about 29 KB per asset (Section 5.8). This fits a single entry, but rewriting it on every posting is the dominant write cost of `post_signals`. Benchmark the write cost in the first week of the `RiskOracle` build; if it is too high, fall back to paging the ring into entries of 24 slots each. Confirm entry size and per transaction write limits against the current network configuration at the same time.
 - The quote vector is capped at 64 entries to bound read and write cost of `buy_cover`.
+- `register_definition`'s live series check reads at most `max_series_per_asset` (default 4) series terms.
 
 ## 16. Roles, authorization and access control
 
-Every privileged call checks a role address with `require_auth()`; there are no hidden admin keys. The guardian can only pause, and no role can move user collateral.
+Every privileged call checks a role address with `require_auth()`; there are no hidden admin keys. The guardian can only pause. No role can move user collateral, bonds or stakes outside the rules of Sections 7.8 and 9.6; `Treasury` funds move only through a governance action or a reward claim by the keeper or reporter who earned it.
 
 | Role | Holder (v1) | Can | Cannot |
 | --- | --- | --- | --- |
-| Governor | Multisig contract, 4 of 7, 7 day timelock | Add assets, set parameters, register definitions, open series, upgrade contracts, add keepers and reporters | Change terms of an open series, move collateral, declare events |
-| Committee | Separate multisig, 4 of 7 | Rule on escalated events, propose Tier 3 events, resolve signal disputes, slash for false evidence | Change parameters, touch collateral directly |
+| Governor | Multisig contract, 4 of 7, 7 day timelock | Add assets, set parameters, register definitions (which is also how an asset is re-enabled after a Declared event), open series, upgrade contracts, add and remove keepers and reporters in `Staking`, allocate and spend `Treasury` funds | Change terms or pinned definition versions of an open series, change an asset's reference, move collateral, bonds or stakes, declare events |
+| Committee | Separate multisig, 4 of 7 | Rule on escalated events before their ruling deadline, propose Tier 3 events, resolve signal disputes, slash reporters for false evidence | Change parameters, touch collateral directly, extend a ruling deadline |
 | Guardian | 2 of 3 multisig of core team | Pause new deposits, new cover and new series per scope | Unpause (needs governor), pause claims or withdrawals, move funds |
-| Keeper | Bonded, permissioned addresses | Post signals | Change past postings, declare events |
-| Reporter | Staked, permissioned addresses | Submit probes, propose Tier 2 events (with bond) | Decide disputes |
-| Seller, buyer, holder | Anyone | Their own positions only | Others' positions |
-| Contract to contract | Registry to Oracle (`set_event_band`); Series to Factory (`reserve_cover`, `release_cover`) | Only those calls | Anything else |
+| Keeper | Bonded in `Staking`, permissioned by governance | Post signals for any closed, non Final epoch inside `window_secs`; claim keeper rewards from `Treasury` | Set the endpoint status, change Final postings, declare events |
+| Reporter | Staked in `Staking`, permissioned by governance | Submit probes, propose Tier 2 events (with bond), claim reporter rewards from `Treasury` | Decide disputes |
+| Bond poster | Anyone | Dispute a signal posting, propose a Tier 2 event, or challenge any event, each with a bond locked in `Staking`; claim refunds and winnings | Withdraw a locked bond before its record resolves |
+| Seller | Anyone not on the related seller list | Deposit, quote, withdraw per Section 9.6, transfer the whole position to an address that holds none | Withdraw premiums before Triggered or Expired, touch other positions |
+| Buyer | Anyone; holding the asset if `require_holding` | Buy cover while the cover gate is `Clear` (Section 9.4) | Buy while an event is in progress or a trailing failure signal is present |
+| Holder | Anyone holding cover units | Transfer cover units (SEP-41), claim in Triggered | Claim outside Triggered |
+| Anyone | Any address | Permissionless triggers: `propose_tier1`, `finalize`, `resolve_timeout`, `finalize_endpoint`, `settle_probes`, `trigger`, `sync`, `claim_for` after the claim window, `deposit` into `Treasury` | Anything that needs one of the roles above |
+| EventRegistry to RiskOracle | Contract | `set_event_band`, `clear_event_band` | Anything else |
+| Series to MarketFactory | Contract, only series in `Deployed` | `reserve_cover`, `release_cover` | Anything else |
+| RiskOracle to Staking | Contract | `lock_bond`, `release_bond`, `forfeit_bond` for `SignalDispute` keys; `slash` keepers; `reward_keeper` | Touch event bonds |
+| EventRegistry to Staking | Contract | `lock_bond`, `release_bond`, `forfeit_bond` for `EventProposal` and `EventChallenge` keys; `slash` | Touch signal dispute bonds |
+| Staking to Treasury | Contract | `accrue_reward` against `KeeperRewards` and `ReporterRewards` | `allocate`, `spend`, any other bucket |
 
 ### 16.1 Contract to contract auth
 
-- The oracle stores the registry's address at `initialize` and checks `registry.require_auth()` in `set_event_band`; in Soroban a contract authorizes its own direct calls, so this succeeds only when the registry is the caller.
+- The oracle stores the registry's address at `initialize` and checks `registry.require_auth()` in `set_event_band` and `clear_event_band`; in Soroban a contract authorizes its own direct calls, so this succeeds only when the registry is the caller.
 - The factory records every series it deploys in a `Deployed(series)` set and checks membership plus `series.require_auth()` in `reserve_cover` and `release_cover`.
+- `Staking` stores the oracle and registry addresses at `initialize`. `lock_bond`, `release_bond` and `forfeit_bond` require the oracle's auth for a `SignalDispute` key and the registry's auth for `EventProposal` and `EventChallenge` keys, so neither contract can touch the other's bonds. `slash` requires the oracle, the registry or the committee (false probe evidence only); `reward_keeper` requires the oracle.
+- `Treasury` stores the `Staking` address at `initialize` and checks `staking.require_auth()` in `accrue_reward`. `deposit` needs only the depositor's own auth.
+- The registry reads `MarketFactory.series_for` and `Series.terms` in `register_definition`; these are reads and need no auth.
 
 ### 16.2 What pausing does
 
@@ -1217,21 +1746,46 @@ pub enum Action {
     Upgrade(Address, BytesN<32>),   // contract, new wasm hash
     Unpause(PauseScope),
     SetSigners(Vec<Address>, u32),
+    TreasuryAllocate(TreasuryBucket, TreasuryBucket, i128), // from, to, amount
+    TreasurySpend(TreasuryBucket, Address, i128),            // bucket, recipient, amount
+}
+
+#[contracttype]
+pub enum ActionState { Queued, Approved, Executed, Cancelled, Expired }
+
+#[contracttype]
+pub struct QueuedAction {
+    pub id: u64,                   // Governor action counter
+    pub action: Action,
+    pub proposer: Address,         // the signer that queued it
+    pub approvals: Vec<Address>,   // distinct signers that approved, proposer included once it approves
+    pub eta: u64,                  // queue time + the action's timelock (17.2)
+    pub expires_at: u64,           // eta + grace_secs; never executable after this
+    pub state: ActionState,
 }
 ```
+
+`QueuedAction` is exactly the struct in `contracts/types/src/governance.rs`. `state` is written on every transition the Governor performs (`approve` to Approved, `execute`, `cancel`). Expiry needs no write: `action(id)` reports `Expired` once `now > expires_at` and the stored state is still Queued or Approved, and `execute` rejects it with `ActionExpired`.
+
+Checks the targets apply when an action executes, beyond the Governor's own threshold and timelock:
+
+- `RegisterDefinition`: all rejections of Section 8.8, including that an IssuerFreeze definition can only be registered for an asset whose `AssetConfig.issuer_flags` make an issuer freeze possible (`auth_revocable` or `clawback_enabled`), and that no live series pins the current version.
+- `UpdateAsset`: `reference` cannot change (Section 4.1).
+- `AddKeeper`, `RemoveKeeper`, `AddReporter`, `RemoveReporter`: executed on `Staking`.
+- `TreasuryAllocate`, `TreasurySpend`: executed on `Treasury`; fail with `InsufficientBucket` if the bucket is short.
 
 ### 17.2 Timelocks by action
 
 | Action | Timelock | Reason |
 | --- | --- | --- |
 | `OpenSeries`, `AddAsset`, `AddReporter`, `AddKeeper` | 2 days | Operational, low risk |
-| `SetParam`, `SetFormula`, `RegisterDefinition` | 7 days | Changes risk behaviour for new series |
-| `Upgrade`, `SetSeriesWasm`, `SetSigners`, `SetCommittee` | 14 days | Can change code or control |
+| `SetParam`, `SetFormula`, `RegisterDefinition`, `TreasuryAllocate` | 7 days | Changes risk behaviour for new series, or which pool funds rewards |
+| `Upgrade`, `SetSeriesWasm`, `SetSigners`, `SetCommittee`, `TreasurySpend` | 14 days | Can change code or control, or moves protocol funds out |
 | `Unpause` | 0 days | Restoring service should be fast |
 
 Queued actions expire if not executed within `grace_secs` (default 14 days) after their ETA.
 
-Every `Action` goes through the same four states regardless of timelock length:
+Every `Action` goes through the same five states (`ActionState`) regardless of timelock length:
 
 ```mermaid
 stateDiagram-v2
@@ -1241,7 +1795,8 @@ stateDiagram-v2
   Approved --> Executed: execute() [after timelock ETA]
   Queued --> Cancelled: cancel() [threshold of signers]
   Approved --> Cancelled: cancel()
-  Approved --> Expired: ETA + grace_secs passes, never executed
+  Queued --> Expired: expires_at passes, never approved
+  Approved --> Expired: expires_at passes, never executed
   Executed --> [*]
   Cancelled --> [*]
   Expired --> [*]
@@ -1274,14 +1829,16 @@ sequenceDiagram
 
 ### 17.3 Upgrades
 
-- Core contracts (`RiskOracle`, `EventRegistry`, `ReporterStaking`, `MarketFactory`, `Governor`) expose `upgrade(wasm_hash)`, callable only by the governor, which calls `env.deployer().update_current_contract_wasm(hash)`.
+- Core contracts (`RiskOracle`, `EventRegistry`, `Staking`, `Treasury`, `MarketFactory`, `Governor`) expose `upgrade(wasm_hash)`, callable only by the governor, which calls `env.deployer().update_current_contract_wasm(hash)`. `Staking` and `Treasury` hold funds, so their upgrades carry the 14 day timelock like every other `Upgrade` and must preserve invariants I14 and I15.
 - **`Series` contracts are not upgradeable.** `SetSeriesWasm` only affects series opened afterwards. A bug fix for live series is handled by pausing new cover and letting them run to expiry.
 - Every upgrade must ship with a storage migration note and a test proving existing keys decode under the new types.
 - After 12 months on mainnet, governance plans to remove `upgrade` from `EventRegistry` (deploying v2 alongside instead).
 
 ### 17.4 Parameter changes never apply retroactively
 
-- `SeriesTerms` and the `EventDefinition` hash are fixed at `open_series`.
+- `SeriesTerms`, including the pinned definition version per covered kind, are fixed at `open_series`.
+- A new definition version applies only to series opened after it, and can only be registered once no live series pins the previous version (Section 8.8).
+- An asset's `reference`, and so its FX rate source, never changes after `add_asset`.
 - Formula changes affect scores from the next epoch; past scores keep their `formula_version`.
 - The asset wide cover cap is checked only when buying; lowering it never cancels existing cover.
 
@@ -1294,10 +1851,10 @@ Four services run outside the chain: the keeper computes signals, the reporter n
 | Aspect | Design |
 | --- | --- |
 | Language | TypeScript (Node 20+), using the Stellar JS SDK for Horizon and Soroban RPC |
-| Inputs | Trade history and order books (Horizon), ledger operations for issuer accounts, SAC events (Soroban RPC `getEvents`), FX reference via adapter, probe aggregates |
-| Schedule | Cron at each epoch close plus 60 seconds, per asset |
-| Output | `SignalSet` posted via `post_signals`; inputs bundle uploaded first, its SHA-256 placed in `inputs_hash` |
-| Determinism | Recomputation tool (`anchorline-recompute`) takes a bundle and must output byte identical `SignalSet`; the keeper uses the same library |
+| Inputs | Trade history and order books (Horizon), ledger operations for issuer accounts, ledger asset stats for supply, SAC events (Soroban RPC `getEvents`), FX reference on the asset's rate basis via adapter. Not probe results: the endpoint status is never keeper posted |
+| Schedule | Cron at each epoch close plus 60 seconds, per asset; after an outage, backfills every closed, non Final epoch still inside `window_secs` (Section 5.2) |
+| Output | `SignalSet` posted via `post_signals` with `endpoint = Unknown`; inputs bundle uploaded first, its SHA-256 placed in `inputs_hash`. Also calls `finalize_endpoint`, `settle_probes`, `finalize` and `resolve_timeout` when due, since these are permissionless |
+| Determinism | Recomputation tool (`sylox-recompute`) takes a bundle and must output byte identical `SignalSet`; the keeper uses the same library |
 | Keys | Keeper signing key in an HSM or KMS; fee account separate from bond account |
 | Failure | Retries within the epoch; alerts after 2 missed epochs |
 
@@ -1311,7 +1868,7 @@ Four services run outside the chain: the keeper computes signals, the reporter n
 ### 18.3 Indexer
 
 - Consumes contract events from Soroban RPC (or a Galexie style ledger export for backfill) into Postgres.
-- Tables: `assets`, `signals`, `scores`, `events`, `bonds`, `series`, `positions`, `fills`, `claims`, `governance_actions`.
+- Tables: `assets`, `signals`, `scores`, `definitions`, `events`, `bonds`, `stakes`, `treasury`, `series`, `positions`, `fills`, `claims`, `governance_actions`.
 - Derived views: score history per asset, open cover per asset, premiums and fees per day, seller PnL, buyer exposure.
 - Reorg free (Stellar has deterministic finality), so ingestion is append only by ledger.
 
@@ -1335,14 +1892,14 @@ The API is a convenience. Integrators that need guarantees read contract state d
 
 ## 19. TypeScript SDK reference
 
-`@anchorline/sdk` wraps the contract clients generated by `stellar contract bindings typescript`, adds fixed point helpers, simulation, archived entry restoration and error mapping. It is a client of the protocol; everything it does can be done with raw contract calls.
+`@sylox/sdk` wraps the contract clients generated by `stellar contract bindings typescript`, adds fixed point helpers, simulation, archived entry restoration and error mapping. It is a client of the protocol; everything it does can be done with raw contract calls.
 
 ### 19.1 Setup
 
 ```ts
-import { Anchorline, Networks } from "@anchorline/sdk";
+import { Sylox, Networks } from "@sylox/sdk";
 
-const al = new Anchorline({
+const al = new Sylox({
   network: Networks.Testnet,          // rpcUrl, passphrase and contract ids preset
   signer: walletSigner,               // signTransaction / signAuthEntry adapter (e.g. Stellar Wallets Kit)
 });
@@ -1352,16 +1909,16 @@ const al = new Anchorline({
 
 ```ts
 const assets = await al.oracle.assets();                 // Address[]
-const s = await al.oracle.score(usdNgnSac);              // { score, band, stale, epoch, formulaVersion }
-const sig = await al.oracle.latest(usdNgnSac);           // SignalSet with numbers as bigint
+const s = await al.oracle.score(arsSac);                 // { score, band, stale, epoch, formulaVersion }
+const sig = await al.oracle.latest(arsSac);              // SignalSet with numbers as bigint
 al.fx.toNumber(sig.pegRatio);                            // 0.9934
-const unsub = al.stream.onBandChanged(usdNgnSac, e => alert(e.to));
+const unsub = al.stream.onBandChanged(arsSac, e => alert(e.to));
 ```
 
 ### 19.3 Buying cover
 
 ```ts
-const series = await al.markets.seriesFor(usdNgnSac, { state: "Open" });
+const series = await al.markets.seriesFor(arsSac, { state: "Open" });
 const s0 = series[0];
 const q = await al.markets.premiumQuote(s0, al.fx.usdc("20000"), 600); // { fillable, premium }
 const res = await al.markets.buyCover(s0, al.fx.usdc("20000"), { maxRateBps: 600 });
@@ -1384,18 +1941,22 @@ await al.markets.trigger(s0);                            // no-op if already tri
 await al.markets.claim(s0, "all");
 ```
 
-### 19.6 Events and reporters
+### 19.6 Events, staking and rewards
 
 ```ts
-await al.events.proposeTier1(usdNgnSac, "Depeg");
-await al.events.challenge(eventId, evidenceHash);
-const st = await al.events.status(usdNgnSac);            // { kind: "None" | "InProgress" | "Declared", ... }
-await al.reporters.submitProbe({ asset, epoch, status: "Up", region: "af", evidenceHash });
+await al.events.proposeTier1(arsSac, "Depeg");           // uses the canonical Depeg definition
+await al.events.challenge(eventId, evidenceHash);        // bond locked in Staking, escalates at once
+const st = await al.events.status(arsSac, "Depeg");      // per (asset, kind): { kind: "None" | "InProgress" | "Declared", ... }
+const gate = await al.events.coverGate(arsSac);          // "Clear" | "EventInProgress" | "RecentDepeg" | ...
+await al.events.resolveTimeout(eventId);                 // after the ruling deadline
+await al.staking.submitProbe({ asset, epoch, status: "Up", region: "af", evidenceHash });
+await al.staking.claim();                                // bond refunds and winnings
+await al.treasury.claimReward();                         // keeper or reporter rewards
 ```
 
 ### 19.7 Behaviour guarantees
 
-- Every write is simulated first; the SDK throws `AnchorlineError` with the contract error name (Section 14) before asking the wallet to sign.
+- Every write is simulated first; the SDK throws `SyloxError` with the contract error name (Section 14) before asking the wallet to sign.
 - If simulation reports archived entries, the SDK builds and submits a restore transaction first (with user consent callback).
 - Amounts are `bigint` in base units everywhere; `al.fx` converts for display only.
 - No private keys are handled by the SDK; signing is delegated to the provided signer.
@@ -1436,27 +1997,31 @@ Read the band at borrow time inside your own contract; do not cache it across le
 - Pick the series whose expiry covers your exposure period; buy cover equal to what you would lose, not more (per buyer caps apply).
 - Keep cover units in the same account that will claim. If you move them, the new holder claims.
 - After an event is Declared, call `trigger` then `claim`. If you miss it, anyone can push your payout after the claim window.
-- Read the event definition hash for the series before buying; it is the contract, not the marketing text.
+- Read the definitions the series pins before buying (`terms().def_versions`, then `EventRegistry.definition(asset, kind, version)` for each kind); they are the contract, not the marketing text. For a fiat reference, check the rate source (official or market) the definition fixes.
+- Expect `buy_cover` to refuse while any trailing failure signal is present (Section 9.4 step 2): you cannot buy cover on a failure that has already started.
+- A failure that starts before expiry is covered even if it can only be proposed after expiry (Section 8.6); the series waits in Pending for one window length after expiry before it can expire.
 
 ### 20.4 Sellers (market makers, treasuries)
 
 - Your maximum loss is `cover_written`, which is never more than your collateral.
-- Premiums unlock only at Triggered or Expired.
-- Monitor `band_changed`; you cannot exit written cover early except by transferring your position to another party who accepts it.
+- Premiums unlock only at Triggered or Expired, and collateral stays locked through the post expiry Pending period (Sections 8.6, 9.2).
+- Monitor `band_changed`; you cannot exit written cover early except by transferring your whole position to another party who accepts it and holds no position in the series.
 - Quote management: one quote per series; resize it as collateral changes.
 
 ### 20.5 Reporters
 
 1. Get added by governance (provide organization, region, contact).
-2. Stake `reporter_stake` USDC via `stake`.
+2. Stake `reporter_stake` USDC via `Staking.stake`.
 3. Run the reporter node with your key in KMS, region label set honestly.
-4. Watch your fault count via `reporter(addr)`; investigate any disagreement with the majority.
-5. File Tier 2 claims only with complete evidence bundles; a lost challenge costs your bond.
+4. Watch your fault count via `Staking.reporter(addr)`; investigate any disagreement with the majority.
+5. Claim rewards from `Treasury.claim_reward`, and bond refunds or winnings from `Staking.claim`.
+6. File Tier 2 claims only with complete evidence bundles (probes, stuck SEP-24 transactions, anchor statements where available, Section 8.3); a lost challenge costs your bond.
 
 ### 20.6 Anchors
 
 - Publish a complete stellar.toml with transfer servers so probes are accurate.
 - Optional: opt in to authenticated probes by allowlisting the reporters' test accounts.
+- Optional: cooperate on WithdrawalHalt claims by confirming or denying a halt with evidence; this is the strongest input to a Tier 2 ruling (Section 8.3).
 - Optional: publish signed reserve attestations; they are shown alongside signals.
 - Dispute path: contact the committee with evidence if you believe a signal or ruling is wrong.
 
@@ -1474,24 +2039,31 @@ The protocol's safety is stated as invariants that must hold after every transac
 | I4 | Cover units can be minted only in Open state, only against a fill | Series |
 | I5 | Payouts only in Triggered state, and only for an event that covers the series | Series |
 | I6 | Premiums are not withdrawable before Triggered or Expired | Series |
-| I7 | An asset's event status moves to Declared only via `finalize` after an unchallenged window, or via committee `rule` | EventRegistry |
-| I8 | Declared is terminal for that event | EventRegistry |
-| I9 | Sum of open cover across series of an asset ≤ asset cap at the time of each purchase | MarketFactory |
-| I10 | No role can transfer USDC out of a series except to a seller (withdraw), a holder (claim) or the treasury (fee at purchase) | Series |
-| I11 | Series terms never change after `open_series` | Series |
-| I12 | A posted epoch's signals are immutable once Final, except by a resolved dispute | RiskOracle |
+| I7 | An event moves to Declared only via `finalize` after an unchallenged window, committee `rule` before the ruling deadline, or `resolve_timeout` of an escalated Tier 1 Depeg or IssuerFreeze event | EventRegistry |
+| I8 | Declared is terminal for that (asset, kind, def\_version) | EventRegistry |
+| I9 | Sum of open cover across series of an asset ≤ asset cap at the time of each purchase, checked and reserved in one `reserve_cover` call | MarketFactory |
+| I10 | No role can transfer USDC out of a series except to a seller (withdraw), a holder (claim) or the `Treasury` (fee at purchase) | Series |
+| I11 | Series terms, including pinned definition versions, never change after `open_series` | Series |
+| I12 | A posted epoch's signals are immutable once Final, except by a resolved dispute and the one time write of `endpoint` from the `Staking` aggregate | RiskOracle |
+| I13 | Every live series pins the current canonical definition version of each kind it covers | EventRegistry, MarketFactory |
+| I14 | USDC balance of `Staking` ≥ sum of keeper bonds, reporter stakes, locked bonds and claimable balances | Staking, always |
+| I15 | USDC balance of `Treasury` ≥ sum of bucket balances plus accrued, unclaimed rewards | Treasury, always |
+| I16 | `RiskOracle` and `EventRegistry` never hold or transfer USDC | RiskOracle, EventRegistry |
 
 ### 21.2 Threat to control mapping
 
 | Threat (PRD Section 10) | Controls in this design | Invariants or sections |
 | --- | --- | --- |
-| Trigger manipulation | Window, liquidity floor, asset cap from median liquidity, challenge window | 11, I9 |
-| False keeper data | Bonded keepers, inputs hash, deterministic recompute, disputes | 5.3, 5.4, I12 |
-| False reporter claims | Stake, majority, slashing, Tier 2 bonds | 7.5, 8.3 |
+| Trigger manipulation | Window, liquidity baseline before the window, asset cap from median liquidity, challenge window | 8.2, 11, I9 |
+| One wick forcing a band change | `peg_ratio_p10` instead of a window minimum | 6.1, 11.3 |
+| False keeper data | Bonded keepers, inputs hash, deterministic recompute, disputes, backfill of overturned epochs | 5.3, 5.4, I12 |
+| False reporter claims | Stake, strict majority, slashing, Tier 2 bonds, endpoint only from the aggregate | 7.4, 7.5, 8.3 |
 | Committee capture | Separate multisig, published reasons, escalation only | 8.4, 16 |
-| Contract bug drains a pool | Isolated series, non upgradeable series, invariants, audit | 3.2, 17.3, I1 to I10 |
-| Buyer front running a failure | No cover while event in progress or band Distress | 9.4 |
-| Governance attack | Timelocks, terms fixed per series, guardian cannot move funds | 16, 17, I11 |
+| Committee inaction | Ruling deadline, default outcome, `resolve_timeout` by anyone, misses recorded per committee | 8.9 |
+| Contract bug drains a pool | Isolated series, non upgradeable series, invariants, audit; funds split across `Series`, `Staking` and `Treasury` | 3.1, 3.2, 17.3, I1 to I10, I14 to I16 |
+| Buyer front running a failure | Cover gate: no cover while an event is in progress or a trailing failure signal is present; coverage keyed to failure window start | 8.6, 9.4 |
+| Definition shopping | One canonical version per (asset, kind); proposals cannot pick a version; series pin current versions | 8.8, I13 |
+| Governance attack | Timelocks, terms and definitions fixed per series, reference immutable, guardian cannot move funds | 16, 17, I11 |
 | Storage expiry loses claims | TTL policy, restore support in SDK | 15.2 |
 
 ### 21.3 Testing strategy
@@ -1499,20 +2071,35 @@ The protocol's safety is stated as invariants that must hold after every transac
 | Layer | Tooling | What it covers |
 | --- | --- | --- |
 | Unit | `soroban-sdk` testutils, `Env::default()`, mocked auths | Every function, every error path |
-| Property | `proptest` with random sequences of deposit, quote, buy, trigger, claim, withdraw | I1 to I6, I10 after every step |
+| Property | `proptest` with random sequences of deposit, quote, buy, trigger, claim, withdraw; of lock, release, forfeit, slash and claim in `Staking`; of deposit, accrue, claim, allocate and spend in `Treasury` | I1 to I6, I10, I14, I15 after every step |
 | Fuzz | `cargo-fuzz` on premium math and signal sanity checks | Overflow, rounding direction |
 | Integration | Local quickstart network with all contracts, scripted scenarios | Full flows across contracts |
 | Scenario | Replays of historical depeg periods from public data on other stablecoins, scaled to Stellar assets | Trigger behaviour, false positives |
-| Adversarial | Scripted manipulation attempts on testnet AMMs and order books with capped budgets | Section 11 assumptions |
+| Adversarial | Scripted manipulation attempts on testnet AMMs and order books, each with a fixed spending limit | Section 11 assumptions |
 | Recompute | Golden bundles: recompute tool must reproduce posted signals byte for byte | Keeper determinism |
 
-Coverage target: 95% line coverage on `Series` and `EventRegistry`, 100% of error codes exercised.
+Coverage target: 95% line coverage on `Series`, `EventRegistry`, `Staking` and `Treasury`, 100% of error codes exercised. Scenario tests must include the day 88 of 90 depeg (Section 8.6), a ruling deadline timeout for each default outcome (Section 8.9), a definition change with live series (Section 8.8), and a backfill after a keeper outage (Section 5.2).
 
 ### 21.4 Audit and disclosure
 
-- Audit through the SCF Audit Bank before mainnet, scoped to all six contracts and the recompute library.
+- External security audit before mainnet, scoped to all seven contracts and the recompute library.
 - SECURITY.md with a disclosure address and response targets (acknowledge within 48 hours).
 - Bug bounty once mainnet collateral passes an agreed level.
+
+### 21.5 Libraries
+
+Check OpenZeppelin's Stellar contracts library (the Soroban port of OpenZeppelin Contracts) before hand rolling standard components, and record what it covers at the time each contract is built. Use an audited implementation wherever one fits; hand roll only what it does not cover, and note why.
+
+| Need | Where in Sylox | What to check in the library |
+| --- | --- | --- |
+| SEP-41 fungible token | Cover units in `Series` (Section 9.1) | A fungible token implementing the SEP-41 interface, with allowance, burn and metadata extensions, that can be embedded in a contract with its own non token logic |
+| Pausable | Guardian scopes (Section 16.2) | A pausable utility that supports several independent scopes and expiring pauses, or can be wrapped to do so |
+| Upgradeable | `upgrade(wasm_hash)` on the six core contracts (Section 17.3) | An upgradeable utility, ideally with a migration hook, gated by an owner or role that the `Governor` can hold |
+| Access control | Role checks (Section 16) | Ownable or role based access control usable with a contract address (the `Governor`) as owner |
+
+What it covers today, as understood when this revision was written and not yet verified against the live repository: a SEP-41 fungible token with burnable and other extensions, a pausable utility, an upgradeable utility with a migration pattern, and ownable and role based access control. Pausable is understood to be a single switch, so the four guardian scopes and the automatic expiry of Section 16.2 would likely be a thin local layer on top. Verify all of this, and pin the exact version, before the `Series` token and the core contracts' pause and upgrade logic are written.
+
+Record for each row: the library version checked, whether it covers the need, and any gap that forces a local implementation. The library's coverage and audit status change over time, so this check is done again at the start of each build phase rather than once.
 
 ## 22. Deployment, configuration and operations
 
@@ -1521,12 +2108,13 @@ Deployment is scripted end to end with the Stellar CLI and is the same on testne
 ### 22.1 Repository layout
 
 ```
-anchorline/
+sylox/
   contracts/
     types/            # shared #[contracttype]s
     risk-oracle/
     event-registry/
-    reporter-staking/
+    staking/          # keeper bonds, reporter stakes and probes, bond escrow, slashing
+    treasury/         # protocol fees, slashed funds, reward pools
     market-factory/
     series/
     governor/
@@ -1546,66 +2134,62 @@ anchorline/
 1. Build all contracts: `stellar contract build`, then optimize the Wasm.
 2. Upload the `Series` Wasm and record its hash.
 3. Deploy and initialize `Governor` with signers, threshold, timelocks and the committee address.
-4. Deploy and initialize `ReporterStaking`, `RiskOracle`, `EventRegistry`, `MarketFactory` (with the `Series` Wasm hash), wiring addresses together.
-5. Through governor actions: add keepers, reporters, assets and event definitions; set parameters from the network's config file.
+4. Deploy and initialize `Staking`, `Treasury`, `RiskOracle`, `EventRegistry` and `MarketFactory` (with the `Series` Wasm hash), wiring addresses together. Contract addresses derive from the deployer and a salt, so every address is computed before any deployment and the mutual references (`RiskOracle` and `Staking`, `EventRegistry` and `MarketFactory`, `Staking` and `Treasury`) are passed straight to each `initialize`.
+5. Through governor actions: add keepers and reporters (on `Staking`), assets with their reference and issuer flags, and one canonical event definition per (asset, kind) in scope; set parameters from the network's config file; allocate initial `Treasury` funds to the reward pools if any.
 6. Start keeper, reporter nodes, indexer and API; wait for at least `stale_after_epochs` clean epochs.
 7. Through governor: open the first series.
 8. Publish all contract ids and Wasm hashes in the docs and the repo `deployments/` file.
 
 ### 22.2a Build sequence
 
-Deployment order (22.2) is the order contracts are *invoked* on a live network; it assumes every contract already exists. Build order is the order they get *written and tested*, and it is driven by the dependency graph in Section 3.5: a contract can only be implemented once the things it reads from compile.
+Deployment order (22.2) is the order contracts are *invoked* on a live network; it assumes every contract already exists. Build order is the order they get *written and tested*, and it is driven by the dependency graph in Section 3.5: a contract can only be implemented once the things it reads from compile. The build runs in three phases after the Phase 0 data pull (Section 1.7):
+
+- **Phase A, data layer:** shared types, `RiskOracle` with the ring buffer (write cost benchmarked in its first week, Section 5.8), `Staking`, `Treasury`, the adapters, the keeper and recompute library, the reporter node.
+- **Phase B, first event scope and markets:** `EventRegistry` with canonical Depeg and IssuerFreeze definitions (Tier 1), challenges and the ruling deadline; `MarketFactory`; `Series`; `Governor`; indexer, API and SDK.
+- **Phase C, later event scope:** WithdrawalHalt (Tier 2) with its evidence handling, Insolvency (Tier 3) with committee tooling, and MintWithoutBacking.
 
 ```mermaid
 flowchart LR
-  A["anchorline-types<br/>shared contracttypes (Section 4)"] --> B["RiskOracle<br/>signals, score, bands (5-6)"]
-  B --> C["ReporterStaking<br/>probes feed into SignalSet.endpoint (7)"]
-  B --> D["EventRegistry<br/>reads Final signals from Oracle (8)"]
-  D --> E["MarketFactory<br/>reads event_status via Series (9, 11.1)"]
-  E --> F["Series<br/>one Wasm, deployed per series (9-10)"]
-  F --> G["Governor<br/>wired in last: wraps every privileged call (16-17)"]
+  P0["Phase 0 data pull<br/>launch assets, liquidity, issuer flags (1.7)"] --> A
 
-  A -.-> H["adapters/amm-soroswap<br/>adapters/fx-reference (3.3)"]
-  H -.-> B
+  subgraph PA["Phase A: data layer"]
+    A["sylox-types<br/>shared contracttypes (Section 4)"] --> B["RiskOracle<br/>signals, ring buffer, score, bands (5-6)"]
+    A --> C["Staking<br/>stakes, probes, bond escrow (7)"]
+    A --> T["Treasury<br/>fees, slashed funds, reward pools (12.7)"]
+    A -.-> H["adapters/amm-soroswap<br/>adapters/fx-reference (3.3)"]
+    H -.-> B
+    C --> B
+    C --> T
+    B -.-> K["keeper, recompute,<br/>reporter-node (18)"]
+  end
 
-  G -.-> I["Offchain services<br/>keeper, reporter-node, indexer, api (18)"]
-  F -.-> I
-  I -.-> J["packages/sdk<br/>wraps generated bindings (19)"]
+  subgraph PB["Phase B: first event scope and markets"]
+    D["EventRegistry<br/>Depeg and IssuerFreeze, Tier 1 (8)"] --> E["MarketFactory<br/>open_series checks, atomic caps (9.7, 11.1)"]
+    E --> F["Series<br/>one Wasm, deployed per series (9-10)"]
+    F --> G["Governor<br/>wired in last: wraps every privileged call (16-17)"]
+    G -.-> I["indexer, api,<br/>packages/sdk (18-19)"]
+  end
+
+  subgraph PC["Phase C: later event scope"]
+    L["WithdrawalHalt, Tier 2 (8.3)"]
+    M["Insolvency, Tier 3 (8.4)"]
+    N["MintWithoutBacking (8.2)"]
+  end
+
+  B --> D
+  C --> D
+  T --> F
+  D --> L
+  D --> M
+  D --> N
 
   classDef done fill:#dfe,stroke:#393;
   classDef todo fill:#eee,stroke:#999;
   class A done;
-  class B,C,D,E,F,G,H,I,J todo;
+  class P0,B,C,T,H,K,D,E,F,G,I,L,M,N todo;
 ```
 
-Green: scaffolded and compiling as of this revision (stub `lib.rs`, no business logic — Section 1.2 scope). Grey: not yet started. `ReporterStaking` and `EventRegistry` both depend only on `RiskOracle` being in place (not on each other), so they can be built in parallel once Section 5-6 are implemented; `Governor` has no functional dependency on the other five core contracts but is ordered last here because every privileged call across them is written against its `require_auth()` pattern (Section 16), so its interface should be stable before those calls are finalized.
-
-A calendar view of the same plan, mapped to the SCF tranches in `prd.md` Section 15.2:
-
-```mermaid
-gantt
-  dateFormat YYYY-MM-DD
-  axisFormat %b %d
-  title Anchorline build sequence vs. SCF tranches
-  section Tranche #1 (MVP, 20%)
-  anchorline-types            :done,    types, 2026-10-08, 3d
-  RiskOracle                  :active,  oracle, after types, 14d
-  ReporterStaking             :         staking, after oracle, 10d
-  EventRegistry (Tier 1 only) :         registry1, after oracle, 10d
-  MarketFactory + Series      :         markets1, after registry1, 14d
-  Web app alpha                :         webapp1, after markets1, 7d
-  section Tranche #2 (Testnet, 30%)
-  EventRegistry (Tier 2/3)    :         registry2, after markets1, 14d
-  Governor                    :         gov, after registry2, 10d
-  Manipulation limits (Sec 11) :         limits, after gov, 7d
-  Threat model + Audit Bank app :        audit, after limits, 10d
-  section Tranche #3 (Mainnet, 40%)
-  Offchain services (18)      :         svc, after gov, 14d
-  SDK (19)                    :         sdk, after svc, 10d
-  Mainnet deploy (22.2)        :         deploy, after sdk, 7d
-```
-
-Dates are illustrative scaffolding, not commitments; actual duration depends on team size (`prd.md` Section 16) and what the Phase 0 legal and partner gates (`prd.md` Section 14, 18.2) allow.
+Green: implemented and tested as of this revision (the shared types crate). Grey: not yet implemented; every contract crate exists as a compiling stub (`lib.rs` with one `todo!()` function, no business logic). Within Phase A, `Staking` comes before the parts of `RiskOracle` that read the endpoint aggregate and send bond instructions, and `Treasury` before the reward paths of `Staking`. `Governor` has no functional dependency on the other core contracts but is ordered last in Phase B because every privileged call across them is written against its `require_auth()` pattern (Section 16), so its interface should be stable before those calls are finalized. Phase C adds checks, evidence handling and committee tooling to `EventRegistry`; it needs no type changes (Section 1.2).
 
 ### 22.3 Configuration
 
@@ -1620,14 +2204,18 @@ All per network settings live in `deploy/<network>.toml` (contract ids, USDC SAC
 | Reporter split | No majority for an asset in an epoch | Medium |
 | Band up move | Any asset moves to Warning or Distress | Medium, notify subscribers |
 | Event proposed | Any `event_proposed` | High, page committee |
+| Ruling deadline near | An Escalated event within 48 hours of its ruling deadline with no ruling | High, page committee |
+| Ruling timed out | Any `ruling_timed_out` | High, notify governance (committee rotation grounds) |
 | Unusual cover | Cover bought on an asset above 20% of its cap within 24 hours | Medium |
-| Invariant check | Offchain check of I1 to I3 per series per hour fails | Critical, consider guardian pause |
+| Invariant check | Offchain check of I1 to I3 per series, I14 for `Staking` and I15 for `Treasury` per hour fails | Critical, consider guardian pause |
+| Reward pool low | A `Treasury` reward bucket below one week of expected accruals | Medium, propose `TreasuryAllocate` |
 | TTL low | Any core entry within 30 days of expiry | Medium |
 
 ### 22.5 Runbooks
 
-- **Event proposed:** confirm signals from raw bundles; notify committee; watch for challenges; call `finalize` or `escalate` on time.
-- **Keeper outage:** second keeper takes over automatically (any keeper may post); if all keepers are down past staleness, new cover stops by design; restore and backfill.
+- **Event proposed:** confirm signals from raw bundles; notify committee; watch for challenges; call `finalize` on time. After a challenge, track the ruling deadline from `event_escalated`; if it passes, call `resolve_timeout`.
+- **Keeper outage:** second keeper takes over automatically (any keeper may post); if all keepers are down past staleness, new cover stops by design; restore and backfill every closed, non Final epoch still inside `window_secs` (Section 5.2). Epochs older than the window stay missing and count toward `max_missing_epochs`.
+- **Definition change:** queue `RegisterDefinition`; stop opening series that pin the current version for that (asset, kind); `sync` live series as they expire; execute once none pins the old version (Section 8.8).
 - **Suspected manipulation:** compare DEX activity with AMM cross checks; file a challenge with evidence; guardian may pause `NewCover` on the asset.
 - **Contract bug:** guardian pauses affected scopes; existing series run to expiry; fix via governor upgrade for core contracts, new Wasm for future series.
 - **TTL maintenance:** weekly job extends TTL on instances, asset configs, open event records and live series' positions.
@@ -1639,7 +2227,7 @@ Every tunable value in one place, with its v1 default. All defaults are starting
 | Parameter | Default | Unit | Used in |
 | --- | --- | --- | --- |
 | `epoch_secs` | 3,600 | seconds | Oracle epochs |
-| `window_secs` | 259,200 (72h) | seconds | Peg TWAP window |
+| `window_secs` | 259,200 (72h) | seconds | Peg TWAP and `peg_ratio_p10` window; backfill limit for posting |
 | `signal_dispute_secs` | 7,200 (2h) | seconds | Signal dispute window |
 | `signal_dispute_bond` | 1,000 | USDC | Signal disputes |
 | `stale_after_epochs` | 3 | epochs | Staleness |
@@ -1647,7 +2235,7 @@ Every tunable value in one place, with its v1 default. All defaults are starting
 | `keeper_bond` | 5,000 | USDC | Keepers |
 | `keeper_slash` | 1,000 | USDC | Lost disputes |
 | `keeper_max_faults` | 3 | count per 30 days | Suspension |
-| `keeper_reward` | 0.50 | USDC per accepted epoch | Fee pool |
+| `keeper_reward` | 0.50 | USDC per accepted epoch | `Treasury` keeper reward pool |
 | `band_down_epochs` | 3 | epochs | Hysteresis |
 | `d_max`, `r_max`, `c_max`, `k_max`, `s_max_bps` | 0.10, 0.10, 0.01, 20, 2,000 | ratio, ratio, ratio, count, bps | Score components |
 | Weights P, E, R, I, L, S | 3,500, 2,000, 1,500, 1,500, 1,000, 500 | bps | Score |
@@ -1659,11 +2247,13 @@ Every tunable value in one place, with its v1 default. All defaults are starting
 | `reporter_slash_bps` | 1,000 | bps | Slashing |
 | `depeg_threshold` | 0.95 | ratio | Event definition |
 | `depeg_window_secs` | 259,200 | seconds | Event definition |
+| `max_missing_epochs` | 6 (of 72) | epochs | Event definition (Depeg) |
 | `halt_window_secs` | 259,200 | seconds | Event definition |
 | `challenge_secs` | 86,400 | seconds | Event definition |
+| `ruling_deadline_secs` | 1,209,600 (14d) | seconds from escalation | Event definition |
 | `cure_threshold` | 0.98 | ratio | Event definition |
 | `claim_bond` | 2,000 | USDC | Tier 2 |
-| `challenge_multiplier` | 1 | multiple | Tier 2 |
+| `challenge_multiplier` | 1 | multiple | Challenges of every tier |
 | `cooldown_secs` | 604,800 (7d) | seconds | After cure or reject |
 | `liquidity_cover_ratio` | 0.25 | ratio | Asset cover cap |
 | `max_series_per_asset` | 4 | count | Factory |
@@ -1684,29 +2274,42 @@ Every tunable value in one place, with its v1 default. All defaults are starting
 | --- | --- |
 | Anchor | A business that issues tokens on Stellar backed by offchain money and runs deposit and withdrawal services |
 | Band | Risk category from the score: Normal, Watch, Warning, Distress, Event |
-| Bond | USDC posted to back a claim, challenge or dispute; forfeited if wrong |
+| Bond | USDC posted to back a claim, challenge or dispute, held by `Staking`; forfeited if wrong, refunded on a ruling timeout |
+| Canonical definition | The one current `EventDefinition` version for an (asset, kind); proposals always use it and new series must pin it |
 | Challenge window | Time after a proposal during which anyone can contest it |
 | Claim window | Time after which anyone can push a holder's payout to them |
 | Committee | The multisig that rules on escalated events and Tier 3 events |
+| Cover gate | The check that blocks new cover while an event is in progress or a trailing failure signal is present |
 | Cover unit | 1 unit of protection, paying 1 USDC on a covered event |
 | Credit event | A declared failure of an issuer under a fixed definition |
 | Cure | A depeg proposal cancelled because the price recovered inside the challenge window |
 | Epoch | One signal interval for one asset |
-| Event definition | The exact rules for what counts as a credit event, stored by hash |
+| Event definition | The exact rules for what counts as a credit event of one kind on one asset, versioned and stored by (asset, kind, version) |
+| Failure window start | The time a credit event's failure began; it decides which series the event covers |
 | Guardian | Multisig that can pause some actions, nothing more |
 | Inputs bundle | The raw data a keeper used, published so anyone can recompute signals |
 | Keeper | Bonded service that computes and posts signals |
+| Official and market rate | Two exchange rates for one currency when they diverge (ARS is the standard example); each fiat reference fixes one |
 | Reporter | Staked service that probes anchor endpoints |
+| Ring buffer | The per asset entry of 240 epoch slots, each with a finality flag, that Tier 1 checks read |
+| Ruling deadline | Time from escalation within which the committee must rule before the default outcome applies |
 | SAC | Stellar Asset Contract: the Soroban interface to a classic Stellar asset |
 | SEP-1, SEP-6, SEP-10, SEP-24, SEP-41 | Stellar standards for stellar.toml, transfers, authentication, interactive transfers and token interfaces |
-| Series | One market for one asset, one event definition and one term |
+| Series | One market for one asset and one term, pinning one definition version per covered kind |
+| Staking | The contract holding every bond and stake |
+| Treasury | The contract holding protocol fees, slashed funds and the reward pools |
 | TTL | Time to live of a Soroban storage entry |
 
 ### 24.2 Open technical questions
 
-- [ ] Which FX oracles on Stellar provide NGN and other local currency rates, at what update frequency and with what methodology?
+- [ ] Which FX oracles on Stellar provide ARS and other local currency rates, on which basis (official, market or both), at what update frequency and with what methodology? (Phase 0 data pull, Section 1.7.)
 - [ ] Can Soroban AMM adapters cover enough of the target assets to make the cross check meaningful?
-- [ ] Exact ledger entry size and resource limits for the 168 entry ring buffer on the current network configuration.
+- [ ] Ring buffer write cost and the per entry and per transaction limits for a 240 slot entry on the current network configuration (benchmark in the first week of the `RiskOracle` build, Section 5.8).
+- [ ] Should `min_liquidity` move from `AssetConfig` into the Depeg definition, so that an `UpdateAsset` cannot change the liquidity floor a live series is judged against?
+- [ ] Insolvency has no measurement window, so under Section 8.6 it must be proposed by series expiry. Is a post expiry acceptance period needed for Tier 3 when it is built?
+- [ ] What pending time makes a user submitted SEP-24 transaction count as stuck for WithdrawalHalt evidence, and should it be a definition parameter?
+- [ ] Depeg windows longer than 72 hours need a larger ring buffer; is any asset expected to need one?
+- [ ] An asset's `reference` is immutable after `add_asset`. If an issuer changes its redemption basis, what is the migration path (for example: disable the asset, let its series run off, then a governed reference change with new definition versions)?
 - [ ] Is the Soroban Optimistic Oracle suitable as the Tier 2 dispute layer, or is committee escalation simpler for v1?
 - [ ] Can signal disputes move from committee resolution to onchain verifiable recomputation in v2 (for example via proofs over ledger data)?
 - [ ] Should `require_holding` be enforced at claim time as well as at purchase, and how to handle assets frozen for the buyer?

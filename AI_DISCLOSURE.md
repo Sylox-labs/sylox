@@ -17,7 +17,7 @@ Required by the SCF Open Track checklist (`prd.md` Section 15.1).
 ## Human review
 
 All design decisions (event definitions, manipulation defenses, governance
-structure, budget) originate from and are reviewed by the Anchorline team.
+structure, budget) originate from and are reviewed by the Sylox team.
 AI-assisted code changes go through the same review process as any other
 contribution before merging.
 

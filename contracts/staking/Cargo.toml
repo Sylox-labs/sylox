@@ -1,5 +1,5 @@
 [package]
-name = "risk-oracle"
+name = "staking"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

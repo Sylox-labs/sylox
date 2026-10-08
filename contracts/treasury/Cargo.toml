@@ -1,5 +1,5 @@
 [package]
-name = "reporter-staking"
+name = "treasury"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
-anchorline-types = { workspace = true }
+sylox-types = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
