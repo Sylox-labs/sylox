@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-slate-black: var(--color-slate-black);
+  --color-silo-oatmeal: var(--color-silo-oatmeal);
+  --color-anchor-graphite: var(--color-anchor-graphite);
+  --color-cement-grey: var(--color-cement-grey);
+  --color-cyber-tin: var(--color-cyber-tin);
+  --color-risk-crimson: var(--color-risk-crimson);
+  --color-risk-crimson-tint: var(--color-risk-crimson-tint);
+
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-border: var(--border);
+  --color-border-hover: var(--border-hover);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-focus-ring: var(--focus-ring);
+
+  --font-sans: var(--font-sans-family);
+  --font-mono: var(--font-mono-family);
+  --font-display: var(--font-display);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+body {
+  background: var(--color-slate-black);
+  color: var(--color-silo-oatmeal);
+  font-family: var(--font-sans);
+}
+
+/* Numbers that update or align use tabular figures (brief §4.4). */
+.font-mono,
+[data-numeric] {
+  font-feature-settings: "tnum" 1;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--color-focus-ring, var(--color-risk-crimson));
+  outline-offset: 2px;
+}
+
+/*
+ * Hero panel staggered-parallax entrance. A ScrollTrigger onUpdate writes
+ * --panel-progress (0-1) onto each [data-hero-panel]; panelIndex sets
+ * --delay (1-4) inline. Panel 1 skips this (it's visible immediately, the
+ * LCP element) — only panels 2-4 opt in via [data-hero-panel]:not(:first-child)
+ * so the rule never fights the first panel's required immediate visibility.
+ * Technique generalized from stellar-websiteguide.md §7.1's CSS-var pattern.
+ */
+@media (prefers-reduced-motion: no-preference) {
+  [data-hero-panel]:not(:first-child) {
+    --panel-progress: 0;
+    --offset-step: min(100px, 10vh);
+    --offset: calc(var(--delay, 1) * var(--offset-step));
+    opacity: var(--panel-progress);
+    translate: 0 calc(var(--offset) - var(--offset) * var(--panel-progress));
+  }
+}
