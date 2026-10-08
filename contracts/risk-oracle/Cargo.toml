@@ -14,6 +14,9 @@ soroban-sdk = { workspace = true }
 sylox-types = { workspace = true }
 
 [dev-dependencies]
+proptest = "1.11.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 soroban-sdk = { workspace = true, features = ["testutils"] }
 
 [features]
