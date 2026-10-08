@@ -1529,3 +1529,104 @@ fn set_event_in_progress_requires_registry_auth() {
         )]
     );
 }
+
+// -- Required error coverage: Unauthorized, NotInitialized, MathOverflow --
+
+/// `Error::Unauthorized` (3) is never returned by any production call
+/// site (confirmed: no `Error::Unauthorized` construction anywhere
+/// outside `error.rs`'s own definition). Every authorization check in
+/// this contract (`add_asset`, `update_asset`, `set_formula`,
+/// `post_signals`, `dispute_signals`, `resolve_signal_dispute`,
+/// `set_event_band`, `clear_event_band`, `set_event_in_progress`) goes
+/// through Soroban's native `Address::require_auth()`, which traps the
+/// host call directly rather than returning a `Result::Err` this
+/// contract could wrap — so the caller never gets a `RiskOracle::Error`
+/// back at all on an auth failure, it gets a host error. This test
+/// demonstrates that trap directly (no `mock_all_auths`, so the
+/// registry's signature is genuinely missing) rather than asserting a
+/// code path that does not exist.
+#[test]
+#[should_panic]
+fn missing_auth_traps_natively_rather_than_returning_unauthorized() {
+    let env = Env::default();
+    let staking = env.register(MockStaking, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let governor = Address::generate(&env);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let asset = Address::generate(&env);
+
+    // No mock_all_auths(): the registry never actually signs this call.
+    client.set_event_in_progress(&asset, &true);
+}
+
+/// `Error::NotInitialized` (2), from `require_config` (via `try_` so the
+/// panic-on-`Err` client wrapper is not used), on a contract that has
+/// never had `initialize` called. Every method gated by
+/// `require_config` shares this one guard; `add_asset` exercises it
+/// here as a representative call.
+#[test]
+fn add_asset_before_initialize_is_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    let result = client.try_add_asset(&asset_config(&env, &asset, &issuer));
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+}
+
+/// `Error::MathOverflow` (5), from `aggregate_from_ring`'s checked sum
+/// over the 7 day window: `clawback_amount` has no sanity bound in
+/// `check_sanity_bounds` (only `peg_ratio`, `peg_ratio_p10`,
+/// `liquidity_2pct` and `supply` are bounded there), so a keeper
+/// posting a large `clawback_amount` on enough epochs makes the
+/// `checked_add` sum over `AGGREGATE_SLOTS_7D` (168) epochs overflow
+/// `i128`. `recompute_score`'s `Result` propagates through
+/// `post_signals` via `?`, so the overflow surfaces as the 168th post
+/// itself failing (the one that first triggers a score computation),
+/// not as a separate call.
+#[test]
+fn post_signals_reports_math_overflow_when_the_7d_clawback_sum_cannot_fit_i128() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    // Posting in strict order only makes an epoch effectively final once
+    // 2 further epochs have posted (pending_until = post_time +
+    // SIGNAL_DISPUTE_SECS, review item C5), so epoch 167 (the one that
+    // first completes the 168-epoch window) only becomes the
+    // newest-final epoch, and triggers recompute_score, once epoch 169
+    // posts.
+    for epoch in 0..170u64 {
+        staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s = signal_set(&env, epoch, sylox_types::SCALE);
+        s.liquidity_2pct = 100_000_000_000;
+        s.supply_change_bps = 0;
+        // Large enough that summing just 2 of these 168 postings already
+        // exceeds i128::MAX; well within check_sanity_bounds, which does
+        // not bound this field at all.
+        s.issuer_actions = IssuerActions {
+            clawbacks: 1,
+            clawback_amount: i128::MAX / 2 + 1,
+            auth_revocations: 0,
+            flag_changes: 0,
+        };
+        let result = fx.client.try_post_signals(&keeper, &asset, &s);
+        if epoch == 169 {
+            assert_eq!(
+                result,
+                Err(Ok(Error::MathOverflow)),
+                "epoch 167 becomes newest-final here, completing the 7 day window and \
+                 triggering the overflowing clawback_amount_7d sum"
+            );
+            return;
+        }
+        let _ = result.unwrap();
+    }
+    unreachable!("loop always returns at epoch 169");
+}

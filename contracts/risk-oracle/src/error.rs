@@ -9,6 +9,17 @@ use soroban_sdk::contracterror;
 pub enum Error {
     AlreadyInitialized = 1,
     NotInitialized = 2,
+    /// Never actually returned by any call in this contract: every
+    /// authorization check (`add_asset`, `update_asset`, `set_formula`,
+    /// `post_signals`, `dispute_signals`, `resolve_signal_dispute`,
+    /// `set_event_band`, `clear_event_band`, `set_event_in_progress`)
+    /// goes through Soroban's native `Address::require_auth()`, which
+    /// traps the host call directly rather than returning a `Result`
+    /// this contract could wrap in `Error::Unauthorized`. Kept for
+    /// `technical-doc.md` Section 14 code-number compatibility; see
+    /// `missing_auth_traps_natively_rather_than_returning_unauthorized`
+    /// in test.rs and the PR's "Review fixes" section for why this is
+    /// documented as unreachable rather than tested as reachable.
     Unauthorized = 3,
     Paused = 4,
     MathOverflow = 5,
