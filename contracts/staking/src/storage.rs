@@ -79,7 +79,9 @@ pub enum DataKey {
 }
 
 pub fn get_keeper(env: &Env, keeper: &Address) -> Option<KeeperInfo> {
-    env.storage().persistent().get(&DataKey::Keeper(keeper.clone()))
+    env.storage()
+        .persistent()
+        .get(&DataKey::Keeper(keeper.clone()))
 }
 
 pub fn set_keeper(env: &Env, keeper: &Address, info: &KeeperInfo) {
@@ -111,11 +113,18 @@ pub fn add_to_all_reporters(env: &Env, reporter: &Address) {
     let mut reporters = get_all_reporters(env);
     if !reporters.contains(reporter) {
         reporters.push_back(reporter.clone());
-        env.storage().instance().set(&DataKey::AllReporters, &reporters);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllReporters, &reporters);
     }
 }
 
-pub fn get_probe(env: &Env, asset: &Address, epoch: u64, reporter: &Address) -> Option<StoredProbe> {
+pub fn get_probe(
+    env: &Env,
+    asset: &Address,
+    epoch: u64,
+    reporter: &Address,
+) -> Option<StoredProbe> {
     env.storage()
         .temporary()
         .get(&DataKey::Probe(asset.clone(), epoch, reporter.clone()))
@@ -131,7 +140,9 @@ pub fn set_probe(
 ) {
     let key = DataKey::Probe(asset.clone(), epoch, reporter.clone());
     env.storage().temporary().set(&key, probe);
-    env.storage().temporary().extend_ttl(&key, ttl_ledgers, ttl_ledgers);
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
 }
 
 pub fn get_submitters(env: &Env, asset: &Address, epoch: u64) -> Vec<Address> {
@@ -163,7 +174,9 @@ pub fn add_submitter(
     }
     submitters.push_back(reporter.clone());
     env.storage().temporary().set(&key, &submitters);
-    env.storage().temporary().extend_ttl(&key, ttl_ledgers, ttl_ledgers);
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
     true
 }
 
@@ -177,7 +190,9 @@ pub fn get_probes_settled(env: &Env, asset: &Address, epoch: u64) -> bool {
 pub fn set_probes_settled(env: &Env, asset: &Address, epoch: u64, ttl_ledgers: u32) {
     let key = DataKey::ProbesSettled(asset.clone(), epoch);
     env.storage().temporary().set(&key, &true);
-    env.storage().temporary().extend_ttl(&key, ttl_ledgers, ttl_ledgers);
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
 }
 
 pub fn get_bond(env: &Env, key: &BondKey) -> Option<BondRecord> {
@@ -185,11 +200,15 @@ pub fn get_bond(env: &Env, key: &BondKey) -> Option<BondRecord> {
 }
 
 pub fn set_bond(env: &Env, key: &BondKey, record: &BondRecord) {
-    env.storage().persistent().set(&DataKey::Bond(key.clone()), record);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Bond(key.clone()), record);
 }
 
 pub fn clear_bond(env: &Env, key: &BondKey) {
-    env.storage().persistent().remove(&DataKey::Bond(key.clone()));
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Bond(key.clone()));
 }
 
 pub fn get_claimable(env: &Env, who: &Address) -> i128 {
@@ -207,7 +226,9 @@ pub fn add_claimable(env: &Env, who: &Address, amount: i128) {
 }
 
 pub fn clear_claimable(env: &Env, who: &Address) {
-    env.storage().persistent().remove(&DataKey::Claimable(who.clone()));
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Claimable(who.clone()));
 }
 
 pub fn get_accrued_reward(env: &Env, who: &Address) -> i128 {
@@ -231,7 +252,10 @@ pub fn clear_accrued_reward(env: &Env, who: &Address) {
 }
 
 pub fn get_reward_pool(env: &Env) -> i128 {
-    env.storage().instance().get(&DataKey::RewardPool).unwrap_or(0)
+    env.storage()
+        .instance()
+        .get(&DataKey::RewardPool)
+        .unwrap_or(0)
 }
 
 pub fn set_reward_pool(env: &Env, amount: i128) {

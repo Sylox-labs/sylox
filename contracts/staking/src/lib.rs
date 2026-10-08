@@ -391,7 +391,11 @@ impl Staking {
         storage::set_keeper(&env, &keeper, &info);
         if amount > 0 {
             let usdc = token::TokenClient::new(&env, &config.usdc);
-            usdc.transfer(&env.current_contract_address(), soroban_sdk::MuxedAddress::from(keeper.clone()), &amount);
+            usdc.transfer(
+                &env.current_contract_address(),
+                soroban_sdk::MuxedAddress::from(keeper.clone()),
+                &amount,
+            );
         }
         events::KeeperBondWithdrawn {
             keeper: keeper.clone(),
@@ -722,12 +726,7 @@ impl Staking {
             Self::increment_open_disputes(&env, keeper);
         }
 
-        events::BondLocked {
-            owner,
-            key,
-            amount,
-        }
-        .publish(&env);
+        events::BondLocked { owner, key, amount }.publish(&env);
         Ok(())
     }
 
@@ -778,7 +777,11 @@ impl Staking {
             Self::decrement_open_disputes(&env, keeper);
         }
 
-        let to_treasury_final = if winner.is_some() { to_treasury } else { record.amount };
+        let to_treasury_final = if winner.is_some() {
+            to_treasury
+        } else {
+            record.amount
+        };
         events::BondForfeited {
             owner: record.owner,
             key,
@@ -864,7 +867,11 @@ impl Staking {
             storage::add_claimable(&env, &config.treasury, actual);
         }
 
-        let to_treasury_final = if winner.is_some() { to_treasury } else { actual };
+        let to_treasury_final = if winner.is_some() {
+            to_treasury
+        } else {
+            actual
+        };
         events::Slashed {
             who,
             amount: actual,

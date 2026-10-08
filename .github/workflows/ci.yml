@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  STELLAR_CLI_VERSION: "28.1.0"
+  # SHA-256 of stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz,
+  # computed locally against the published release asset: this
+  # release does not publish its own checksums file, so there is no
+  # independent source to verify against. This is trust-on-first-use,
+  # not a verification against an authority the release itself
+  # supplies; re-compute and update this value on every version bump.
+  STELLAR_CLI_SHA256: "c1680deee94301d33ada7a17f98411e642a4248c727afbd2e43050d345746462"
+  # technical-doc.md Section 5.8 / the PR #2 and #7 reports: the
+  # network's contract_max_size_bytes limit, checked against
+  # `stellar network settings` at the time those reports were
+  # written. A contract build exceeding this would fail to deploy
+  # regardless of how clean its tests and lints are, so it is
+  # checked here as its own gate, not folded into the build step.
+  CONTRACT_MAX_SIZE_BYTES: 131072
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No toolchain inputs needed: rust-toolchain.toml at the repo
+      # root pins version and components (rustfmt, clippy) and the
+      # wasm32v1-none target for every job that follows. Pinned to
+      # the `stable` branch's commit, not the `v1` tag: at `v1`'s
+      # commit, `toolchain` is a required input with no default,
+      # unlike `stable`, which defaults it to "stable" and lets
+      # rust-toolchain.toml's own channel win instead.
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch, 2026-10-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch, 2026-10-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch, 2026-10-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run tests and report run time
+        run: |
+          start=$(date +%s)
+          cargo test --workspace
+          end=$(date +%s)
+          echo "cargo test --workspace took $((end - start))s"
+
+  build-contracts:
+    name: stellar contract build (all contracts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch, 2026-10-08
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install stellar-cli
+        run: |
+          curl -sSfL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -o stellar-cli.tar.gz
+          echo "${STELLAR_CLI_SHA256}  stellar-cli.tar.gz" | sha256sum -c -
+          tar -xzf stellar-cli.tar.gz
+          sudo mv stellar /usr/local/bin/stellar
+          rm stellar-cli.tar.gz
+          stellar --version
+      - name: Build every contract
+        run: |
+          start=$(date +%s)
+          stellar contract build
+          end=$(date +%s)
+          echo "stellar contract build took $((end - start))s"
+      - name: Check every Wasm against the network size limit
+        run: |
+          status=0
+          for wasm in target/wasm32v1-none/release/*.wasm; do
+            size=$(wc -c < "$wasm")
+            if [ "$size" -gt "$CONTRACT_MAX_SIZE_BYTES" ]; then
+              echo "::error file=$wasm::$wasm is $size bytes, over the $CONTRACT_MAX_SIZE_BYTES byte network limit"
+              status=1
+            else
+              echo "$wasm: $size bytes (limit $CONTRACT_MAX_SIZE_BYTES)"
+            fi
+          done
+          exit $status

@@ -282,10 +282,7 @@ fn stake_transfers_real_usdc_and_increases_the_keeper_bond() {
 
     assert_eq!(fx.client.keeper(&keeper).unwrap().bond, params::KEEPER_BOND);
     assert_eq!(fx.usdc_client.balance(&keeper), 0);
-    assert_eq!(
-        fx.usdc_client.balance(&fx.contract_id),
-        params::KEEPER_BOND
-    );
+    assert_eq!(fx.usdc_client.balance(&fx.contract_id), params::KEEPER_BOND);
 }
 
 #[test]
@@ -517,8 +514,12 @@ fn dispute_resolved_against_a_removed_keeper_before_withdrawal_still_slashes() {
     // forfeit_bond, matching resolve_signal_dispute's own disputer
     // wins branch) against the removed keeper.
     let slash_amount = 10_000_000_000;
-    fx.client
-        .slash(&keeper, &slash_amount, &Some(disputer.clone()), &BytesN::from_array(&env, &[0u8; 32]));
+    fx.client.slash(
+        &keeper,
+        &slash_amount,
+        &Some(disputer.clone()),
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
     fx.client.release_bond(&key);
 
     assert_eq!(
@@ -538,7 +539,9 @@ fn submit_probe_requires_reporter_auth_and_rejects_an_unregistered_address() {
     let asset = Address::generate(&env);
     let who = Address::generate(&env);
     env.ledger().set_timestamp(epoch_close(0));
-    let result = fx.client.try_submit_probe(&who, &probe(&env, &asset, 0, EndpointStatus::Up));
+    let result = fx
+        .client
+        .try_submit_probe(&who, &probe(&env, &asset, 0, EndpointStatus::Up));
     assert_eq!(result, Err(Ok(Error::NotReporter)));
 }
 
@@ -591,7 +594,12 @@ fn submit_probe_rejects_a_suspended_reporter() {
         .set_timestamp(epoch_close(params::REPORTER_MAX_FAULTS as u64 + 1));
     let result = fx.client.try_submit_probe(
         &reporter,
-        &probe(&env, &asset, params::REPORTER_MAX_FAULTS as u64 + 1, EndpointStatus::Up),
+        &probe(
+            &env,
+            &asset,
+            params::REPORTER_MAX_FAULTS as u64 + 1,
+            EndpointStatus::Up,
+        ),
     );
     assert_eq!(result, Err(Ok(Error::Suspended)));
 }
@@ -737,9 +745,12 @@ fn aggregate_never_writes_to_storage() {
     let r2 = add_and_fund_reporter(&env, &fx, &region(&env, "us"), params::REPORTER_STAKE);
     let r3 = add_and_fund_reporter(&env, &fx, &region(&env, "af"), params::REPORTER_STAKE);
     env.ledger().set_timestamp(epoch_close(0));
-    fx.client.submit_probe(&r1, &probe(&env, &asset, 0, EndpointStatus::Up));
-    fx.client.submit_probe(&r2, &probe(&env, &asset, 0, EndpointStatus::Up));
-    fx.client.submit_probe(&r3, &probe(&env, &asset, 0, EndpointStatus::Up));
+    fx.client
+        .submit_probe(&r1, &probe(&env, &asset, 0, EndpointStatus::Up));
+    fx.client
+        .submit_probe(&r2, &probe(&env, &asset, 0, EndpointStatus::Up));
+    fx.client
+        .submit_probe(&r3, &probe(&env, &asset, 0, EndpointStatus::Up));
 
     // Calling aggregate many times must be fully idempotent: no write
     // it performed could change a later call's own result, and (S4)
@@ -832,7 +843,8 @@ fn settle_probes_funds_rewards_split_equally_among_matching_reporters() {
     let asset = Address::generate(&env);
     let funder = Address::generate(&env);
     fund(&fx, &funder, params::REPORTER_REWARD_PER_EPOCH);
-    fx.client.fund_rewards(&funder, &params::REPORTER_REWARD_PER_EPOCH);
+    fx.client
+        .fund_rewards(&funder, &params::REPORTER_REWARD_PER_EPOCH);
 
     let [r1, r2, r3] = submit_unanimous(&env, &fx, &asset, 0, EndpointStatus::Up);
     env.ledger().set_timestamp(settlement_opens(0));
@@ -876,8 +888,10 @@ fn settle_probes_faults_and_eventually_slashes_a_reporter_against_a_3_plus_major
 
     for epoch in 0..(params::REPORTER_MAX_FAULTS + 1) as u64 {
         env.ledger().set_timestamp(epoch_close(epoch));
-        fx.client
-            .submit_probe(&dissenter, &probe(&env, &asset, epoch, EndpointStatus::Down));
+        fx.client.submit_probe(
+            &dissenter,
+            &probe(&env, &asset, epoch, EndpointStatus::Down),
+        );
         for m in &majority {
             fx.client
                 .submit_probe(m, &probe(&env, &asset, epoch, EndpointStatus::Up));
@@ -905,15 +919,23 @@ fn settle_probes_does_not_fault_a_minority_dissent_below_the_fault_majority_thre
     // branch is even reachable regardless of agreement.
     let r1 = add_and_fund_reporter(&env, &fx, &region(&env, "eu"), params::REPORTER_STAKE);
     let r2 = add_and_fund_reporter(&env, &fx, &region(&env, "us"), params::REPORTER_STAKE);
-    fx.client.submit_probe(&r1, &probe(&env, &asset, 0, EndpointStatus::Up));
-    fx.client.submit_probe(&r2, &probe(&env, &asset, 0, EndpointStatus::Down));
+    fx.client
+        .submit_probe(&r1, &probe(&env, &asset, 0, EndpointStatus::Up));
+    fx.client
+        .submit_probe(&r2, &probe(&env, &asset, 0, EndpointStatus::Down));
     env.ledger().set_timestamp(settlement_opens(0));
     fx.client.settle_probes(&asset, &0);
 
     assert!(!fx.client.reporter(&r1).unwrap().suspended);
     assert!(!fx.client.reporter(&r2).unwrap().suspended);
-    assert_eq!(fx.client.reporter(&r1).unwrap().stake, params::REPORTER_STAKE);
-    assert_eq!(fx.client.reporter(&r2).unwrap().stake, params::REPORTER_STAKE);
+    assert_eq!(
+        fx.client.reporter(&r1).unwrap().stake,
+        params::REPORTER_STAKE
+    );
+    assert_eq!(
+        fx.client.reporter(&r2).unwrap().stake,
+        params::REPORTER_STAKE
+    );
 }
 
 #[test]
@@ -974,8 +996,10 @@ fn removed_reporter_who_disagreed_with_a_3_plus_majority_is_still_faulted_and_sl
     ];
     for epoch in 0..(params::REPORTER_MAX_FAULTS + 1) as u64 {
         env.ledger().set_timestamp(epoch_close(epoch));
-        fx.client
-            .submit_probe(&dissenter, &probe(&env, &asset, epoch, EndpointStatus::Down));
+        fx.client.submit_probe(
+            &dissenter,
+            &probe(&env, &asset, epoch, EndpointStatus::Down),
+        );
         for m in &majority {
             fx.client
                 .submit_probe(m, &probe(&env, &asset, epoch, EndpointStatus::Up));
@@ -1007,7 +1031,8 @@ fn removed_reporter_who_matched_the_majority_can_still_claim_rewards() {
     let asset = Address::generate(&env);
     let funder = Address::generate(&env);
     fund(&fx, &funder, params::REPORTER_REWARD_PER_EPOCH);
-    fx.client.fund_rewards(&funder, &params::REPORTER_REWARD_PER_EPOCH);
+    fx.client
+        .fund_rewards(&funder, &params::REPORTER_REWARD_PER_EPOCH);
 
     let [r1, r2, r3] = submit_unanimous(&env, &fx, &asset, 0, EndpointStatus::Up);
     fx.client.remove_reporter(&r1);
@@ -1049,10 +1074,14 @@ fn lock_bond_rejects_a_non_positive_amount_and_does_not_touch_open_dispute_count
     let keeper = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
     let key = BondKey::SignalDispute(asset, 0);
 
-    let result = fx.client.try_lock_bond(&key, &disputer, &0, &Some(keeper.clone()));
+    let result = fx
+        .client
+        .try_lock_bond(&key, &disputer, &0, &Some(keeper.clone()));
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 
-    let negative_result = fx.client.try_lock_bond(&key, &disputer, &-1, &Some(keeper.clone()));
+    let negative_result = fx
+        .client
+        .try_lock_bond(&key, &disputer, &-1, &Some(keeper.clone()));
     assert_eq!(negative_result, Err(Ok(Error::InvalidAmount)));
 
     // The approval fix's own concern: a rejected zero/negative amount
@@ -1089,7 +1118,9 @@ fn lock_bond_rejects_a_signal_dispute_key_with_no_subject() {
     let disputer = Address::generate(&env);
     fund(&fx, &disputer, 1_000_000_000);
     let key = BondKey::SignalDispute(asset, 0);
-    let result = fx.client.try_lock_bond(&key, &disputer, &1_000_000_000, &None);
+    let result = fx
+        .client
+        .try_lock_bond(&key, &disputer, &1_000_000_000, &None);
     assert_eq!(result, Err(Ok(Error::InvalidBondSubject)));
 }
 
@@ -1235,10 +1266,17 @@ fn slash_a_keeper_reduces_the_bond_and_splits_50_50() {
     let disputer = Address::generate(&env);
     let amount = 10_000_000_000;
 
-    fx.client
-        .slash(&keeper, &amount, &Some(disputer.clone()), &BytesN::from_array(&env, &[0u8; 32]));
+    fx.client.slash(
+        &keeper,
+        &amount,
+        &Some(disputer.clone()),
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
 
-    assert_eq!(fx.client.keeper(&keeper).unwrap().bond, params::KEEPER_BOND - amount);
+    assert_eq!(
+        fx.client.keeper(&keeper).unwrap().bond,
+        params::KEEPER_BOND - amount
+    );
     assert_eq!(fx.client.claimable(&disputer), amount / 2);
     assert_eq!(fx.client.claimable(&fx.treasury), amount - amount / 2);
 }
@@ -1254,8 +1292,12 @@ fn slash_a_keeper_below_the_amount_pays_out_only_what_was_actually_held() {
     // Request more than the keeper's whole bond.
     let requested = params::KEEPER_BOND + 5_000_000_000;
 
-    fx.client
-        .slash(&keeper, &requested, &Some(disputer.clone()), &BytesN::from_array(&env, &[0u8; 32]));
+    fx.client.slash(
+        &keeper,
+        &requested,
+        &Some(disputer.clone()),
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
 
     // The keeper had exactly KEEPER_BOND; that is all that can ever be
     // deducted or paid out, regardless of what was requested.
@@ -1286,15 +1328,24 @@ fn slash_a_reporter_below_the_amount_pays_out_only_what_was_actually_held() {
     let reporter = add_and_fund_reporter(&env, &fx, &region(&env, "eu"), params::REPORTER_STAKE);
     let requested = params::REPORTER_STAKE + 1_000_000_000;
 
-    fx.client
-        .slash(&reporter, &requested, &None, &BytesN::from_array(&env, &[0u8; 32]));
+    fx.client.slash(
+        &reporter,
+        &requested,
+        &None,
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
 
     assert_eq!(fx.client.reporter(&reporter).unwrap().stake, 0);
     assert_eq!(fx.client.claimable(&fx.treasury), params::REPORTER_STAKE);
 
     let balance = fx.usdc_client.balance(&fx.contract_id);
     let liabilities = fx.client.claimable(&fx.treasury);
-    assert!(balance >= liabilities, "S1 violated: balance {} < liabilities {}", balance, liabilities);
+    assert!(
+        balance >= liabilities,
+        "S1 violated: balance {} < liabilities {}",
+        balance,
+        liabilities
+    );
 }
 
 #[test]
@@ -1306,21 +1357,34 @@ fn two_slashes_in_a_row_exceeding_the_bond_in_total_never_overpay() {
 
     // First slash takes most of the bond.
     let first = params::KEEPER_BOND - 1_000_000_000;
-    fx.client
-        .slash(&keeper, &first, &Some(disputer.clone()), &BytesN::from_array(&env, &[0u8; 32]));
+    fx.client.slash(
+        &keeper,
+        &first,
+        &Some(disputer.clone()),
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
     assert_eq!(fx.client.keeper(&keeper).unwrap().bond, 1_000_000_000);
 
     // Second slash requests more than what remains.
     let second_requested = 5_000_000_000;
-    fx.client
-        .slash(&keeper, &second_requested, &Some(disputer.clone()), &BytesN::from_array(&env, &[0u8; 32]));
+    fx.client.slash(
+        &keeper,
+        &second_requested,
+        &Some(disputer.clone()),
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
     assert_eq!(fx.client.keeper(&keeper).unwrap().bond, 0);
 
     let total_actual = params::KEEPER_BOND;
     let balance = fx.usdc_client.balance(&fx.contract_id);
     let liabilities = fx.client.claimable(&disputer) + fx.client.claimable(&fx.treasury);
     assert_eq!(liabilities, total_actual);
-    assert!(balance >= liabilities, "S1 violated: balance {} < liabilities {}", balance, liabilities);
+    assert!(
+        balance >= liabilities,
+        "S1 violated: balance {} < liabilities {}",
+        balance,
+        liabilities
+    );
 }
 
 #[test]
@@ -1330,10 +1394,17 @@ fn slash_a_reporter_with_no_winner_sends_the_full_amount_to_the_treasury() {
     let reporter = add_and_fund_reporter(&env, &fx, &region(&env, "eu"), params::REPORTER_STAKE);
     let amount = 1_000_000_000;
 
-    fx.client
-        .slash(&reporter, &amount, &None, &BytesN::from_array(&env, &[0u8; 32]));
+    fx.client.slash(
+        &reporter,
+        &amount,
+        &None,
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
 
-    assert_eq!(fx.client.reporter(&reporter).unwrap().stake, params::REPORTER_STAKE - amount);
+    assert_eq!(
+        fx.client.reporter(&reporter).unwrap().stake,
+        params::REPORTER_STAKE - amount
+    );
     assert_eq!(fx.client.claimable(&fx.treasury), amount);
 }
 
@@ -1376,8 +1447,7 @@ fn slash_does_not_count_a_fault_outside_the_fault_window() {
     // One more fault, but well outside FAULT_WINDOW_SECS from every
     // prior one: the earlier faults are pruned, so this single fresh
     // fault alone does not exceed KEEPER_MAX_FAULTS.
-    env.ledger()
-        .set_timestamp(params::FAULT_WINDOW_SECS + 1);
+    env.ledger().set_timestamp(params::FAULT_WINDOW_SECS + 1);
     fx.client.slash(
         &keeper,
         &1_000_000,

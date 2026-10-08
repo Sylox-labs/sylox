@@ -26,8 +26,9 @@ use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::Address;
 use sylox_types::{BondKey, EndpointStatus};
 
-use super::{add_and_fund_keeper, add_and_fund_reporter, epoch_close, probe, region, setup,
-    settlement_opens};
+use super::{
+    add_and_fund_keeper, add_and_fund_reporter, epoch_close, probe, region, settlement_opens, setup,
+};
 use crate::params;
 
 #[derive(Clone, Copy, Debug)]

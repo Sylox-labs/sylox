@@ -156,9 +156,9 @@ fn full_cycle_real_risk_oracle_and_real_staking_signal_dispute_timeout_releases_
     env.ledger().set_timestamp(params::EPOCH_SECS / 2);
     for r in regions {
         let reporter = Address::generate(&env);
-        fx.staking
-            .add_reporter(&reporter, &Symbol::new(&env, r));
-        fx.usdc_admin_client.mint(&reporter, &params::REPORTER_STAKE);
+        fx.staking.add_reporter(&reporter, &Symbol::new(&env, r));
+        fx.usdc_admin_client
+            .mint(&reporter, &params::REPORTER_STAKE);
         fx.staking.stake(&reporter, &params::REPORTER_STAKE);
         fx.staking.submit_probe(
             &reporter,
@@ -194,12 +194,8 @@ fn full_cycle_real_risk_oracle_and_real_staking_signal_dispute_timeout_releases_
     let disputer = Address::generate(&env);
     let dispute_bond = 10_000_000_000i128;
     fx.usdc_admin_client.mint(&disputer, &dispute_bond);
-    fx.oracle.dispute_signals(
-        &disputer,
-        &asset,
-        &0,
-        &BytesN::from_array(&env, &[9u8; 32]),
-    );
+    fx.oracle
+        .dispute_signals(&disputer, &asset, &0, &BytesN::from_array(&env, &[9u8; 32]));
 
     let bond_key = sylox_types::BondKey::SignalDispute(asset.clone(), 0);
     assert_eq!(
@@ -224,7 +220,10 @@ fn full_cycle_real_risk_oracle_and_real_staking_signal_dispute_timeout_releases_
     assert_eq!(fx.staking.bond(&bond_key), None);
     assert_eq!(fx.staking.claimable(&disputer), dispute_bond);
     assert_eq!(fx.staking.keeper(&keeper).unwrap().open_dispute_count, 0);
-    assert_eq!(fx.staking.keeper(&keeper).unwrap().bond, params::KEEPER_BOND);
+    assert_eq!(
+        fx.staking.keeper(&keeper).unwrap().bond,
+        params::KEEPER_BOND
+    );
 
     let claimed = fx.staking.claim(&disputer);
     assert_eq!(claimed, dispute_bond);

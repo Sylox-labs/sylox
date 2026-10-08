@@ -17,7 +17,12 @@ use sylox_types::EndpointStatus;
 use super::{add_and_fund_reporter, epoch_close, probe, region, setup};
 use crate::params;
 
-fn submit(env: &Env, fx: &super::Fixture, asset: &Address, reporters: &[(Address, EndpointStatus)]) {
+fn submit(
+    env: &Env,
+    fx: &super::Fixture,
+    asset: &Address,
+    reporters: &[(Address, EndpointStatus)],
+) {
     for (r, status) in reporters {
         fx.client.submit_probe(r, &probe(env, asset, 0, *status));
     }
