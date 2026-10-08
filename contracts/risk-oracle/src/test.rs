@@ -1,6 +1,7 @@
 extern crate std;
 
 mod golden_vectors;
+mod property;
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},

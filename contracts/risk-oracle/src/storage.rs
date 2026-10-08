@@ -529,8 +529,10 @@ pub fn set_slot_endpoint(env: &Env, asset: &Address, epoch: u64, endpoint: Endpo
 }
 
 /// `epoch`'s position in the ring. A position, not an identity: see the
-/// module doc comment.
-fn position_of(epoch: u64) -> u32 {
+/// module doc comment. `pub(crate)` so the hysteresis/overwrite
+/// property tests can construct same-position epoch pairs directly
+/// instead of duplicating this formula.
+pub(crate) fn position_of(epoch: u64) -> u32 {
     (epoch % RING_SLOTS as u64) as u32
 }
 
