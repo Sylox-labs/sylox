@@ -369,11 +369,15 @@ pub fn band_for_score(score: u32) -> Band {
 /// the score.
 ///
 /// Does not implement the Section 6.3 "forced to Distress if an event is
-/// Proposed, Challenged or Escalated" override: `RiskOracle` has no stored
-/// flag and no API path to learn that from `EventRegistry` (see the PR's
-/// "Spec deviations" section). The "forced to at least Warning if P = 100
-/// or E = 100" override and the sticky `Event` band (via
-/// `set_event_band`/`clear_event_band`) are both implemented.
+/// Proposed, Challenged or Escalated" override: review decision D1 adds
+/// that as a read-time floor in `RiskOracle::score`, deliberately
+/// outside this function and outside the stored `RiskScore`, so the
+/// hysteresis streak computed here only ever reflects genuine new-epoch
+/// evidence, never an `EventRegistry` flag flip (see `score`'s doc
+/// comment and the PR's "Review fixes" section, D1). The "forced to at
+/// least Warning if P = 100 or E = 100" override and the sticky `Event`
+/// band (via `set_event_band`/`clear_event_band`) are both implemented
+/// here as before.
 pub fn apply_hysteresis(
     current: &RiskScore,
     raw_band: Band,

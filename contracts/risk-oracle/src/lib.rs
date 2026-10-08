@@ -13,6 +13,7 @@
 
 mod clients;
 mod error;
+mod events;
 mod math;
 mod score;
 mod storage;
@@ -86,10 +87,10 @@ impl RiskOracle {
     }
 
     /// technical-doc.md Section 12.1. Rejects an asset that is already
-    /// registered (`update_asset` is for changing one).
-    /// technical-doc.md Section 12.1. Review decision D3: rejects
-    /// `Reference::Asset` (no USD rate is defined anywhere in the spec
-    /// for an asset pegged reference; see the PR's "Spec deviations").
+    /// registered (`update_asset` is for changing one). Review decision
+    /// D3: also rejects `Reference::Asset` (no USD rate is defined
+    /// anywhere in the spec for an asset pegged reference; see the PR's
+    /// "Spec deviations").
     pub fn add_asset(env: Env, cfg: AssetConfig) -> Result<(), Error> {
         let config = Self::require_config(&env)?;
         config.governor.require_auth();
@@ -157,16 +158,13 @@ impl RiskOracle {
         let now = env.ledger().timestamp();
         check_epoch_window(s.epoch, now)?;
         if storage::get_signals(&env, &asset, s.epoch).is_some() {
-            // No dispute state machine wiring here yet beyond
-            // dispute_signals/resolve_signal_dispute below reopening a
-            // slot to Empty on an overturn; any OTHER existing posting
-            // for this epoch (Pending, Disputed or Final) blocks a
-            // repost, matching Section 11.3. An overturned epoch's
-            // Signals entry is intentionally left in place as history
-            // (Section 15.2); only its ring slot returns to Empty, so
-            // `get_signals` would still find it here. This means a
-            // reposted epoch after an overturn currently fails with
-            // EpochAlreadyPosted — a known gap, see the PR description.
+            // Review item C4: an epoch that was overturned by a resolved
+            // dispute has already been moved out of here (to the
+            // Overturned history key, by resolve_signal_dispute), so
+            // get_signals no longer finds it and this check does not
+            // block a repost for it. Any OTHER existing posting for this
+            // epoch (Pending, Disputed or still Final) blocks a repost,
+            // matching Section 11.3.
             return Err(Error::EpochAlreadyPosted);
         }
         check_sanity_bounds(&s)?;
@@ -187,6 +185,29 @@ impl RiskOracle {
             // should already reject a posting this stale via WINDOW_SECS;
             // reaching here would mean the two checks have drifted apart.
             return Err(Error::WrongEpoch);
+        }
+
+        events::SignalsPosted {
+            asset: asset.clone(),
+            epoch: s.epoch,
+            keeper,
+            inputs_hash: s.inputs_hash.clone(),
+            pending_until,
+        }
+        .publish(&env);
+
+        // Review items C1, C5: this posting cannot itself be final yet
+        // (pending_until is always in the future at post time), but
+        // posting is also the natural moment to sweep forward any OLDER
+        // epoch on this asset that has quietly crossed finality since
+        // the last state changing call touched it ("on backfill" in
+        // review item C1's wording: a backfilled epoch becoming final
+        // later is still driven from here, the next time anything posts
+        // for this asset). Bounded to a small number of steps; see
+        // try_advance_finality's doc comment for why that bound is safe
+        // in the common case.
+        if let Some(newest_final) = try_advance_finality(&env, &asset, 8) {
+            recompute_score(&env, &asset, newest_final)?;
         }
 
         Ok(())
@@ -228,8 +249,24 @@ impl RiskOracle {
             &disputer,
             &bond,
         );
-        storage::set_dispute(&env, &asset, epoch, &DisputeRecord { disputer, alt_hash });
+        storage::set_dispute(
+            &env,
+            &asset,
+            epoch,
+            &DisputeRecord {
+                disputer: disputer.clone(),
+                alt_hash: alt_hash.clone(),
+            },
+        );
         storage::set_slot_state(&env, &asset, epoch, sylox_types::SlotState::Disputed);
+
+        events::SignalsDisputed {
+            asset,
+            epoch,
+            disputer,
+            alt_hash,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -246,7 +283,7 @@ impl RiskOracle {
         let config = Self::require_config(&env)?;
         let committee = GovernorClient::new(&env, &config.governor).committee();
         committee.require_auth();
-        let _ = reason; // stored only by EventRegistry-style callers in Phase 3; RiskOracle has nowhere to persist it yet (known gap).
+        let _ = &reason; // stored only by EventRegistry-style callers in Phase 3; RiskOracle has nowhere to persist it yet (known gap).
 
         let dispute =
             storage::get_dispute(&env, &asset, epoch).ok_or(Error::DisputeWindowClosed)?;
@@ -257,6 +294,13 @@ impl RiskOracle {
         if keeper_wins {
             staking.forfeit_bond(&bond_key, &Some(signals.poster.clone()));
             storage::set_slot_state(&env, &asset, epoch, sylox_types::SlotState::Final);
+            // The slot is now immediately, definitely Final (not merely
+            // "effectively" final pending a clock check): sweep finality
+            // forward from here in case this resolution was the only
+            // thing blocking later epochs on this asset too.
+            if let Some(newest_final) = try_advance_finality(&env, &asset, 8) {
+                recompute_score(&env, &asset, newest_final)?;
+            }
         } else {
             staking.release_bond(&bond_key);
             staking.slash(
@@ -266,8 +310,21 @@ impl RiskOracle {
                 &BytesN::from_array(&env, &[0u8; 32]),
             );
             storage::set_slot_state(&env, &asset, epoch, sylox_types::SlotState::Empty);
+            // Review item C4: move the overturned Signals entry to
+            // history so post_signals accepts a fresh posting for this
+            // same epoch (ADR-005: "an overturned epoch reopens for
+            // reposting").
+            storage::overturn_signals(&env, &asset, epoch);
         }
         storage::clear_dispute(&env, &asset, epoch);
+
+        events::SignalsResolved {
+            asset,
+            epoch,
+            keeper_wins,
+            reason,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -292,9 +349,25 @@ impl RiskOracle {
                 signals.endpoint = aggregate;
                 storage::set_signals(&env, &asset, epoch, &signals);
                 storage::set_slot_endpoint(&env, &asset, epoch, aggregate);
+                events::EndpointFinalized {
+                    asset: asset.clone(),
+                    epoch,
+                    status: aggregate,
+                }
+                .publish(&env);
             }
         }
         staking.settle_probes(&asset, &epoch);
+
+        // finalize_endpoint is the one permissionless, callable-by-anyone
+        // function guaranteed to run after an epoch's dispute window has
+        // had time to elapse (the caller only needs the epoch itself to
+        // have closed, Section 7.4), so it is also where review item C1
+        // and C5's lazy finality sweep gets a chance to run even if no
+        // new SignalSet is ever posted for a later epoch on this asset.
+        if let Some(newest_final) = try_advance_finality(&env, &asset, 8) {
+            recompute_score(&env, &asset, newest_final)?;
+        }
         Ok(())
     }
 
@@ -325,6 +398,26 @@ impl RiskOracle {
         let mut score = storage::get_score(&env, &asset).ok_or(Error::UnknownAsset)?;
         score.band = score::band_for_score(score.score);
         storage::set_score(&env, &asset, &score);
+        Ok(())
+    }
+
+    /// Review decision D1, not in the original Section 12.1 list. Auth:
+    /// the registry contract, same pattern as `set_event_band` /
+    /// `clear_event_band` (Section 16.1). While `true`, `score()` floors
+    /// the band at `Distress` on every read (Section 6.3's "forced to
+    /// Distress if a credit event... is Proposed, Challenged or
+    /// Escalated"), independent of the hysteresis-protected band
+    /// actually stored; `RiskOracle` never calls into `EventRegistry` to
+    /// check this itself, matching the instruction that "the oracle
+    /// never calls the registry" — this is pushed in, the same
+    /// direction `set_event_band` already works.
+    pub fn set_event_in_progress(env: Env, asset: Address, in_progress: bool) -> Result<(), Error> {
+        let config = Self::require_config(&env)?;
+        config.registry.require_auth();
+        storage::set_event_in_progress(&env, &asset, in_progress);
+        // No recompute needed: `score()` applies this flag as a live
+        // floor on every read (see its doc comment), so the change is
+        // visible immediately with no write to the stored RiskScore.
         Ok(())
     }
 
@@ -360,6 +453,15 @@ impl RiskOracle {
         storage::get_signals(&env, &asset, epoch)
     }
 
+    /// Review item C4: the `SignalSet` an overturned epoch's posting had
+    /// before `resolve_signal_dispute` moved it out of `signals`'s live
+    /// key, kept for audit. `None` if `epoch` was never overturned (or
+    /// was overturned, reposted, and overturned again, which keeps only
+    /// the most recent overturn, not a full history of every attempt).
+    pub fn overturned_signals(env: Env, asset: Address, epoch: u64) -> Option<SignalSet> {
+        storage::get_overturned_signals(&env, &asset, epoch)
+    }
+
     pub fn latest(env: Env, asset: Address) -> Option<SignalSet> {
         let newest = storage::get_newest_epoch_pub(&env, &asset)?;
         storage::get_signals(&env, &asset, newest)
@@ -372,59 +474,69 @@ impl RiskOracle {
         storage::get_ring(&env, &asset)
     }
 
-    /// technical-doc.md Section 12.1, 6. Computes and persists a fresh
-    /// `RiskScore` from the latest Final epoch's ring window, applying
-    /// hysteresis against the previously stored score. Returns the stored
-    /// score unchanged (and does not write) if the asset is stale or has
-    /// no Final epoch yet, or if the band is currently the sticky `Event`
-    /// band (only `clear_event_band` moves out of it).
+    /// Review item C5: whether epoch `epoch` is EFFECTIVELY final right
+    /// now: its stored state is `Final`, or it is `Pending` and
+    /// `pending_until` has already passed. `false` for a missing epoch.
+    pub fn is_final(env: Env, asset: Address, epoch: u64) -> bool {
+        let now = env.ledger().timestamp();
+        storage::is_final(&env, &asset, epoch, now)
+    }
+
+    /// Review item C5: a window read of effective state per epoch, for
+    /// `EventRegistry`'s Tier 1 checks (Section 8.2), so it can learn
+    /// which epochs in a window are final without one call per epoch.
+    /// Missing epochs read `None`, the same convention as `ring`'s
+    /// underlying storage.
+    pub fn effective_window(
+        env: Env,
+        asset: Address,
+        start_epoch: u64,
+        count: u32,
+    ) -> Vec<Option<sylox_types::SlotState>> {
+        let now = env.ledger().timestamp();
+        storage::get_effective_window(&env, &asset, start_epoch, count, now)
+    }
+
+    /// technical-doc.md Section 12.1, 6. Review item C1: a PURE read.
+    /// Returns whatever `RiskScore` is currently stored, with `stale`
+    /// recomputed fresh against the clock (so a score that was fresh
+    /// when last written but has since gone quiet is reported stale
+    /// without needing a write to say so). Never calls
+    /// `storage::set_score` or any other write; the actual computation
+    /// happens in `recompute_score`, called from `post_signals`, the
+    /// finality sweep, and `finalize_endpoint` (see those for exactly
+    /// when).
+    ///
+    /// Review decision D1: the stored `band` is always the plain
+    /// hysteresis band, computed with no knowledge of the event-in-
+    /// progress flag (see `recompute_score`), so that flipping the
+    /// flag off is never confused with a genuine new epoch of evidence
+    /// for the hysteresis streak. The "forced to at least Distress
+    /// while in progress" override is applied here instead, on every
+    /// read, which also makes it take effect immediately on
+    /// `set_event_in_progress` with no recompute required.
     pub fn score(env: Env, asset: Address) -> Result<RiskScore, Error> {
-        let cfg = storage::get_asset_config(&env, &asset).ok_or(Error::UnknownAsset)?;
+        storage::get_asset_config(&env, &asset).ok_or(Error::UnknownAsset)?;
         let stored = storage::get_score(&env, &asset);
+        let newest_final = storage::get_newest_final(&env, &asset);
 
-        let Some(newest) = storage::get_newest_epoch_pub(&env, &asset) else {
-            return Ok(stale_score(&stored));
+        let result = match (stored, newest_final) {
+            (Some(current), Some(newest_final)) if current.band != Band::Event => RiskScore {
+                stale: is_stale_epoch(&env, newest_final),
+                ..current
+            },
+            (Some(current), _) => current, // Event band stays as stored regardless of staleness.
+            (None, _) => stale_score(&None),
         };
-        if Self::is_stale_at(&env, newest) {
-            return Ok(stale_score(&stored));
+        if result.band != Band::Event
+            && storage::get_event_in_progress(&env, &asset)
+            && result.band < Band::Distress
+        {
+            return Ok(RiskScore {
+                band: Band::Distress,
+                ..result
+            });
         }
-        if newest + 1 < AGGREGATE_SLOTS_7D as u64 {
-            // Not enough history yet for the 7 day baseline every
-            // component needs (Section 6.5): report advisory-stale rather
-            // than scoring on a partial window. A brand new asset is
-            // "stale" in the sense that nothing trustworthy can be
-            // computed yet, even though it is actively posting.
-            return Ok(stale_score(&stored));
-        }
-        if let Some(current) = &stored {
-            if current.band == Band::Event {
-                return Ok(*current);
-            }
-        }
-
-        let formula = storage::get_formula(&env).ok_or(Error::NotInitialized)?;
-        let l_target = l_target_for(&cfg);
-        let aggregates = score::aggregate_from_ring(&env, &asset, newest)?;
-        let raw = score::combined_score(&formula, &aggregates, l_target)?;
-        let raw_band = score::band_for_score(raw);
-
-        let down_streak = storage::get_down_streak(&env, &asset);
-        let (band, new_streak) = match &stored {
-            Some(current) => {
-                score::apply_hysteresis(current, raw_band, down_streak, BAND_DOWN_EPOCHS)
-            }
-            None => (raw_band, 0),
-        };
-        storage::set_down_streak(&env, &asset, new_streak);
-
-        let result = RiskScore {
-            epoch: newest,
-            score: raw,
-            band,
-            formula_version: formula.version,
-            stale: false,
-        };
-        storage::set_score(&env, &asset, &result);
         Ok(result)
     }
 
@@ -434,7 +546,7 @@ impl RiskOracle {
 
     pub fn is_stale(env: Env, asset: Address) -> bool {
         match storage::get_newest_epoch_pub(&env, &asset) {
-            Some(newest) => Self::is_stale_at(&env, newest),
+            Some(newest) => is_stale_epoch(&env, newest),
             None => true,
         }
     }
@@ -492,12 +604,6 @@ impl RiskOracle {
         storage::get_assets(&env)
     }
 
-    fn is_stale_at(env: &Env, newest_epoch: u64) -> bool {
-        let now = env.ledger().timestamp();
-        let current_epoch = now / EPOCH_SECS;
-        current_epoch.saturating_sub(newest_epoch) > STALE_AFTER_EPOCHS
-    }
-
     fn require_config(env: &Env) -> Result<Config, Error> {
         env.storage()
             .instance()
@@ -544,6 +650,17 @@ fn keeper_slash() -> i128 {
 fn is_stale_timestamp(env: &Env, timestamp: u64) -> bool {
     let now = env.ledger().timestamp();
     now.saturating_sub(timestamp) > STALE_AFTER_EPOCHS * EPOCH_SECS
+}
+
+/// technical-doc.md Section 5.5: an asset (or, here, a specific epoch
+/// candidate) is stale if more than `stale_after_epochs` epochs have
+/// passed since it. Shared by `score()` (a pure read) and
+/// `recompute_score` (a write), neither of which is a method so both
+/// can call it without going through `Self`.
+fn is_stale_epoch(env: &Env, epoch: u64) -> bool {
+    let now = env.ledger().timestamp();
+    let current_epoch = now / EPOCH_SECS;
+    current_epoch.saturating_sub(epoch) > STALE_AFTER_EPOCHS
 }
 
 #[derive(Clone)]
@@ -659,6 +776,160 @@ fn check_amm_cross_check(env: &Env, cfg: &AssetConfig, s: &SignalSet) -> Result<
         if deviation_bps > AMM_TOLERANCE_BPS {
             return Err(Error::AmmCrossCheckFailed);
         }
+    }
+    Ok(())
+}
+
+/// Review item C5: advances `NewestFinal(asset)` forward one epoch at a
+/// time while the next candidate epoch is effectively final, emitting
+/// `signals_final` for each one newly observed as final ("lazy
+/// finalization... document where": this is where). Bounded by
+/// `max_steps` so a caller that has gone quiet for a long time cannot
+/// make a single call walk an unbounded number of epochs; callers that
+/// care about a specific epoch becoming final (`dispute_signals`,
+/// `finalize_endpoint`) pass a small bound, `post_signals` passes enough
+/// to cover one typical gap between postings.
+///
+/// Returns the newest epoch now known final, if any advance happened or
+/// already existed.
+fn try_advance_finality(env: &Env, asset: &Address, max_steps: u32) -> Option<u64> {
+    let now = env.ledger().timestamp();
+    let mut newest_final = storage::get_newest_final(env, asset);
+    let mut next_candidate = match newest_final {
+        Some(n) => n + 1,
+        None => {
+            // No finality observed yet for this asset. Start from the
+            // oldest epoch still reachable in the ring rather than
+            // guessing 0: `get_newest_epoch` minus up to RING_SLOTS - 1
+            // is the furthest back a live slot could be, but walking
+            // that far on the very first call would defeat the bound.
+            // In practice the first candidate that matters is whatever
+            // epoch was posted first, which this loop finds by trying
+            // from the newest backfill-eligible epoch downward is not
+            // bounded either; instead, seed from the oldest epoch within
+            // one window of the newest posted epoch, the only range
+            // `post_signals` can ever have written to to begin with.
+            let newest_posted = storage::get_newest_epoch_pub(env, asset)?;
+            newest_posted.saturating_sub(WINDOW_SECS / EPOCH_SECS)
+        }
+    };
+
+    let mut steps = 0;
+    while steps < max_steps {
+        let Some(slot) = storage::get_slot(env, asset, next_candidate) else {
+            break;
+        };
+        if storage::effective_state(&slot, now) != sylox_types::SlotState::Final {
+            break;
+        }
+        newest_final = Some(next_candidate);
+        storage::set_newest_final(env, asset, next_candidate);
+        events::SignalsFinal {
+            asset: asset.clone(),
+            epoch: next_candidate,
+        }
+        .publish(env);
+        next_candidate += 1;
+        steps += 1;
+    }
+    newest_final
+}
+
+/// Review item C1: the one place a `RiskScore` is actually computed and
+/// written. Called from `post_signals` (after writing the new slot and
+/// advancing finality), `finalize_endpoint`, and the dispute resolution
+/// path, each time finality may have moved forward; a no-op (no write,
+/// no event) if the newest final epoch has not moved past what is
+/// already stored, so repeated calls within the same epoch do not spam
+/// `score_updated`/`band_changed`.
+///
+/// The hysteresis down streak in `apply_hysteresis` only advances when
+/// called here with a strictly newer final epoch than what is stored:
+/// this is what review item C1's "the hysteresis down streak may advance
+/// at most once per new epoch... only when the scored epoch is newer
+/// than the stored score's epoch" requires, satisfied by construction
+/// rather than by an extra check, because `score()` itself never calls
+/// this function.
+///
+/// Review decision D1's "at least Distress while an event is in
+/// progress" override is deliberately NOT applied here: it is a
+/// read-time floor applied in `score()` instead (see that function's
+/// doc comment), so that the `RiskScore` persisted here — and the
+/// hysteresis streak computed from it — always reflects the plain
+/// signal-derived band, never confusing a flag flip with a new epoch of
+/// evidence.
+fn recompute_score(env: &Env, asset: &Address, newest_final: u64) -> Result<(), Error> {
+    let stored = storage::get_score(env, asset);
+    if let Some(current) = &stored {
+        if newest_final <= current.epoch {
+            return Ok(()); // Nothing newer to score from.
+        }
+        if current.band == Band::Event {
+            return Ok(()); // Sticky; only clear_event_band moves out of it.
+        }
+    }
+    if is_stale_epoch(env, newest_final) {
+        // The epoch that just became final is itself already outside
+        // stale_after_epochs (a very late backfill); recording it would
+        // immediately read back as stale, which score() already reports
+        // correctly from the stored epoch without a write. Emit
+        // asset_stale once here if this is the state actually changing,
+        // not on every call that happens to observe it.
+        if stored.as_ref().map(|s| !s.stale).unwrap_or(true) {
+            events::AssetStale {
+                asset: asset.clone(),
+                last_epoch: newest_final,
+            }
+            .publish(env);
+        }
+        return Ok(());
+    }
+    if newest_final + 1 < AGGREGATE_SLOTS_7D as u64 {
+        // Not enough history yet for the 7 day baseline every component
+        // needs (Section 6.5); review decision D2: a new asset with
+        // fewer than 168 epochs reads as stale, by design, documented
+        // here and in the PR report.
+        return Ok(());
+    }
+
+    let cfg = storage::get_asset_config(env, asset).ok_or(Error::UnknownAsset)?;
+    let formula = storage::get_formula(env).ok_or(Error::NotInitialized)?;
+    let l_target = l_target_for(&cfg);
+    let aggregates = score::aggregate_from_ring(env, asset, newest_final)?;
+    let raw = score::combined_score(&formula, &aggregates, l_target)?;
+    let raw_band = score::band_for_score(raw);
+
+    let down_streak = storage::get_down_streak(env, asset);
+    let (band, new_streak) = match &stored {
+        Some(current) => score::apply_hysteresis(current, raw_band, down_streak, BAND_DOWN_EPOCHS),
+        None => (raw_band, 0),
+    };
+    storage::set_down_streak(env, asset, new_streak);
+
+    let result = RiskScore {
+        epoch: newest_final,
+        score: raw,
+        band,
+        formula_version: formula.version,
+        stale: false,
+    };
+    storage::set_score(env, asset, &result);
+
+    events::ScoreUpdated {
+        asset: asset.clone(),
+        epoch: newest_final,
+        score: raw,
+        formula_version: formula.version,
+    }
+    .publish(env);
+    if stored.as_ref().map(|s| s.band) != Some(band) {
+        events::BandChanged {
+            asset: asset.clone(),
+            from: stored.map(|s| s.band).unwrap_or(Band::Normal),
+            to: band,
+            epoch: newest_final,
+        }
+        .publish(env);
     }
     Ok(())
 }

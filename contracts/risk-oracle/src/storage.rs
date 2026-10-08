@@ -71,7 +71,19 @@ pub enum DataKey {
     /// Newest epoch successfully written to `Ring(asset)`, so `get_ring`
     /// can report "oldest first" without scanning for it.
     RingNewest(Address),
+    /// Newest epoch known to be EFFECTIVELY final (Section 5.7, review
+    /// item C5), advanced one step at a time by `lib.rs`'s
+    /// `try_advance_finality`. `None` until the asset's first epoch
+    /// becomes final.
+    NewestFinal(Address),
     Score(Address),
+    /// Review decision D1: set by `EventRegistry` via
+    /// `set_event_in_progress`. While `true`, `recompute_score` forces
+    /// the band to at least `Distress` (Section 6.3). `RiskOracle` never
+    /// sets or clears this itself and never calls into `EventRegistry`
+    /// to check it proactively; it is purely a flag `EventRegistry`
+    /// pushes.
+    EventInProgress(Address),
     /// `(asset, down_streak)` hysteresis counter alongside `Score(asset)`,
     /// kept separate so bumping it on every epoch that fails to move the
     /// band down does not require rewriting the whole `RiskScore`.
@@ -79,6 +91,13 @@ pub enum DataKey {
     /// Dispute record only; the bond itself lives in `Staking` under
     /// `BondKey::SignalDispute` (Section 4.5, 7.8).
     Dispute(Address, u64),
+    /// Review item C4: history for an overturned epoch's `SignalSet`.
+    /// `resolve_signal_dispute` moves it here from `Signals(asset, epoch)`
+    /// on an overturn, so `get_signals` no longer finds it and
+    /// `post_signals` can accept a fresh posting for the same epoch
+    /// (ADR-005: "an overturned epoch reopens for reposting"), while the
+    /// overturned data stays available for audit.
+    Overturned(Address, u64),
     Assets,
     Formula,
 }
@@ -112,6 +131,33 @@ pub fn set_signals(env: &Env, asset: &Address, epoch: u64, signals: &SignalSet) 
     env.storage()
         .persistent()
         .set(&DataKey::Signals(asset.clone(), epoch), signals);
+}
+
+/// Review item C4: moves `Signals(asset, epoch)` to the `Overturned`
+/// history key and removes the live entry, so `get_signals` reports it
+/// missing (unblocking a repost) while the overturned data stays
+/// retrievable via `get_overturned_signals`. A no-op if there was no
+/// `Signals` entry for this epoch (defensive; `resolve_signal_dispute`'s
+/// caller already checked one exists before calling this).
+pub fn overturn_signals(env: &Env, asset: &Address, epoch: u64) {
+    let key = DataKey::Signals(asset.clone(), epoch);
+    if let Some(signals) = env.storage().persistent().get::<_, SignalSet>(&key) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Overturned(asset.clone(), epoch), &signals);
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// The history an overturned epoch's `SignalSet` was moved to by
+/// `overturn_signals`. `None` if that epoch was never overturned (or was
+/// reposted and overturned again, which overwrites this entry with the
+/// newer attempt's data, keeping only the most recent overturn on
+/// record, not a full history of every attempt).
+pub fn get_overturned_signals(env: &Env, asset: &Address, epoch: u64) -> Option<SignalSet> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Overturned(asset.clone(), epoch))
 }
 
 /// Returns epoch `epoch`'s slot, or `None` if that epoch is missing: never
@@ -160,6 +206,49 @@ pub fn get_window(
         } else {
             out.push_back(None);
         }
+    }
+    out
+}
+
+/// Review item C5: a slot is EFFECTIVELY `Final` once `now >=
+/// pending_until`, even while its stored `state` still reads `Pending`
+/// (nobody has made a state changing call to flip it since). This is the
+/// pure function every "is this epoch final" decision in the contract
+/// goes through; it never writes.
+pub fn effective_state(slot: &RingSlot, now: u64) -> SlotState {
+    if slot.state == SlotState::Pending && now >= slot.pending_until {
+        SlotState::Final
+    } else {
+        slot.state
+    }
+}
+
+/// Review item C5: `is_final(asset, epoch)`, exposed as a `RiskOracle`
+/// read (see `lib.rs`). `false` for a missing epoch: there is nothing to
+/// be final.
+pub fn is_final(env: &Env, asset: &Address, epoch: u64, now: u64) -> bool {
+    match get_slot(env, asset, epoch) {
+        Some(slot) => effective_state(&slot, now) == SlotState::Final,
+        None => false,
+    }
+}
+
+/// Review item C5: a window read of EFFECTIVE state per epoch, for
+/// `EventRegistry`'s Tier 1 checks (Section 8.2), which need to know
+/// which epochs in a window are final without each one costing a
+/// separate call. Missing epochs read `None`, the same convention as
+/// `get_window`.
+pub fn get_effective_window(
+    env: &Env,
+    asset: &Address,
+    start_epoch: u64,
+    count: u32,
+    now: u64,
+) -> Vec<Option<SlotState>> {
+    let slots = get_window(env, asset, start_epoch, count);
+    let mut out = Vec::new(env);
+    for slot in slots.iter() {
+        out.push_back(slot.map(|s| effective_state(&s, now)));
     }
     out
 }
@@ -226,6 +315,21 @@ pub fn get_newest_epoch_pub(env: &Env, asset: &Address) -> Option<u64> {
     get_newest_epoch(env, asset)
 }
 
+/// Review item C1/C5: the newest epoch known to be effectively final.
+/// `score()` reads this (and only this; it is a pure read, never a
+/// scan) to know which epoch's window to have already scored.
+pub fn get_newest_final(env: &Env, asset: &Address) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::NewestFinal(asset.clone()))
+}
+
+pub fn set_newest_final(env: &Env, asset: &Address, epoch: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::NewestFinal(asset.clone()), &epoch);
+}
+
 /// Writes `signals` for `epoch` into its ring slot at `position_of(epoch)`
 /// and persists the whole packed buffer in one storage write.
 /// technical-doc.md Section 5.3 step 4, 5.8.
@@ -290,6 +394,27 @@ pub fn set_score(env: &Env, asset: &Address, score: &RiskScore) {
     env.storage()
         .persistent()
         .set(&DataKey::Score(asset.clone()), score);
+}
+
+/// Review decision D1.
+pub fn get_event_in_progress(env: &Env, asset: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::EventInProgress(asset.clone()))
+        .unwrap_or(false)
+}
+
+/// Review decision D1.
+pub fn set_event_in_progress(env: &Env, asset: &Address, in_progress: bool) {
+    if in_progress {
+        env.storage()
+            .persistent()
+            .set(&DataKey::EventInProgress(asset.clone()), &true);
+    } else {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EventInProgress(asset.clone()));
+    }
 }
 
 pub fn get_down_streak(env: &Env, asset: &Address) -> u32 {

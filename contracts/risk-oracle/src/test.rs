@@ -613,6 +613,17 @@ fn get_ring_packed_rejects_a_header_that_does_not_match() {
 /// against `EndpointStatus::Unknown` (the mock's default when no
 /// aggregate was ever set, which `post_signals` would otherwise source
 /// for real per Section 7.4).
+///
+/// Posts 2 extra epochs beyond `epochs` (review item C5: a slot is only
+/// EFFECTIVELY final once `pending_until` passes, `signal_dispute_secs`
+/// after it was posted, which at the default parameters is 2 epochs;
+/// posting in strict order means epoch N only becomes final once epoch
+/// N+2 posts) so that after this call, `epochs` consecutive epochs
+/// starting at 0 are all effectively final, not just posted. Then
+/// finalize_endpoint sweeps any last-epoch finality forward explicitly,
+/// so the caller does not depend on a further post_signals call to
+/// notice it (review items C1, C5's lazy finalization: this is the test
+/// side exercising it rather than waiting on it).
 fn fill_ring_with_constant_signal(
     env: &Env,
     client: &RiskOracleClient,
@@ -624,7 +635,8 @@ fn fill_ring_with_constant_signal(
 ) {
     let keeper = Address::generate(env);
     let staking_client = crate::mocks::MockStakingClient::new(env, staking);
-    for epoch in 0..epochs {
+    let total = epochs + 2;
+    for epoch in 0..total {
         staking_client.set_aggregate(asset, &epoch, &EndpointStatus::Up);
         env.ledger().set_timestamp((epoch + 1) * 3_600);
         let mut s = signal_set(env, epoch, peg_ratio);
@@ -632,6 +644,7 @@ fn fill_ring_with_constant_signal(
         s.supply_change_bps = 0;
         client.post_signals(&keeper, asset, &s);
     }
+    client.finalize_endpoint(asset, &(epochs - 1));
 }
 
 #[test]
@@ -686,7 +699,7 @@ fn percentile_p10_ignores_a_single_epoch_wick() {
     let keeper = Address::generate(&env);
     let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
 
-    for epoch in 0..168u64 {
+    for epoch in 0..170u64 {
         staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
         env.ledger().set_timestamp((epoch + 1) * 3_600);
         let mut s = signal_set(&env, epoch, sylox_types::SCALE);
@@ -694,13 +707,15 @@ fn percentile_p10_ignores_a_single_epoch_wick() {
         s.supply_change_bps = 0;
         // The Depeg window is the newest 72 of the 168 posted (epochs
         // 96..168); epoch 96, the oldest epoch inside it, carries the
-        // single wick.
+        // single wick. Epochs 168 and 169 are flush epochs (review item
+        // C5: a slot is only final 2 epochs after it posts).
         if epoch == 96 {
             s.peg_ratio = 1_000_000;
             s.peg_ratio_p10 = 1_000_000; // severely depegged, one epoch only
         }
         fx.client.post_signals(&keeper, &asset, &s);
     }
+    fx.client.finalize_endpoint(&asset, &167);
 
     let score = fx.client.score(&asset);
     assert!(!score.stale);
@@ -723,7 +738,7 @@ fn percentile_p10_reflects_a_sustained_depeg_in_the_window() {
     let keeper = Address::generate(&env);
     let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
 
-    for epoch in 0..168u64 {
+    for epoch in 0..170u64 {
         staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
         env.ledger().set_timestamp((epoch + 1) * 3_600);
         let mut s = signal_set(&env, epoch, sylox_types::SCALE);
@@ -731,13 +746,15 @@ fn percentile_p10_reflects_a_sustained_depeg_in_the_window() {
         s.supply_change_bps = 0;
         // 20 of the newest 72 epochs (96..168) are depegged: well over
         // the 10th percentile index (7), so it must land on a depegged
-        // value this time.
+        // value this time. Epochs 168 and 169 are flush epochs (review
+        // item C5).
         if (96..116).contains(&epoch) {
             s.peg_ratio = 1_000_000;
             s.peg_ratio_p10 = 1_000_000;
         }
         fx.client.post_signals(&keeper, &asset, &s);
     }
+    fx.client.finalize_endpoint(&asset, &167);
 
     let score = fx.client.score(&asset);
     assert!(!score.stale);
@@ -755,7 +772,16 @@ fn percentile_p10_reflects_a_sustained_depeg_in_the_window() {
 /// (liquidity 0 against min_liquidity), I=100 (large clawback and many
 /// auth revocations), R=100 (large redemption outflow relative to
 /// supply). P+E+L+I+R alone already weighs 3500+2000+1000+1500+1500 =
-/// 9500 of the 10,000 bps total. Returns the next unused epoch.
+/// 9500 of the 10,000 bps total.
+///
+/// Posts 2 extra distressed epochs beyond `epochs` (review item C5: a
+/// slot is only effectively final `signal_dispute_secs` after it posts,
+/// 2 epochs at the default parameters, and posting in strict order
+/// means epoch N only becomes final once epoch N+2 posts), then sweeps
+/// finality forward with `finalize_endpoint` so the caller does not need
+/// a further `post_signals` call to observe it. Returns `start_epoch +
+/// epochs + 2`, the next entirely FRESH epoch (one that was never
+/// posted, distressed or otherwise) a caller can continue from.
 fn fill_ring_distressed(
     env: &Env,
     client: &RiskOracleClient,
@@ -766,7 +792,8 @@ fn fill_ring_distressed(
 ) -> u64 {
     let keeper = Address::generate(env);
     let staking_client = crate::mocks::MockStakingClient::new(env, staking);
-    for i in 0..epochs {
+    let total = epochs + 2;
+    for i in 0..total {
         let epoch = start_epoch + i;
         staking_client.set_aggregate(asset, &epoch, &EndpointStatus::Down);
         env.ledger().set_timestamp((epoch + 1) * 3_600);
@@ -786,7 +813,8 @@ fn fill_ring_distressed(
         };
         client.post_signals(&keeper, asset, &s);
     }
-    start_epoch + epochs
+    client.finalize_endpoint(asset, &(start_epoch + epochs - 1));
+    start_epoch + total
 }
 
 #[test]
@@ -799,6 +827,31 @@ fn score_is_distress_band_with_a_depegged_price() {
     assert_eq!(score.band, Band::Distress);
 }
 
+/// Posts `count` healthy epochs starting at `start_epoch` (no flush
+/// epochs added; the caller decides how many of them actually become
+/// final by how many more it posts afterward, or by calling
+/// `finalize_endpoint` itself).
+fn post_healthy_epochs(
+    env: &Env,
+    client: &RiskOracleClient,
+    staking: &Address,
+    asset: &Address,
+    start_epoch: u64,
+    count: u64,
+) {
+    let keeper = Address::generate(env);
+    let staking_client = crate::mocks::MockStakingClient::new(env, staking);
+    for i in 0..count {
+        let epoch = start_epoch + i;
+        staking_client.set_aggregate(asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s = signal_set(env, epoch, sylox_types::SCALE);
+        s.liquidity_2pct = 100_000_000_000;
+        s.supply_change_bps = 0;
+        client.post_signals(&keeper, asset, &s);
+    }
+}
+
 #[test]
 fn score_hysteresis_requires_consecutive_epochs_to_move_down() {
     let env = Env::default();
@@ -809,20 +862,16 @@ fn score_hysteresis_requires_consecutive_epochs_to_move_down() {
     let distressed = fx.client.score(&asset);
     assert_eq!(distressed.band, Band::Distress);
 
-    // One healthy epoch is not enough to move down immediately.
-    let keeper = Address::generate(&env);
-    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
-    staking_client.set_aggregate(&asset, &next_epoch, &EndpointStatus::Up);
-    env.ledger().set_timestamp((next_epoch + 1) * 3_600);
-    let mut healthy = signal_set(&env, next_epoch, sylox_types::SCALE);
-    healthy.liquidity_2pct = 100_000_000_000;
-    healthy.supply_change_bps = 0;
-    fx.client.post_signals(&keeper, &asset, &healthy);
+    // Post exactly 1 healthy epoch worth of new data (plus the 2 more
+    // postings needed for ANY epoch to become final at all, review item
+    // C5), so exactly 1 new final epoch is observed: band_down_epochs
+    // (3) has not elapsed, so the band must not move yet.
+    post_healthy_epochs(&env, &fx.client, &fx.staking, &asset, next_epoch, 3);
     let after_one = fx.client.score(&asset);
     assert_eq!(
         after_one.band,
         Band::Distress,
-        "band_down_epochs (3) has not elapsed yet"
+        "band_down_epochs (3) has not elapsed yet: only 1 new final epoch has been observed"
     );
 }
 
@@ -833,23 +882,23 @@ fn score_moves_down_after_band_down_epochs_consecutive_qualifying_epochs() {
     let next_epoch = fill_ring_distressed(&env, &fx.client, &fx.staking, &asset, 0, 168);
     assert_eq!(fx.client.score(&asset).band, Band::Distress);
 
-    let keeper = Address::generate(&env);
+    // 3 final healthy epochs needs 3 + 2 postings (review item C5's
+    // finality lag), then one more call to let the last of them settle.
+    post_healthy_epochs(&env, &fx.client, &fx.staking, &asset, next_epoch, 5);
     let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
-    for i in 0..3u64 {
-        let epoch = next_epoch + i;
-        staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
-        env.ledger().set_timestamp((epoch + 1) * 3_600);
-        let mut s = signal_set(&env, epoch, sylox_types::SCALE);
-        s.liquidity_2pct = 100_000_000_000;
-        s.supply_change_bps = 0;
-        fx.client.post_signals(&keeper, &asset, &s);
-        fx.client.score(&asset);
-    }
+    let flush_epoch = next_epoch + 5;
+    staking_client.set_aggregate(&asset, &flush_epoch, &EndpointStatus::Up);
+    env.ledger().set_timestamp((flush_epoch + 1) * 3_600);
+    let mut flush = signal_set(&env, flush_epoch, sylox_types::SCALE);
+    flush.liquidity_2pct = 100_000_000_000;
+    flush.supply_change_bps = 0;
+    fx.client.post_signals(&Address::generate(&env), &asset, &flush);
+
     let result = fx.client.score(&asset);
     assert_ne!(
         result.band,
         Band::Distress,
-        "3 consecutive qualifying epochs must move the band down"
+        "3 consecutive final qualifying epochs must move the band down"
     );
 }
 
@@ -872,10 +921,13 @@ fn set_event_band_forces_event_and_is_sticky_until_cleared() {
     assert_eq!(fx.client.band(&asset), Band::Event);
 
     // Posting more healthy signals must not move it out of Event.
+    // fill_ring_with_constant_signal already posted epochs 0..170 (168
+    // plus 2 flush epochs, review item C5), so the next fresh epoch is
+    // 170.
     let keeper = Address::generate(&env);
-    env.ledger().set_timestamp(169 * 3_600);
+    env.ledger().set_timestamp(171 * 3_600);
     fx.client.post_signals(&keeper, &asset, &{
-        let mut s = signal_set(&env, 168, sylox_types::SCALE);
+        let mut s = signal_set(&env, 170, sylox_types::SCALE);
         s.liquidity_2pct = 100_000_000_000;
         s.supply_change_bps = 0;
         s
@@ -1291,4 +1343,189 @@ fn post_signals_skips_the_cross_check_when_adapter_liquidity_is_too_low() {
     fx.client
         .post_signals(&keeper, &asset, &signal_set(&env, 1, 9_000_000));
     assert!(fx.client.signals(&asset, &1).is_some());
+}
+
+// -- C1: score() / band() are pure reads --
+
+#[test]
+fn score_is_a_pure_read_calling_it_repeatedly_changes_nothing() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    fill_ring_with_constant_signal(
+        &env,
+        &fx.client,
+        &fx.staking,
+        &asset,
+        168,
+        sylox_types::SCALE,
+        100_000_000_000,
+    );
+
+    let first = fx.client.score(&asset);
+    for _ in 0..10 {
+        let repeat = fx.client.score(&asset);
+        assert_eq!(
+            repeat, first,
+            "score() must return the same RiskScore every time with no state changing call in between"
+        );
+    }
+    // band() goes through the same pure read path.
+    for _ in 0..10 {
+        assert_eq!(fx.client.band(&asset), first.band);
+    }
+}
+
+#[test]
+fn score_down_streak_advances_at_most_once_per_new_final_epoch() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let next_epoch = fill_ring_distressed(&env, &fx.client, &fx.staking, &asset, 0, 168);
+    assert_eq!(fx.client.score(&asset).band, Band::Distress);
+
+    // Post exactly 1 new healthy epoch (plus the 2 extra needed for it
+    // to become final, review item C5), then call score() many times
+    // with no further state changing call. The down streak must not
+    // advance on any of these repeated reads: only a genuinely new
+    // final epoch (from a further post_signals or finalize_endpoint
+    // call) is allowed to advance it.
+    post_healthy_epochs(&env, &fx.client, &fx.staking, &asset, next_epoch, 3);
+    let after_first_new_final = fx.client.score(&asset);
+    for _ in 0..5 {
+        let repeat = fx.client.score(&asset);
+        assert_eq!(repeat, after_first_new_final);
+    }
+    assert_eq!(
+        after_first_new_final.band,
+        Band::Distress,
+        "only 1 new final epoch observed; band_down_epochs (3) has not elapsed"
+    );
+}
+
+// -- D1: set_event_in_progress forces at least Distress --
+
+#[test]
+fn set_event_in_progress_forces_at_least_distress_and_applies_immediately() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    fill_ring_with_constant_signal(
+        &env,
+        &fx.client,
+        &fx.staking,
+        &asset,
+        168,
+        sylox_types::SCALE,
+        100_000_000_000,
+    );
+    assert_eq!(fx.client.score(&asset).band, Band::Normal);
+
+    // No new final epoch has arrived; the override must still apply
+    // immediately, because score() applies it as a read-time floor on
+    // every call rather than needing a recompute to notice the flag
+    // changed.
+    fx.client.set_event_in_progress(&asset, &true);
+    assert_eq!(fx.client.band(&asset), Band::Distress);
+
+    fx.client.set_event_in_progress(&asset, &false);
+    assert_eq!(
+        fx.client.band(&asset),
+        Band::Normal,
+        "clearing the override must let the raw score show through again"
+    );
+}
+
+#[test]
+fn set_event_in_progress_does_not_persist_into_the_stored_score() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    fill_ring_with_constant_signal(
+        &env,
+        &fx.client,
+        &fx.staking,
+        &asset,
+        168,
+        sylox_types::SCALE,
+        100_000_000_000,
+    );
+    assert_eq!(fx.client.score(&asset).band, Band::Normal);
+
+    // The override is applied only at read time (score()); the
+    // underlying RiskScore this contract actually persists must stay
+    // the plain hysteresis band throughout, confirmed here by reading
+    // storage directly rather than through the overridden score() read.
+    fx.client.set_event_in_progress(&asset, &true);
+    assert_eq!(fx.client.band(&asset), Band::Distress);
+    env.as_contract(&fx.client.address, || {
+        let stored = crate::storage::get_score(&env, &asset).unwrap();
+        assert_eq!(
+            stored.band,
+            Band::Normal,
+            "the override must never be baked into the persisted RiskScore"
+        );
+    });
+}
+
+#[test]
+fn set_event_in_progress_does_not_downgrade_a_worse_band() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    fill_ring_distressed(&env, &fx.client, &fx.staking, &asset, 0, 168);
+    assert_eq!(fx.client.score(&asset).band, Band::Distress);
+
+    // Already at or above Distress: the override is a floor, not a
+    // ceiling, so it must not move an Event-worthy or already-Distress
+    // score down to exactly Distress.
+    fx.client.set_event_in_progress(&asset, &true);
+    assert_eq!(fx.client.band(&asset), Band::Distress);
+}
+
+#[test]
+fn set_event_in_progress_does_not_touch_the_hysteresis_down_streak() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let next_epoch = fill_ring_distressed(&env, &fx.client, &fx.staking, &asset, 0, 168);
+    assert_eq!(fx.client.score(&asset).band, Band::Distress);
+
+    // One new qualifying final epoch arrives from post_healthy_epochs
+    // (the usual recompute_score path; see
+    // score_down_streak_advances_at_most_once_per_new_final_epoch for
+    // why this particular call only ever contributes one qualifying
+    // epoch here). Setting and clearing the override around it must not
+    // add to, or otherwise disturb, that streak: only a genuinely new
+    // final epoch is allowed to advance it, and the override never
+    // recomputes at all.
+    post_healthy_epochs(&env, &fx.client, &fx.staking, &asset, next_epoch, 3);
+    let before = fx.client.score(&asset);
+    fx.client.set_event_in_progress(&asset, &true);
+    fx.client.set_event_in_progress(&asset, &false);
+    let after = fx.client.score(&asset);
+    assert_eq!(
+        after, before,
+        "the override must not change the stored RiskScore at all"
+    );
+    assert_eq!(
+        after.band,
+        Band::Distress,
+        "only 1 of band_down_epochs (3) distinct newer epochs has elapsed"
+    );
+}
+
+#[test]
+fn set_event_in_progress_requires_registry_auth() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    fx.client.set_event_in_progress(&asset, &true);
+    assert_eq!(
+        env.auths(),
+        [(
+            fx.registry.clone(),
+            soroban_sdk::testutils::AuthorizedInvocation {
+                function: soroban_sdk::testutils::AuthorizedFunction::Contract((
+                    fx.client.address.clone(),
+                    soroban_sdk::Symbol::new(&env, "set_event_in_progress"),
+                    (asset.clone(), true).into_val(&env),
+                )),
+                sub_invocations: std::vec![],
+            }
+        )]
+    );
 }
