@@ -9,7 +9,7 @@ import { setMobileMenuOpen } from "@/lib/motion/useMobileMenuOpen";
 function Logo() {
   return (
     <Image
-      src="/brand/sylox-mark.png"
+      src="/brand/sylox-mark.webp"
       alt="Sylox"
       width={100}
       height={44}
