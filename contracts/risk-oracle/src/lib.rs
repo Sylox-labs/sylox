@@ -45,6 +45,17 @@ const STALE_AFTER_EPOCHS: u64 = 3;
 /// technical-doc.md Section 23 `band_down_epochs` default.
 const BAND_DOWN_EPOCHS: u32 = 3;
 
+/// Review item C6 (re-review): every state-changing call's finality
+/// scan (`try_advance_finality`) looks back across the full backfill
+/// window, `WINDOW_SECS / EPOCH_SECS + 1` epochs (73 at the defaults),
+/// never more than `RING_SLOTS` (nothing older could still be
+/// physically present). This is a fixed bound per call, not a
+/// sequential cursor that only advances one epoch per call: a single
+/// call can now observe and announce every epoch across the whole
+/// window that just became final, matching the re-review's "scan
+/// back... bounded by the ring" instruction.
+const FINALITY_LOOKBACK_EPOCHS: u32 = (WINDOW_SECS / EPOCH_SECS) as u32 + 1;
+
 /// technical-doc.md Section 23 `amm_tolerance_bps` default.
 const AMM_TOLERANCE_BPS: i128 = 300;
 
@@ -196,17 +207,13 @@ impl RiskOracle {
         }
         .publish(&env);
 
-        // Review items C1, C5: this posting cannot itself be final yet
-        // (pending_until is always in the future at post time), but
-        // posting is also the natural moment to sweep forward any OLDER
-        // epoch on this asset that has quietly crossed finality since
-        // the last state changing call touched it ("on backfill" in
-        // review item C1's wording: a backfilled epoch becoming final
-        // later is still driven from here, the next time anything posts
-        // for this asset). Bounded to a small number of steps; see
-        // try_advance_finality's doc comment for why that bound is safe
-        // in the common case.
-        if let Some(newest_final) = try_advance_finality(&env, &asset, 8) {
+        // Review items C1, C5, C6: this posting cannot itself be final
+        // yet (pending_until is always in the future at post time),
+        // but posting is also the natural moment to sweep the whole
+        // backfill window for any OLDER epoch that has quietly
+        // crossed finality since the last state changing call touched
+        // it ("on backfill" in review item C1's wording).
+        if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
             recompute_score(&env, &asset, newest_final)?;
         }
 
@@ -258,7 +265,7 @@ impl RiskOracle {
                 alt_hash: alt_hash.clone(),
             },
         );
-        storage::set_slot_state(&env, &asset, epoch, sylox_types::SlotState::Disputed);
+        storage::set_slot_disputed(&env, &asset, epoch);
 
         events::SignalsDisputed {
             asset,
@@ -293,12 +300,25 @@ impl RiskOracle {
 
         if keeper_wins {
             staking.forfeit_bond(&bond_key, &Some(signals.poster.clone()));
-            storage::set_slot_state(&env, &asset, epoch, sylox_types::SlotState::Final);
-            // The slot is now immediately, definitely Final (not merely
-            // "effectively" final pending a clock check): sweep finality
-            // forward from here in case this resolution was the only
-            // thing blocking later epochs on this asset too.
-            if let Some(newest_final) = try_advance_finality(&env, &asset, 8) {
+            // Review item C6 (re-review): the slot is now immediately,
+            // definitely Final, decided right here, not merely
+            // "effectively" final pending a clock check elsewhere.
+            // set_slot_final sets the final_announced flag in the same
+            // write that sets the state, per the re-review's "emit
+            // signals_final immediately and set the flag in the same
+            // write" instruction; this contract then emits the event
+            // for THIS epoch directly, rather than waiting for the
+            // independent backward scan below (which exists to pick up
+            // any OTHER epoch this resolution may have unblocked, not
+            // this one).
+            if storage::set_slot_final(&env, &asset, epoch) {
+                events::SignalsFinal {
+                    asset: asset.clone(),
+                    epoch,
+                }
+                .publish(&env);
+            }
+            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
                 recompute_score(&env, &asset, newest_final)?;
             }
         } else {
@@ -309,12 +329,22 @@ impl RiskOracle {
                 &Some(dispute.disputer.clone()),
                 &BytesN::from_array(&env, &[0u8; 32]),
             );
-            storage::set_slot_state(&env, &asset, epoch, sylox_types::SlotState::Empty);
+            storage::set_slot_overturned(&env, &asset, epoch);
             // Review item C4: move the overturned Signals entry to
             // history so post_signals accepts a fresh posting for this
             // same epoch (ADR-005: "an overturned epoch reopens for
             // reposting").
             storage::overturn_signals(&env, &asset, epoch);
+            // Review item C6 (re-review): an overturned epoch, even if
+            // never reposted, must not block any LATER epoch's
+            // finality. The independent backward scan already
+            // guarantees this by construction (it skips past this
+            // epoch, now Empty, without stopping), but a resolution
+            // can still be the event that unblocks something later
+            // that was waiting on this one, so sweep here too.
+            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+                recompute_score(&env, &asset, newest_final)?;
+            }
         }
         storage::clear_dispute(&env, &asset, epoch);
 
@@ -365,7 +395,7 @@ impl RiskOracle {
         // have closed, Section 7.4), so it is also where review item C1
         // and C5's lazy finality sweep gets a chance to run even if no
         // new SignalSet is ever posted for a later epoch on this asset.
-        if let Some(newest_final) = try_advance_finality(&env, &asset, 8) {
+        if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
             recompute_score(&env, &asset, newest_final)?;
         }
         Ok(())
@@ -780,59 +810,76 @@ fn check_amm_cross_check(env: &Env, cfg: &AssetConfig, s: &SignalSet) -> Result<
     Ok(())
 }
 
-/// Review item C5: advances `NewestFinal(asset)` forward one epoch at a
-/// time while the next candidate epoch is effectively final, emitting
-/// `signals_final` for each one newly observed as final ("lazy
-/// finalization... document where": this is where). Bounded by
-/// `max_steps` so a caller that has gone quiet for a long time cannot
-/// make a single call walk an unbounded number of epochs; callers that
-/// care about a specific epoch becoming final (`dispute_signals`,
-/// `finalize_endpoint`) pass a small bound, `post_signals` passes enough
-/// to cover one typical gap between postings.
+/// Review item C6 (re-review): finality is per epoch and INDEPENDENT.
+/// A permanently missing epoch, an overturned epoch that is never
+/// reposted, or an unresolved dispute must never block any OTHER
+/// epoch's finality or the score from advancing past it. The previous
+/// design (a sequential cursor walking forward one epoch at a time,
+/// stopping dead at the first non-Final epoch) violated this; see
+/// `finality_keeps_advancing_past_a_permanently_missing_epoch` and its
+/// two siblings in `test.rs`, written to fail against that design
+/// before this fix.
 ///
-/// Returns the newest epoch now known final, if any advance happened or
-/// already existed.
-fn try_advance_finality(env: &Env, asset: &Address, max_steps: u32) -> Option<u64> {
+/// `newest_final` is now found by scanning BACKWARD from the newest
+/// posted epoch, stopping at the first epoch (in that backward order)
+/// found effectively Final, bounded by `max_lookback` epochs (at most
+/// `RING_SLOTS`, since nothing older could still be physically
+/// present in the ring). A missing, Empty, Disputed, or still-pending
+/// epoch anywhere in that scanned range is simply skipped, never a
+/// reason to give up early. The storage-layer scan itself
+/// (`storage::advance_finality`) does the heavy lifting; this wrapper
+/// just supplies `now` and the posting/lookback bounds, and turns the
+/// storage layer's list of newly-announced epochs into actual
+/// `signals_final` events (announcing is storage's job; the EVENT
+/// belongs at this layer, next to every other event this contract
+/// emits).
+///
+/// Every call site in this contract passes `FINALITY_LOOKBACK_EPOCHS`
+/// (the full backfill window): the re-review's instruction is that
+/// EVERY state changing call sweeps the whole window, not that some
+/// callers get a smaller budget than others the way the old
+/// `max_steps` design did. `max_lookback` stays a parameter (rather
+/// than hardcoding the constant inside this function) so a future
+/// caller with a genuine reason to scan less can still do so
+/// explicitly, and so this function's own tests can probe a specific
+/// bound without depending on the module-level constant.
+///
+/// Returns the newest epoch now known Final, if any.
+fn try_advance_finality(env: &Env, asset: &Address, max_lookback: u32) -> Option<u64> {
     let now = env.ledger().timestamp();
-    let mut newest_final = storage::get_newest_final(env, asset);
-    let mut next_candidate = match newest_final {
-        Some(n) => n + 1,
-        None => {
-            // No finality observed yet for this asset. Start from the
-            // oldest epoch still reachable in the ring rather than
-            // guessing 0: `get_newest_epoch` minus up to RING_SLOTS - 1
-            // is the furthest back a live slot could be, but walking
-            // that far on the very first call would defeat the bound.
-            // In practice the first candidate that matters is whatever
-            // epoch was posted first, which this loop finds by trying
-            // from the newest backfill-eligible epoch downward is not
-            // bounded either; instead, seed from the oldest epoch within
-            // one window of the newest posted epoch, the only range
-            // `post_signals` can ever have written to to begin with.
-            let newest_posted = storage::get_newest_epoch_pub(env, asset)?;
-            newest_posted.saturating_sub(WINDOW_SECS / EPOCH_SECS)
-        }
+    let Some(newest_posted) = storage::get_newest_epoch_pub(env, asset) else {
+        return storage::get_newest_final(env, asset);
     };
+    let (newest_final, newly_announced) =
+        storage::advance_finality(env, asset, now, newest_posted, max_lookback);
 
-    let mut steps = 0;
-    while steps < max_steps {
-        let Some(slot) = storage::get_slot(env, asset, next_candidate) else {
-            break;
-        };
-        if storage::effective_state(&slot, now) != sylox_types::SlotState::Final {
-            break;
-        }
-        newest_final = Some(next_candidate);
-        storage::set_newest_final(env, asset, next_candidate);
+    for epoch in newly_announced.iter() {
         events::SignalsFinal {
             asset: asset.clone(),
-            epoch: next_candidate,
+            epoch,
         }
         .publish(env);
-        next_candidate += 1;
-        steps += 1;
     }
-    newest_final
+
+    // Never move the cached pointer backward: the fresh scan's own
+    // bound only looks back `max_lookback` epochs from the newest
+    // POSTED epoch, which is strictly a caller-side budget, not a
+    // claim that nothing Final exists further back than that. A
+    // smaller `max_lookback` (e.g. dispute_signals's bounded call)
+    // must never erase a larger result an earlier, wider scan already
+    // found and cached.
+    let previous = storage::get_newest_final(env, asset);
+    let advanced = match (newest_final, previous) {
+        (Some(fresh), Some(cached)) => Some(fresh.max(cached)),
+        (Some(fresh), None) => Some(fresh),
+        (None, cached) => cached,
+    };
+    if let Some(advanced) = advanced {
+        if Some(advanced) != previous {
+            storage::set_newest_final(env, asset, advanced);
+        }
+    }
+    advanced
 }
 
 /// Review item C1: the one place a `RiskScore` is actually computed and

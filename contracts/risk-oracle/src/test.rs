@@ -4,8 +4,8 @@ mod golden_vectors;
 mod property;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, BytesN, Env, IntoVal,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, BytesN, Env, Event as _, IntoVal,
 };
 use sylox_types::{
     Band, EndpointStatus, FxRateSource, IssuerActions, Reference, SignalSet, SlotState,
@@ -1982,25 +1982,21 @@ fn a_frozen_score_must_report_stale_judged_against_its_own_epoch() {
 }
 
 #[test]
-fn is_stale_must_not_mask_a_score_frozen_behind_a_gap() {
+fn score_stays_fresh_behind_a_permanent_gap_once_finality_advances_independently() {
     let env = Env::default();
     let (fx, asset) = setup_with_asset(&env);
 
     // Reach a real score, then leave a permanent gap at epoch 100 and
-    // keep posting for 200+ further epochs. Posting never stops, so
-    // is_stale (which reads the newest POSTED epoch, not the newest
-    // FINAL/scored one) reports fresh throughout, even once the gap has
-    // frozen the actual score far enough in the past for score().stale
-    // to correctly flip true on its own terms. A caller that checks
-    // only is_stale() — exactly the field named for this purpose — is
-    // misled into believing the asset's risk data is current when the
-    // real score has not moved in hundreds of epochs. This is true
-    // whether or not try_advance_finality itself gets fixed (C6's fix
-    // does not touch is_stale()'s own newest-posted-epoch semantics),
-    // so this failure is about is_stale()'s definition, not about the
-    // finality-stall bug the other three tests above target; recorded
-    // here because the review grouped it under the same "frozen score"
-    // heading.
+    // keep posting for 200+ further epochs. Before review item C6's
+    // fix, the sequential finality cursor would have stalled at the
+    // gap, freezing score() at an epoch far enough in the past to
+    // eventually read score().stale = true even while is_stale()
+    // (which reads only the newest POSTED epoch) kept reporting
+    // fresh, misleading a caller that trusted is_stale() alone. With
+    // per-epoch independent finality, score() keeps advancing past
+    // the gap, so BOTH reads agree the asset is current: there is no
+    // more divergence to mislead anyone with, because there is no
+    // more frozen score to mask.
     for epoch in 0..100u64 {
         post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
     }
@@ -2009,15 +2005,233 @@ fn is_stale_must_not_mask_a_score_frozen_behind_a_gap() {
         post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
     }
 
-    assert!(
-        !fx.client.is_stale(&asset),
-        "is_stale reads the newest posted epoch, which stays fresh since posting never stopped"
-    );
+    assert!(!fx.client.is_stale(&asset));
     let score = fx.client.score(&asset);
     assert!(
-        score.stale,
-        "score().stale, judged against the epoch the score was actually computed from, \
-         must report stale here even though is_stale() does not — proving is_stale() \
-         alone is not a safe substitute for score().stale"
+        !score.stale,
+        "score() must keep advancing past the permanent gap at epoch 100, so its \
+         staleness judgment agrees with is_stale() instead of lagging behind it"
+    );
+    assert!(score.epoch >= 290, "got stuck at epoch {}", score.epoch);
+}
+
+// -- Re-review item C6, step 3: signals_final emission tests --
+//
+// `env.events().all()` only returns events from the LAST contract
+// invocation (soroban-sdk's own doc comment on `Events::all`), so
+// every test below checks immediately after each individual call and
+// accumulates its own running tally, rather than querying once at the
+// end of a long posting loop.
+
+/// Counts how many `signals_final` events matching `(asset, target_epoch)`
+/// appear in the events emitted by the single most recent contract
+/// invocation.
+fn signals_final_count_for_asset(
+    env: &Env,
+    contract_id: &Address,
+    asset: &Address,
+    target_epoch: u64,
+) -> usize {
+    let expected = crate::events::SignalsFinal {
+        asset: asset.clone(),
+        epoch: target_epoch,
+    }
+    .to_xdr(env, contract_id);
+    env.events()
+        .all()
+        .events()
+        .iter()
+        .filter(|e| *e == &expected)
+        .count()
+}
+
+#[test]
+fn each_epoch_emits_signals_final_exactly_once_across_many_calls() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+
+    // 170 epochs posted in strict order (no gaps, no disputes): every
+    // epoch eventually becomes final through the lazy backward scan
+    // triggered by a LATER post. Tally, per post_signals call, how
+    // many times each specific epoch's signals_final fires across the
+    // whole run, and assert every epoch that ever becomes final gets
+    // exactly one.
+    let mut counts: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    for epoch in 0..170u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+        for candidate in 0..=epoch {
+            let n = signals_final_count_for_asset(&env, &contract_id, &asset, candidate);
+            if n > 0 {
+                *counts.entry(candidate).or_insert(0) += n;
+            }
+        }
+    }
+
+    assert!(
+        !counts.is_empty(),
+        "at least some epochs must have become final over 170 posts"
+    );
+    for (epoch, count) in &counts {
+        assert_eq!(
+            *count, 1,
+            "epoch {epoch} emitted signals_final {count} time(s); expected exactly 1"
+        );
+    }
+}
+
+#[test]
+fn a_backfilled_epoch_emits_signals_final_exactly_once_when_first_observed_final() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    // Post 0..50 in order, skip epoch 50 (to be backfilled shortly),
+    // continue 51..60: epochs newer than 50 become final first, while
+    // 50 itself is still missing.
+    for epoch in 0..50u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    for epoch in 51..60u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    assert_eq!(
+        signals_final_count_for_asset(&env, &contract_id, &asset, 50),
+        0,
+        "epoch 50 cannot be final before it has even been posted"
+    );
+
+    // Backfill epoch 50 now, WITHOUT moving the clock backward: it
+    // lands at whatever "now" already is (the end of the 51..60 pass),
+    // matching post_with_an_outage_then_backfill's pattern elsewhere in
+    // this file. epoch 50 cannot itself be the one that becomes final
+    // on this same call (its own pending_until is in the future
+    // relative to this post's "now"), so continue posting forward a
+    // few more epochs for its finality lag to resolve.
+    staking_client.set_aggregate(&asset, &50, &EndpointStatus::Up);
+    let mut s = signal_set(&env, 50, sylox_types::SCALE);
+    s.liquidity_2pct = 100_000_000_000;
+    s.supply_change_bps = 0;
+    fx.client.post_signals(&keeper, &asset, &s);
+    let mut total = signals_final_count_for_asset(&env, &contract_id, &asset, 50);
+    for epoch in 60..65u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+        total += signals_final_count_for_asset(&env, &contract_id, &asset, 50);
+    }
+
+    assert_eq!(
+        total, 1,
+        "the backfilled epoch 50 must emit signals_final exactly once total, got {total}"
+    );
+    assert!(
+        fx.client.is_final(&asset, &50),
+        "epoch 50 must actually have become final by the end of this run"
+    );
+}
+
+#[test]
+fn an_overturned_and_reposted_epoch_emits_signals_final_exactly_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let governor_client = crate::mocks::MockGovernorClient::new(&env, &governor);
+    let committee = Address::generate(&env);
+    governor_client.set_committee(&committee);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+
+    // Post, dispute, and overturn epoch 5 (disputer wins). It must
+    // never emit signals_final while overturned (it is Empty, never
+    // Final). Repost it, then post enough further epochs for its
+    // finality lag to resolve, and confirm exactly one emission total,
+    // from the repost's own eventual finality, never from the original
+    // (overturned) posting.
+    post_one_healthy_epoch(&env, &client, &staking, &asset, 5);
+    let disputer = Address::generate(&env);
+    client.dispute_signals(&disputer, &asset, &5, &BytesN::from_array(&env, &[9u8; 32]));
+    client.resolve_signal_dispute(&asset, &5, &false, &BytesN::from_array(&env, &[0u8; 32]));
+    assert_eq!(
+        signals_final_count_for_asset(&env, &contract_id, &asset, 5),
+        0,
+        "an overturned epoch must never emit signals_final"
+    );
+
+    // Repost epoch 5 (ADR-005, review item C4): the clock does not
+    // move backward; this repost lands at whatever "now" already is.
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &staking);
+    staking_client.set_aggregate(&asset, &5, &EndpointStatus::Up);
+    let mut s = signal_set(&env, 5, sylox_types::SCALE);
+    s.liquidity_2pct = 100_000_000_000;
+    s.supply_change_bps = 0;
+    client.post_signals(&keeper, &asset, &s);
+
+    let mut total = signals_final_count_for_asset(&env, &contract_id, &asset, 5);
+    for epoch in 6..15u64 {
+        post_one_healthy_epoch(&env, &client, &staking, &asset, epoch);
+        total += signals_final_count_for_asset(&env, &contract_id, &asset, 5);
+    }
+
+    assert_eq!(
+        total, 1,
+        "the reposted epoch 5 must emit signals_final exactly once total, got {total}"
+    );
+    assert!(client.is_final(&asset, &5));
+}
+
+#[test]
+fn resolve_signal_dispute_keeper_wins_emits_signals_final_once_at_resolution_never_again() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let governor_client = crate::mocks::MockGovernorClient::new(&env, &governor);
+    let committee = Address::generate(&env);
+    governor_client.set_committee(&committee);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+
+    post_one_healthy_epoch(&env, &client, &staking, &asset, 5);
+    let disputer = Address::generate(&env);
+    client.dispute_signals(&disputer, &asset, &5, &BytesN::from_array(&env, &[9u8; 32]));
+    assert_eq!(
+        signals_final_count_for_asset(&env, &contract_id, &asset, 5),
+        0,
+        "disputing must not itself emit signals_final"
+    );
+
+    // Review item C6 (re-review): keeper_wins resolves the slot to
+    // Final immediately and decisively, set_slot_final/emission
+    // happening right here, not waiting for the independent backward
+    // scan or a clock check.
+    client.resolve_signal_dispute(&asset, &5, &true, &BytesN::from_array(&env, &[0u8; 32]));
+    let mut total = signals_final_count_for_asset(&env, &contract_id, &asset, 5);
+    assert_eq!(
+        total, 1,
+        "resolve_signal_dispute with keeper_wins = true must emit signals_final exactly \
+         once, at resolution itself"
+    );
+
+    // Keep posting further epochs: epoch 5 must never emit again.
+    for epoch in 6..15u64 {
+        post_one_healthy_epoch(&env, &client, &staking, &asset, epoch);
+        total += signals_final_count_for_asset(&env, &contract_id, &asset, 5);
+    }
+    assert_eq!(
+        total, 1,
+        "epoch 5 must never emit signals_final again after its resolution-time emission"
     );
 }

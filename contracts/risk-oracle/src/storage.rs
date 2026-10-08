@@ -55,7 +55,15 @@ pub const SLOT_BYTES: u32 = 112;
 /// Packed ring layout version. Bump this and handle the old layout
 /// explicitly (migrate or reject) before ever changing `RING_SLOTS` or
 /// `SLOT_BYTES`, or the byte offsets below.
-const LAYOUT_VERSION: u8 = 1;
+///
+/// Bumped to 2 for review item C6 (re-review): byte 106, previously
+/// unused padding, now holds `final_announced` (see `write_slot`'s
+/// doc comment). `SLOT_BYTES` itself is unchanged (112; byte 106 was
+/// already inside the padded range). No contract using version 1 has
+/// ever been deployed, so this is a version bump with no migration
+/// code, not a live format change; documented here so that changes if
+/// that ever stops being true.
+const LAYOUT_VERSION: u8 = 2;
 
 /// Header: `[0] layout version, [1..5) RING_SLOTS, [5..9) SLOT_BYTES`,
 /// little endian. `HEADER_BYTES` of overhead ahead of the packed slots so
@@ -368,7 +376,12 @@ pub fn write_ring_slot(
         auth_revocations: signals.issuer_actions.auth_revocations,
         endpoint: signals.endpoint,
     };
-    write_slot(&mut packed, index, &slot);
+    // A fresh post always starts unannounced: either this epoch has
+    // never been posted before, or it is a repost after an overturn
+    // (review item C4), which the re-review's C6 instructions say must
+    // also start unannounced rather than inheriting whatever the
+    // overturned attempt's flag happened to be.
+    write_slot(&mut packed, index, &slot, false);
     env.storage()
         .persistent()
         .set(&DataKey::Ring(asset.clone()), &packed);
@@ -484,27 +497,69 @@ pub fn clear_dispute(env: &Env, asset: &Address, epoch: u64) {
 }
 
 /// Sets a ring slot's state directly, for `resolve_signal_dispute`
-/// (Section 5.4): `Final` on a keeper win, `Empty` (reopened) on an
-/// overturn. Does not touch `RingNewest`: an overturned slot going back
-/// to `Empty` should not move the "newest" pointer backwards, and a
-/// keeper-wins `Final` transition does not change which epoch is newest
-/// either, since the epoch itself is unchanged.
-pub fn set_slot_state(env: &Env, asset: &Address, epoch: u64, state: SlotState) {
+/// (Section 5.4), for `dispute_signals` opening a dispute. Preserves
+/// whatever `final_announced` already held (always `false` at this
+/// point: nothing is announced before a slot is actually Final). Does
+/// not touch `RingNewest`: a state transition never changes which
+/// epoch is newest, since the epoch itself is unchanged.
+pub fn set_slot_disputed(env: &Env, asset: &Address, epoch: u64) {
     let mut packed = get_ring_packed(env, asset);
     let index = position_of(epoch);
     let mut slot = read_slot(&packed, index);
     if slot.epoch != epoch {
-        // Nothing to transition; the slot this epoch used to occupy has
-        // already been overwritten by something newer. A dispute
-        // resolution arriving this late is a timing issue for the caller
-        // to handle, not something storage can retroactively fix.
+        // Nothing to transition; see set_slot_final's doc comment for
+        // why this can legitimately happen and is not an error.
         return;
     }
-    slot.state = state;
-    if state == SlotState::Empty {
-        slot = empty_slot();
+    let final_announced = read_final_announced(&packed, index);
+    slot.state = SlotState::Disputed;
+    write_slot(&mut packed, index, &slot, final_announced);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Ring(asset.clone()), &packed);
+}
+
+/// `resolve_signal_dispute`'s keeper-wins path (Section 5.4): the slot
+/// becomes definitely `Final`. Review item C6 (re-review): sets
+/// `final_announced` to `true` in the SAME write, since the caller is
+/// responsible for emitting `signals_final` immediately after this
+/// call returns `true` (and must not emit it if this returns `false`,
+/// meaning the slot had already moved on and there is nothing to
+/// announce). Returns whether the transition actually happened.
+pub fn set_slot_final(env: &Env, asset: &Address, epoch: u64) -> bool {
+    let mut packed = get_ring_packed(env, asset);
+    let index = position_of(epoch);
+    let mut slot = read_slot(&packed, index);
+    if slot.epoch != epoch {
+        // The slot this epoch used to occupy has already been
+        // overwritten by something newer (the ring wrapped past it).
+        // A dispute resolution arriving this late is a timing issue
+        // for the caller to handle, not something storage can
+        // retroactively fix.
+        return false;
     }
-    write_slot(&mut packed, index, &slot);
+    slot.state = SlotState::Final;
+    write_slot(&mut packed, index, &slot, true);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Ring(asset.clone()), &packed);
+    true
+}
+
+/// `resolve_signal_dispute`'s disputer-wins path (Section 5.4): the
+/// slot reopens to `Empty` (its `Signals` entry is moved to history by
+/// `overturn_signals`, review item C4, separately). `final_announced`
+/// resets to unannounced along with everything else, via `empty_slot`;
+/// an `Empty` slot was never Final, so there is nothing it could have
+/// announced. Does not touch `RingNewest`, matching `set_slot_final`.
+pub fn set_slot_overturned(env: &Env, asset: &Address, epoch: u64) {
+    let mut packed = get_ring_packed(env, asset);
+    let index = position_of(epoch);
+    let slot = read_slot(&packed, index);
+    if slot.epoch != epoch {
+        return;
+    }
+    write_slot(&mut packed, index, &empty_slot(), false);
     env.storage()
         .persistent()
         .set(&DataKey::Ring(asset.clone()), &packed);
@@ -513,7 +568,7 @@ pub fn set_slot_state(env: &Env, asset: &Address, epoch: u64, state: SlotState) 
 /// Updates a slot's `endpoint` in place, for `finalize_endpoint` (Section
 /// 7.4) booking a late `Staking.aggregate` result after `post_signals`
 /// had already written `Unknown`. A no-op if the slot's stored epoch no
-/// longer matches `epoch` (same reasoning as `set_slot_state`).
+/// longer matches `epoch` (same reasoning as `set_slot_final`).
 pub fn set_slot_endpoint(env: &Env, asset: &Address, epoch: u64, endpoint: EndpointStatus) {
     let mut packed = get_ring_packed(env, asset);
     let index = position_of(epoch);
@@ -521,8 +576,9 @@ pub fn set_slot_endpoint(env: &Env, asset: &Address, epoch: u64, endpoint: Endpo
     if slot.epoch != epoch {
         return;
     }
+    let final_announced = read_final_announced(&packed, index);
     slot.endpoint = endpoint;
-    write_slot(&mut packed, index, &slot);
+    write_slot(&mut packed, index, &slot, final_announced);
     env.storage()
         .persistent()
         .set(&DataKey::Ring(asset.clone()), &packed);
@@ -635,12 +691,27 @@ fn slot_base(index: u32) -> u32 {
 }
 
 /// Writes one slot's fields into `packed` at `index`, fixed width, no field
-/// names. Layout (little endian) within the slot, 106 of its 112 bytes
+/// names. Layout (little endian) within the slot, 107 of its 112 bytes
 /// used: `[0..8) epoch, [8) state, [9..17) pending_until, [17..33)
 /// peg_ratio, [33..49) liquidity_2pct, [49..65) redemption_net, [65..81)
 /// supply, [81..85) supply_change_bps, [85..101) clawback_amount,
-/// [101..105) auth_revocations, [105) endpoint`.
-fn write_slot(packed: &mut Bytes, index: u32, slot: &RingSlot) {
+/// [101..105) auth_revocations, [105) endpoint, [106) final_announced`.
+///
+/// `final_announced` (C6, re-review) marks whether `signals_final` has
+/// already been emitted for this epoch, so the backward finality scan
+/// in `lib.rs`'s `try_advance_finality` never re-announces the same
+/// epoch twice. It lives in the ring slot's own byte, not a separate
+/// storage key, so checking and setting it costs no extra read or
+/// write beyond the slot write every other field already needed.
+/// Every call site must pass it explicitly (never implicitly
+/// preserved or implicitly zeroed) so each one states its own intent:
+/// `write_ring_slot` always passes `false` (a fresh post, or a repost
+/// after an overturn, both start unannounced); `set_slot_final`'s
+/// keeper-wins transition to `Final` passes `true` in the same write
+/// that makes the slot Final, rather than a separate write; every
+/// other caller that is not changing this specifically must read the
+/// slot's current value first and pass it straight through.
+fn write_slot(packed: &mut Bytes, index: u32, slot: &RingSlot, final_announced: bool) {
     let base = slot_base(index);
     let mut buf = [0u8; SLOT_BYTES as usize];
     buf[0..8].copy_from_slice(&slot.epoch.to_le_bytes());
@@ -654,6 +725,7 @@ fn write_slot(packed: &mut Bytes, index: u32, slot: &RingSlot) {
     buf[85..101].copy_from_slice(&slot.clawback_amount.to_le_bytes());
     buf[101..105].copy_from_slice(&slot.auth_revocations.to_le_bytes());
     buf[105] = endpoint_byte(slot.endpoint);
+    buf[106] = final_announced as u8;
 
     packed.copy_from_slice(base, &buf);
 }
@@ -684,6 +756,102 @@ fn read_slot(packed: &Bytes, index: u32) -> RingSlot {
         auth_revocations: read_u32(&buf, 101),
         endpoint: byte_endpoint(buf[105]),
     }
+}
+
+/// Reads slot `index`'s `final_announced` byte (106) without decoding
+/// the rest of the slot. Internal only: not part of the public
+/// `RingSlot` shape `ring()` returns, since it is bookkeeping for
+/// `signals_final` emission, not data Section 12.1 specifies as part
+/// of a slot's observable content.
+fn read_final_announced(packed: &Bytes, index: u32) -> bool {
+    let base = slot_base(index);
+    packed.get(base + 106).unwrap_or(0) != 0
+}
+
+/// Review item C6 (re-review): per epoch, INDEPENDENT finality. Scans
+/// back from `newest_posted` across at most `max_lookback` epochs
+/// (never more than `RING_SLOTS`, since nothing older could still be
+/// physically present), finding the single newest epoch that is
+/// effectively Final (C5's `effective_state`) — a missing, Empty,
+/// Disputed, or still-Pending-but-not-yet-due epoch along the way is
+/// simply skipped, never a reason to stop scanning past it, unlike the
+/// old sequential cursor this replaces.
+///
+/// At the same time, collects every epoch in the scanned range that is
+/// effectively Final and not yet `final_announced`, flips that flag
+/// for each one in the SAME in-memory buffer, and writes the whole
+/// buffer back to storage exactly once regardless of how many flags
+/// changed — "one ring write for the whole scan," per the re-review's
+/// instruction. The caller (`lib.rs`) is responsible for actually
+/// emitting `signals_final` for each epoch in the returned list, in
+/// whatever order it chooses; this function only decides WHICH epochs
+/// qualify and persists that they have been announced.
+///
+/// Returns `(newest_final, newly_announced)`. `newly_announced` is
+/// NOT necessarily sorted by epoch and can include epochs older than
+/// a later-posted one that became final earlier (a backfilled epoch),
+/// which is why the re-review's report notes `signals_final` can
+/// arrive out of epoch order; callers (indexers) must dedupe on
+/// `(asset, epoch)`, not assume monotonic order.
+pub fn advance_finality(
+    env: &Env,
+    asset: &Address,
+    now: u64,
+    newest_posted: u64,
+    max_lookback: u32,
+) -> (Option<u64>, Vec<u64>) {
+    let lookback = max_lookback.min(RING_SLOTS) as u64;
+    let oldest_candidate = newest_posted.saturating_sub(lookback.saturating_sub(1));
+
+    let mut packed = get_ring_packed(env, asset);
+    let mut newest_final: Option<u64> = None;
+    let mut newly_announced: Vec<u64> = Vec::new(env);
+    let mut changed = false;
+
+    let mut epoch = newest_posted;
+    loop {
+        let index = position_of(epoch);
+        let slot = read_slot(&packed, index);
+        if slot.state != SlotState::Empty
+            && slot.epoch == epoch
+            && effective_state(&slot, now) == SlotState::Final
+        {
+            if newest_final.is_none() {
+                newest_final = Some(epoch);
+            }
+            if !read_final_announced(&packed, index) {
+                // Only the flag changes here, never the stored `state`
+                // byte itself: `write_ring_slot_...` and
+                // `backfill_after_an_outage_matches_no_outage` both
+                // require two posting orders of the exact same
+                // signals to leave an IDENTICAL ring, including the
+                // stored `state` byte. Eagerly materializing `Pending`
+                // to `Final` here, even though harmless to any reader
+                // (every read goes through `effective_state` or this
+                // same check), would make that byte's value depend on
+                // whether a finality scan happened to pass over this
+                // epoch, not purely on wall-clock time, breaking that
+                // order-independence. `effective_state` already gives
+                // every caller the right answer lazily, so there is
+                // nothing to gain from writing it early.
+                write_slot(&mut packed, index, &slot, true);
+                newly_announced.push_back(epoch);
+                changed = true;
+            }
+        }
+        if epoch == oldest_candidate {
+            break;
+        }
+        epoch -= 1;
+    }
+
+    if changed {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Ring(asset.clone()), &packed);
+    }
+
+    (newest_final, newly_announced)
 }
 
 /// Reads 8 bytes at `offset` as a little endian `u64`. `offset + 8` is

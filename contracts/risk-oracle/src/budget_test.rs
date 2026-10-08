@@ -212,3 +212,68 @@ fn budget_post_signals_rent_detail() {
         resources.temporary_entry_rent_bumps
     );
 }
+
+/// Review item C6 (re-review): the worst case for `try_advance_finality`'s
+/// backward scan combines a FULL 240 slot ring (the realistic storage
+/// read/write cost every posting already pays, see
+/// `budget_post_signals_against_a_full_ring`) with a long run of
+/// MISSING epochs between the newest Final epoch and the newest
+/// posted one, forcing the scan to walk every epoch in its lookback
+/// bound (`WINDOW_SECS / EPOCH_SECS`, 72) without finding anything,
+/// rather than the common case (1-2 epochs back, given the 2 epoch
+/// finality lag) terminating almost immediately.
+///
+/// Warms a full ring normally, then posts one more epoch, skips the
+/// next 71 entirely (never posted), then posts the epoch 72 slots
+/// later (the oldest epoch `check_epoch_window` still accepts relative
+/// to that posting time) and measures THAT call, whose
+/// `try_advance_finality` sweep must walk the full 71 epoch gap
+/// before finding the epoch just before it Final.
+#[test]
+fn budget_finality_backward_scan_across_a_full_backfill_window() {
+    let env = Env::default();
+    let (client, asset) = setup(&env);
+    let next_epoch = warm_full_ring(&env, &client, &asset);
+    let keeper = Address::generate(&env);
+
+    env.ledger().set_timestamp((next_epoch + 1) * 3_600);
+    client.post_signals(&keeper, &asset, &signal_set(&env, next_epoch, 9_900_000));
+    // The next 71 epochs intentionally never posted.
+    let gap_start = next_epoch + 1;
+    let resume_epoch = gap_start + 71;
+
+    env.ledger().set_timestamp((resume_epoch + 1) * 3_600);
+    client.post_signals(&keeper, &asset, &signal_set(&env, resume_epoch, 9_900_000));
+
+    // Capture the estimate for THIS post_signals call immediately,
+    // before any further invocation (including the sanity check read
+    // below) can fold its own cost into cost_estimate()'s result.
+    let estimate = env.cost_estimate();
+    print_resources(
+        "post_signals, full ring, try_advance_finality scanning a 71 epoch missing gap",
+        &estimate,
+    );
+
+    // Sanity check, AFTER capturing the estimate above: resume_epoch
+    // itself cannot be Final yet (posted this instant, pending_until
+    // is in the future). next_epoch's own pending_until is also 2
+    // epochs ahead of its own post time (SIGNAL_DISPUTE_SECS), so the
+    // newest epoch actually Final by the time resume_epoch posts is
+    // next_epoch - 2 (the same finality lag every other test in this
+    // crate accounts for), reached only by walking back across nearly
+    // the entire gap, not a trivial same-epoch or 1-step result.
+    assert_eq!(
+        client.score(&asset).epoch,
+        next_epoch - 2,
+        "the measured call's backward scan must walk nearly the full 71 epoch gap, \
+         not stop early; a different result here means this test is not actually \
+         measuring the scenario it claims to"
+    );
+
+    let resources = estimate.resources();
+    assert!(
+        resources.instructions < 400_000_000,
+        "must stay comfortably under tx_max_instructions even at this scan's worst case; got {}",
+        resources.instructions
+    );
+}
