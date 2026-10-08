@@ -980,7 +980,11 @@ fn reference_rate_fiat_reads_the_fx_adapter() {
 }
 
 #[test]
-fn reference_rate_asset_reference_is_unavailable() {
+fn add_asset_rejects_reference_asset() {
+    // Review decision D3: Reference::Asset is rejected in v1, so it can
+    // never actually reach storage, and reference_rate's own Asset branch
+    // (ReferenceRateUnavailable) is unreachable through the public API;
+    // kept in reference_rate only as a defensive fallback.
     let env = Env::default();
     let fx = setup(&env);
     let asset = Address::generate(&env);
@@ -988,10 +992,22 @@ fn reference_rate_asset_reference_is_unavailable() {
     let other_asset = Address::generate(&env);
     let mut cfg = asset_config(&env, &asset, &issuer);
     cfg.reference = Reference::Asset(other_asset);
-    fx.client.add_asset(&cfg);
 
-    let result = fx.client.try_reference_rate(&asset);
-    assert_eq!(result, Err(Ok(Error::ReferenceRateUnavailable)));
+    let result = fx.client.try_add_asset(&cfg);
+    assert_eq!(result, Err(Ok(Error::ReferenceNotSupported)));
+}
+
+#[test]
+fn update_asset_rejects_reference_asset() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let issuer = Address::generate(&env);
+    let other_asset = Address::generate(&env);
+    let mut cfg = asset_config(&env, &asset, &issuer);
+    cfg.reference = Reference::Asset(other_asset);
+
+    let result = fx.client.try_update_asset(&asset, &cfg);
+    assert_eq!(result, Err(Ok(Error::ReferenceNotSupported)));
 }
 
 // -- dispute_signals / resolve_signal_dispute --

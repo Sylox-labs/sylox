@@ -87,9 +87,13 @@ impl RiskOracle {
 
     /// technical-doc.md Section 12.1. Rejects an asset that is already
     /// registered (`update_asset` is for changing one).
+    /// technical-doc.md Section 12.1. Review decision D3: rejects
+    /// `Reference::Asset` (no USD rate is defined anywhere in the spec
+    /// for an asset pegged reference; see the PR's "Spec deviations").
     pub fn add_asset(env: Env, cfg: AssetConfig) -> Result<(), Error> {
         let config = Self::require_config(&env)?;
         config.governor.require_auth();
+        reject_asset_reference(&cfg.reference)?;
         if storage::get_asset_config(&env, &cfg.asset).is_some() {
             return Err(Error::AlreadyInitialized);
         }
@@ -99,9 +103,15 @@ impl RiskOracle {
     }
 
     /// technical-doc.md Section 12.1: "rejects a change to cfg.reference".
+    /// Review decision D3: also rejects `Reference::Asset`, same as
+    /// `add_asset` (an existing asset can never have had this reference
+    /// in the first place, since `add_asset` rejects it, but the check
+    /// is repeated here rather than relying on that invariant holding
+    /// forever).
     pub fn update_asset(env: Env, asset: Address, cfg: AssetConfig) -> Result<(), Error> {
         let config = Self::require_config(&env)?;
         config.governor.require_auth();
+        reject_asset_reference(&cfg.reference)?;
         let existing = storage::get_asset_config(&env, &asset).ok_or(Error::UnknownAsset)?;
         if existing.reference != cfg.reference {
             return Err(Error::ReferenceImmutable);
@@ -559,6 +569,18 @@ fn check_epoch_window(epoch: u64, now: u64) -> Result<(), Error> {
     let epoch_close = (epoch + 1) * EPOCH_SECS;
     if now.saturating_sub(epoch_close) > WINDOW_SECS {
         return Err(Error::WrongEpoch);
+    }
+    Ok(())
+}
+
+/// Review decision D3: `Reference::Asset` is rejected in v1. No part of
+/// the spec defines a USD rate for an asset pegged reference (it would
+/// presumably need that other asset's own `reference_rate`, recursively,
+/// but nothing bounds how deep that could go); see the PR's "Spec
+/// deviations" section.
+fn reject_asset_reference(reference: &sylox_types::Reference) -> Result<(), Error> {
+    if matches!(reference, sylox_types::Reference::Asset(_)) {
+        return Err(Error::ReferenceNotSupported);
     }
     Ok(())
 }
