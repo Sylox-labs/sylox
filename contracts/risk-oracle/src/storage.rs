@@ -106,6 +106,13 @@ pub enum DataKey {
     /// (ADR-005: "an overturned epoch reopens for reposting"), while the
     /// overturned data stays available for audit.
     Overturned(Address, u64),
+    /// Re-review item C7's `asset_stale` redesign: tracks whether the
+    /// asset is currently announced stale, so `check_stale` emits
+    /// `asset_stale` only on the transition into stale (flag false to
+    /// true), never on every call that happens to observe an already
+    /// announced stale state, and clears when a fresh, non-stale
+    /// epoch is scored.
+    StaleAnnounced(Address),
     Assets,
     Formula,
 }
@@ -427,6 +434,27 @@ pub fn set_event_in_progress(env: &Env, asset: &Address, in_progress: bool) {
         env.storage()
             .persistent()
             .remove(&DataKey::EventInProgress(asset.clone()));
+    }
+}
+
+/// Re-review item C7.
+pub fn get_stale_announced(env: &Env, asset: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::StaleAnnounced(asset.clone()))
+        .unwrap_or(false)
+}
+
+/// Re-review item C7.
+pub fn set_stale_announced(env: &Env, asset: &Address, announced: bool) {
+    if announced {
+        env.storage()
+            .persistent()
+            .set(&DataKey::StaleAnnounced(asset.clone()), &true);
+    } else {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::StaleAnnounced(asset.clone()));
     }
 }
 

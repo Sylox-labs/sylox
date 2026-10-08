@@ -5,7 +5,7 @@ mod property;
 
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
-    Address, BytesN, Env, Event as _, IntoVal,
+    Address, BytesN, Env, Event as _, FromVal, IntoVal,
 };
 use sylox_types::{
     Band, EndpointStatus, FxRateSource, IssuerActions, Reference, SignalSet, SlotState,
@@ -50,6 +50,46 @@ fn asset_config(env: &Env, asset: &Address, issuer: &Address) -> sylox_types::As
         issuer_flags: sylox_types::IssuerFlags::default(),
         enabled: true,
     }
+}
+
+// -- Timing helpers (re-review item C7): never hand-compute a
+// timestamp or epoch boundary in a test; derive it from the same
+// constants the contract itself uses. --
+
+/// The ledger timestamp this crate's convention posts epoch `n` at:
+/// its own close time, matching `check_epoch_window`'s `epoch_close`.
+fn time_at_epoch(epoch: u64) -> u64 {
+    (epoch + 1) * crate::EPOCH_SECS
+}
+
+/// The epoch number whose close time is `timestamp`, i.e. the inverse
+/// of `time_at_epoch`. Panics if `timestamp` does not fall exactly on
+/// an epoch boundary (a test bug, not a valid input).
+#[allow(dead_code)]
+fn epoch_at_time(timestamp: u64) -> u64 {
+    assert_eq!(timestamp % crate::EPOCH_SECS, 0, "not an epoch boundary");
+    timestamp / crate::EPOCH_SECS - 1
+}
+
+/// The first ledger timestamp at which a score computed from
+/// `last_epoch` reads stale, i.e. the smallest `now` for which
+/// `is_stale_epoch`'s own condition (`now / EPOCH_SECS -
+/// last_epoch > STALE_AFTER_EPOCHS`) first holds.
+fn first_stale_time(last_epoch: u64) -> u64 {
+    (last_epoch + crate::STALE_AFTER_EPOCHS + 1) * crate::EPOCH_SECS
+}
+
+/// The epoch `SIGNAL_DISPUTE_SECS` after `epoch`'s own close, i.e. how
+/// many whole epochs the 2 epoch finality lag (review item C5) spans.
+#[allow(dead_code)]
+fn finality_lag_epochs() -> u64 {
+    crate::SIGNAL_DISPUTE_SECS / crate::EPOCH_SECS
+}
+
+/// The backfill window, in epochs: the largest gap `check_epoch_window`
+/// still accepts a late posting across.
+fn backfill_window_epochs() -> u64 {
+    crate::WINDOW_SECS / crate::EPOCH_SECS
 }
 
 fn signal_set(env: &Env, epoch: u64, peg_ratio: i128) -> SignalSet {
@@ -2235,3 +2275,385 @@ fn resolve_signal_dispute_keeper_wins_emits_signals_final_once_at_resolution_nev
         "epoch 5 must never emit signals_final again after its resolution-time emission"
     );
 }
+
+// -- Re-review item C7: check_stale, asset_stale redesign --
+
+/// Counts how many `asset_stale` events for `asset` appear among the
+/// events emitted by the single most recent contract invocation.
+fn asset_stale_count(env: &Env, contract_id: &Address, asset: &Address, last_epoch: u64) -> usize {
+    let expected = crate::events::AssetStale {
+        asset: asset.clone(),
+        last_epoch,
+    }
+    .to_xdr(env, contract_id);
+    env.events()
+        .all()
+        .events()
+        .iter()
+        .filter(|e| *e == &expected)
+        .count()
+}
+
+#[test]
+fn check_stale_fires_once_when_keepers_stop_posting_then_nothing_on_a_repeat_call() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+
+    for epoch in 0..170u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    let last_epoch = fx.client.score(&asset).epoch;
+    assert!(!fx.client.score(&asset).stale);
+
+    // Keepers stop posting entirely; advance the clock to the first
+    // moment a score computed from last_epoch reads stale, with no
+    // further posts at all.
+    env.ledger().set_timestamp(first_stale_time(last_epoch));
+    assert!(fx.client.check_stale(&asset));
+    assert_eq!(
+        asset_stale_count(&env, &contract_id, &asset, last_epoch),
+        1,
+        "the first check_stale call to observe the asset as stale must emit asset_stale exactly once"
+    );
+
+    assert!(fx.client.check_stale(&asset));
+    assert_eq!(
+        asset_stale_count(&env, &contract_id, &asset, last_epoch),
+        0,
+        "a repeat check_stale call while still stale must emit nothing"
+    );
+}
+
+#[test]
+fn check_stale_does_not_fire_one_second_before_first_stale_time() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+
+    for epoch in 0..170u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    let last_epoch = fx.client.score(&asset).epoch;
+
+    env.ledger()
+        .set_timestamp(first_stale_time(last_epoch) - 1);
+    assert!(
+        !fx.client.check_stale(&asset),
+        "one second before first_stale_time, the asset must not read stale yet"
+    );
+    assert_eq!(
+        asset_stale_count(&env, &contract_id, &asset, last_epoch),
+        0,
+        "no asset_stale before the asset is actually stale"
+    );
+}
+
+#[test]
+fn check_stale_recovers_silently_then_relapses_with_a_fresh_asset_stale() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+
+    for epoch in 0..170u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    let first_last_epoch = fx.client.score(&asset).epoch;
+
+    env.ledger().set_timestamp(first_stale_time(first_last_epoch));
+    assert!(fx.client.check_stale(&asset));
+    assert_eq!(
+        asset_stale_count(&env, &contract_id, &asset, first_last_epoch),
+        1
+    );
+
+    // Recovery: post fresh epochs. The flag clears; no event marks
+    // recovery (score_updated already signals it). The finality lag
+    // (review item C5) means the first of these posts does not itself
+    // become Final yet, so post a couple more to let that resolve
+    // before checking score() again.
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+    let recovery_start = first_last_epoch + backfill_window_epochs();
+    for epoch in recovery_start..recovery_start + 3 {
+        staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp(time_at_epoch(epoch));
+        let mut s = signal_set(&env, epoch, sylox_types::SCALE);
+        s.liquidity_2pct = 100_000_000_000;
+        s.supply_change_bps = 0;
+        fx.client.post_signals(&keeper, &asset, &s);
+        // Checked after each individual post_signals call (events()
+        // only exposes the LAST invocation's events): none of these,
+        // including the one that eventually clears the stale state,
+        // may emit asset_stale.
+        assert_eq!(asset_stale_count(&env, &contract_id, &asset, first_last_epoch), 0);
+    }
+    assert!(!fx.client.score(&asset).stale, "a fresh epoch must clear the stale state");
+    let second_last_epoch = fx.client.score(&asset).epoch;
+
+    // Relapse: go quiet again, past first_stale_time for the new
+    // stored epoch. asset_stale must fire again, exactly once.
+    env.ledger()
+        .set_timestamp(first_stale_time(second_last_epoch));
+    assert!(fx.client.check_stale(&asset));
+    assert_eq!(
+        asset_stale_count(&env, &contract_id, &asset, second_last_epoch),
+        1,
+        "a relapse into stale after a recovery must emit asset_stale again, exactly once"
+    );
+}
+
+#[test]
+fn a_late_backfill_that_is_stale_on_arrival_emits_asset_stale_via_post_signals() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    // Post 0..170 (168 plus 2 flush epochs for the finality lag,
+    // review item C5, so the warm-up threshold is actually crossed
+    // and a real score gets computed), then skip epoch 170 entirely:
+    // it stays genuinely unposted (not just unscored) going into the
+    // backfill below.
+    for epoch in 0..170u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    let last_epoch = fx.client.score(&asset).epoch;
+    assert!(!fx.client.score(&asset).stale, "sanity check: a real score must exist here");
+    assert!(
+        last_epoch < 170,
+        "sanity check: last_epoch must be below the never-posted epoch 170"
+    );
+
+    // epoch 170 is inside the backfill window, newer than the stored
+    // score's own epoch (so recompute_score would otherwise consider
+    // it), but already stale on arrival (so recompute_score declines
+    // to write it, per its own "very late backfill" branch), with
+    // nothing newer posted since. Posting it must still surface the
+    // transition via check_stale_internal.
+    let backfilled_epoch = 170u64;
+    let post_time = first_stale_time(backfilled_epoch);
+    assert!(
+        post_time <= time_at_epoch(backfilled_epoch) + crate::WINDOW_SECS,
+        "the chosen post time must still be inside the backfill window check_epoch_window allows"
+    );
+    env.ledger().set_timestamp(post_time);
+    staking_client.set_aggregate(&asset, &backfilled_epoch, &EndpointStatus::Up);
+    let mut s = signal_set(&env, backfilled_epoch, sylox_types::SCALE);
+    s.liquidity_2pct = 100_000_000_000;
+    s.supply_change_bps = 0;
+    fx.client.post_signals(&keeper, &asset, &s);
+
+    assert_eq!(
+        asset_stale_count(&env, &contract_id, &asset, last_epoch),
+        1,
+        "a late backfill that is already stale on arrival must emit asset_stale once, \
+         via this post_signals call's own check_stale_internal"
+    );
+}
+
+#[test]
+fn score_band_and_is_stale_never_emit_or_write_when_checking_staleness() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+
+    for epoch in 0..170u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    let last_epoch = fx.client.score(&asset).epoch;
+    env.ledger().set_timestamp(first_stale_time(last_epoch));
+
+    // None of these read-only calls may announce asset_stale or set
+    // the stale_announced flag: only check_stale (or an internal
+    // state changing call) may do that. is_stale()'s own result is
+    // not asserted here: it judges staleness against the newest
+    // POSTED epoch (169, still fresh at this clock), not the stored
+    // score's epoch (167, already stale), so it legitimately reads
+    // false here even while score().stale reads true; that divergence
+    // is exactly why check_stale exists as a separate, authoritative
+    // signal, not a bug in this test.
+    assert!(fx.client.score(&asset).stale);
+    assert!(fx.client.score(&asset).stale);
+    assert_eq!(fx.client.band(&asset), Band::Normal);
+    let _ = fx.client.is_stale(&asset);
+
+    let contract_id = fx.client.address.clone();
+    assert_eq!(
+        asset_stale_count(&env, &contract_id, &asset, last_epoch),
+        0,
+        "score()/band()/is_stale() must never emit asset_stale themselves"
+    );
+
+    // Confirm the flag genuinely was never set by any of the calls
+    // above: check_stale must still see this as a fresh transition.
+    assert!(fx.client.check_stale(&asset));
+    assert_eq!(
+        asset_stale_count(&env, &contract_id, &asset, last_epoch),
+        1,
+        "check_stale must still see an unannounced transition, proving the read-only \
+         calls above never set stale_announced"
+    );
+}
+
+// -- Re-review item C7: event topics are ("sylox", <event_name>, <primary key>) --
+
+/// Extracts the raw topic vector (as `ScVal`s) for the most recently
+/// emitted event whose topic 1 is exactly `event_name`, from the
+/// events published by the single most recent contract invocation.
+/// Returns `None` if no such event was emitted.
+fn topics_for_event_named(
+    env: &Env,
+    event_name: &str,
+) -> Option<std::vec::Vec<soroban_sdk::xdr::ScVal>> {
+    let name_scval = soroban_sdk::xdr::ScVal::Symbol(
+        soroban_sdk::xdr::ScSymbol(event_name.try_into().unwrap()),
+    );
+    for event in env.events().all().events() {
+        let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
+        if body.topics.get(1) == Some(&name_scval) {
+            return Some(body.topics.to_vec());
+        }
+    }
+    None
+}
+
+/// Asserts that the most recently emitted event named `event_name` has
+/// EXACTLY the topic vector `["sylox", event_name, primary_key]`: the
+/// 2 custom prefix topics ADR-007 specifies (re-review item C7,
+/// replacing the old literal `"RiskOracle"` prefix), followed by
+/// whatever single field every RiskOracle event's `#[topic]` marks
+/// (always `asset`).
+fn assert_event_topics(env: &Env, event_name: &str, primary_key: &Address) {
+    let topics = topics_for_event_named(env, event_name)
+        .unwrap_or_else(|| panic!("no event named \"{event_name}\" was emitted"));
+    assert_eq!(
+        topics.len(),
+        3,
+        "event \"{event_name}\" must have exactly 3 topics (sylox, name, asset), got {}",
+        topics.len()
+    );
+    assert_eq!(
+        topics[0],
+        soroban_sdk::xdr::ScVal::Symbol(soroban_sdk::xdr::ScSymbol("sylox".try_into().unwrap())),
+        "topic 0 must be \"sylox\""
+    );
+    assert_eq!(
+        topics[1],
+        soroban_sdk::xdr::ScVal::Symbol(soroban_sdk::xdr::ScSymbol(event_name.try_into().unwrap())),
+        "topic 1 must be the event's own name (\"{event_name}\"), not \"RiskOracle\" \
+         (ADR-007, re-review item C7)"
+    );
+    assert_eq!(
+        topics[2],
+        soroban_sdk::xdr::ScVal::from_val(env, &primary_key.to_val()),
+        "topic 2 must be the event's primary key (asset)"
+    );
+}
+
+#[test]
+fn every_event_uses_the_sylox_event_name_asset_topic_convention() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let governor_client = crate::mocks::MockGovernorClient::new(&env, &governor);
+    let committee = Address::generate(&env);
+    governor_client.set_committee(&committee);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &staking);
+    let keeper = Address::generate(&env);
+
+    // signals_posted: every post_signals call emits it.
+    staking_client.set_aggregate(&asset, &0, &EndpointStatus::Up);
+    env.ledger().set_timestamp(3_600);
+    let mut s = signal_set(&env, 0, sylox_types::SCALE);
+    s.liquidity_2pct = 100_000_000_000;
+    s.supply_change_bps = 0;
+    client.post_signals(&keeper, &asset, &s);
+    assert_event_topics(&env, "signals_posted", &asset);
+
+    // signals_disputed: dispute_signals.
+    let disputer = Address::generate(&env);
+    client.dispute_signals(&disputer, &asset, &0, &BytesN::from_array(&env, &[9u8; 32]));
+    assert_event_topics(&env, "signals_disputed", &asset);
+
+    // signals_resolved and signals_final: resolve_signal_dispute,
+    // keeper_wins = true emits both in the same call.
+    client.resolve_signal_dispute(&asset, &0, &true, &BytesN::from_array(&env, &[0u8; 32]));
+    assert_event_topics(&env, "signals_resolved", &asset);
+    assert_event_topics(&env, "signals_final", &asset);
+
+    // endpoint_finalized: post_signals with NO aggregate set yet (so
+    // MockStaking.aggregate returns Unknown, same as a keeper posting
+    // before the endpoint is known), then finalize_endpoint once a
+    // real aggregate exists, which is the one case signals.endpoint ==
+    // Unknown at the time finalize_endpoint runs.
+    env.ledger().set_timestamp(2 * 3_600);
+    let mut s1 = signal_set(&env, 1, sylox_types::SCALE);
+    s1.liquidity_2pct = 100_000_000_000;
+    s1.supply_change_bps = 0;
+    client.post_signals(&keeper, &asset, &s1);
+    staking_client.set_aggregate(&asset, &1, &EndpointStatus::Up);
+    env.ledger().set_timestamp(3 * 3_600);
+    client.finalize_endpoint(&asset, &1);
+    assert_event_topics(&env, "endpoint_finalized", &asset);
+
+    // score_updated and band_changed: the very first score ever
+    // computed for a fresh asset always qualifies as a band change
+    // (recompute_score's `stored = None` branch has no previous band
+    // to compare against), so a plain healthy run to 168 epochs is
+    // enough to trigger both, no depeg scenario needed.
+    let asset2 = Address::generate(&env);
+    let issuer2 = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset2, &issuer2));
+    let keeper2 = Address::generate(&env);
+    for epoch in 0..170u64 {
+        staking_client.set_aggregate(&asset2, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s2 = signal_set(&env, epoch, sylox_types::SCALE);
+        s2.liquidity_2pct = 100_000_000_000;
+        s2.supply_change_bps = 0;
+        client.post_signals(&keeper2, &asset2, &s2);
+    }
+    assert_event_topics(&env, "score_updated", &asset2);
+    assert_event_topics(&env, "band_changed", &asset2);
+
+    // asset_stale: a third asset, posted just enough to reach the 168
+    // epoch threshold, then abandoned long enough that the STORED
+    // score's own epoch (unchanged, since nothing newer posted in the
+    // gap) reads stale against the clock. Re-review item C7:
+    // check_stale_internal runs at the end of every post_signals
+    // call, so the one post below that resumes after the long gap is
+    // what both observes and announces the transition into stale (not
+    // because posting itself triggered a NEW stale epoch, but because
+    // this call is simply the next state changing call to run the
+    // check at all).
+    let asset3 = Address::generate(&env);
+    let issuer3 = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset3, &issuer3));
+    let keeper3 = Address::generate(&env);
+    for epoch in 0..170u64 {
+        staking_client.set_aggregate(&asset3, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s3 = signal_set(&env, epoch, sylox_types::SCALE);
+        s3.liquidity_2pct = 100_000_000_000;
+        s3.supply_change_bps = 0;
+        client.post_signals(&keeper3, &asset3, &s3);
+    }
+    let next_epoch = 300u64;
+    env.ledger().set_timestamp((next_epoch + 1) * 3_600);
+    staking_client.set_aggregate(&asset3, &next_epoch, &EndpointStatus::Up);
+    let mut s3 = signal_set(&env, next_epoch, sylox_types::SCALE);
+    s3.liquidity_2pct = 100_000_000_000;
+    s3.supply_change_bps = 0;
+    client.post_signals(&keeper3, &asset3, &s3);
+    assert_event_topics(&env, "asset_stale", &asset3);
+}
+

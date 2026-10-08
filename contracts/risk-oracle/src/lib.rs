@@ -216,6 +216,7 @@ impl RiskOracle {
         if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
             recompute_score(&env, &asset, newest_final)?;
         }
+        check_stale_internal(&env, &asset)?;
 
         Ok(())
     }
@@ -268,12 +269,13 @@ impl RiskOracle {
         storage::set_slot_disputed(&env, &asset, epoch);
 
         events::SignalsDisputed {
-            asset,
+            asset: asset.clone(),
             epoch,
             disputer,
             alt_hash,
         }
         .publish(&env);
+        check_stale_internal(&env, &asset)?;
         Ok(())
     }
 
@@ -349,12 +351,13 @@ impl RiskOracle {
         storage::clear_dispute(&env, &asset, epoch);
 
         events::SignalsResolved {
-            asset,
+            asset: asset.clone(),
             epoch,
             keeper_wins,
             reason,
         }
         .publish(&env);
+        check_stale_internal(&env, &asset)?;
         Ok(())
     }
 
@@ -398,6 +401,7 @@ impl RiskOracle {
         if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
             recompute_score(&env, &asset, newest_final)?;
         }
+        check_stale_internal(&env, &asset)?;
         Ok(())
     }
 
@@ -574,6 +578,30 @@ impl RiskOracle {
         Ok(Self::score(env, asset)?.band)
     }
 
+    /// Re-review item C7 (lead decision): `asset_stale` now means "the
+    /// asset TRANSITIONED into stale", not "a newly observed epoch
+    /// happened to already be stale on arrival" (the old design's
+    /// condition, which never fired at all for the realistic "keepers
+    /// stopped posting" case, since nothing new ever arrives to
+    /// trigger it). Permissionless: evaluates staleness against the
+    /// epoch of the STORED score (never `newest_final`, which can run
+    /// ahead of the stored score when `recompute_score` short
+    /// circuits without writing, e.g. a sticky `Event` band or not
+    /// enough history yet), emits `asset_stale` once if the asset is
+    /// stale and `stale_announced` is not already set, sets the flag,
+    /// and returns the current stale state either way. Calling this
+    /// again while still stale emits nothing. Every state changing
+    /// call that touches an asset runs the same check internally (see
+    /// `check_stale_internal`), so a late backfill that is stale on
+    /// arrival also emits, once, without needing anyone to call this
+    /// explicitly; this function exists for a monitor that wants to
+    /// poll every asset itself (Section 22.4 in the upcoming spec
+    /// v1.2 PR) without waiting for keeper activity to drive it.
+    pub fn check_stale(env: Env, asset: Address) -> Result<bool, Error> {
+        storage::get_asset_config(&env, &asset).ok_or(Error::UnknownAsset)?;
+        check_stale_internal(&env, &asset)
+    }
+
     pub fn is_stale(env: Env, asset: Address) -> bool {
         match storage::get_newest_epoch_pub(&env, &asset) {
             Some(newest) => is_stale_epoch(&env, newest),
@@ -691,6 +719,35 @@ fn is_stale_epoch(env: &Env, epoch: u64) -> bool {
     let now = env.ledger().timestamp();
     let current_epoch = now / EPOCH_SECS;
     current_epoch.saturating_sub(epoch) > STALE_AFTER_EPOCHS
+}
+
+/// Re-review item C7: the shared implementation behind both the
+/// public, permissionless `check_stale` and the internal call every
+/// state changing function makes on its own asset. Judges staleness
+/// against the STORED score's own epoch (a brand new asset with no
+/// score at all is stale by definition, matching `score()`'s own
+/// `(None, _)` branch), emits `asset_stale` exactly on the transition
+/// into stale, and clears `stale_announced` the moment a fresh,
+/// non-stale score is on record (no separate "recovered" event:
+/// `score_updated` already signals that a fresh score landed).
+fn check_stale_internal(env: &Env, asset: &Address) -> Result<bool, Error> {
+    let stored = storage::get_score(env, asset);
+    let stale = match &stored {
+        Some(current) => is_stale_epoch(env, current.epoch),
+        None => true,
+    };
+    let announced = storage::get_stale_announced(env, asset);
+    if stale && !announced {
+        events::AssetStale {
+            asset: asset.clone(),
+            last_epoch: stored.map(|s| s.epoch).unwrap_or(0),
+        }
+        .publish(env);
+        storage::set_stale_announced(env, asset, true);
+    } else if !stale && announced {
+        storage::set_stale_announced(env, asset, false);
+    }
+    Ok(stale)
 }
 
 #[derive(Clone)]
@@ -886,9 +943,12 @@ fn try_advance_finality(env: &Env, asset: &Address, max_lookback: u32) -> Option
 /// written. Called from `post_signals` (after writing the new slot and
 /// advancing finality), `finalize_endpoint`, and the dispute resolution
 /// path, each time finality may have moved forward; a no-op (no write,
-/// no event) if the newest final epoch has not moved past what is
-/// already stored, so repeated calls within the same epoch do not spam
-/// `score_updated`/`band_changed`.
+/// no `score_updated`/`band_changed` event) if the newest final epoch
+/// has not moved past what is already stored, so repeated calls
+/// within the same epoch do not spam those events. Every caller also
+/// runs `check_stale_internal` afterward (re-review item C7), which is
+/// where `asset_stale` actually gets decided, independent of whether
+/// this function wrote anything.
 ///
 /// The hysteresis down streak in `apply_hysteresis` only advances when
 /// called here with a strictly newer final epoch than what is stored:
@@ -919,16 +979,12 @@ fn recompute_score(env: &Env, asset: &Address, newest_final: u64) -> Result<(), 
         // The epoch that just became final is itself already outside
         // stale_after_epochs (a very late backfill); recording it would
         // immediately read back as stale, which score() already reports
-        // correctly from the stored epoch without a write. Emit
-        // asset_stale once here if this is the state actually changing,
-        // not on every call that happens to observe it.
-        if stored.as_ref().map(|s| !s.stale).unwrap_or(true) {
-            events::AssetStale {
-                asset: asset.clone(),
-                last_epoch: newest_final,
-            }
-            .publish(env);
-        }
+        // correctly from the stored epoch without a write. Re-review
+        // item C7: asset_stale emission is no longer this function's
+        // job at all; every caller runs check_stale_internal
+        // afterward, which detects exactly this "stale on arrival"
+        // case from the stored score's own (unchanged) epoch and
+        // announces the transition from there.
         return Ok(());
     }
     if newest_final + 1 < AGGREGATE_SLOTS_7D as u64 {
