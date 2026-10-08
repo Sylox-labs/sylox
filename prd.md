@@ -24,16 +24,19 @@ $140K to $150K in XLM (Section 16)
 Anchorline gives every anchor issued token on Stellar a public risk score and a market where holders can insure against that issuer depegging, freezing withdrawals or failing.
 1.2 The protocol in three parts
 1. Anchor Risk Oracle: a public onchain feed per issued asset, combining price, issuer account behaviour and anchor endpoint health into signals and a risk score.
-2. Credit Event Registry: objective definitions of failure (depeg, issuer freeze, halted withdrawals, insolvency) and a process that declares them, using onchain checks, staked reporters with disputes, and a committee for edge cases.
+2. Credit Event Registry: objective definitions of failure (depeg, issuer freeze, halted withdrawals, insolvency) and a process that declares them, using keeper posted, publicly recomputable data checks, staked reporters with disputes, and a committee for edge cases.
 3. Protection Markets: fully collateralized pools per issued asset. Buyers pay premiums for cover; sellers post USDC and earn premiums; payouts settle automatically when a credit event is declared.
 1.3 Why it matters
 Stellar's model is many issuers for the same currency. Users, wallets, lenders and NGOs hold these tokens but have no shared way to see, price or hedge issuer risk. Anchorline turns that hidden risk into public data and a tradable market, which also gives good anchors a way to prove they are safe.
 1.4 The honest summary
 The contracts are the easy part. The hard parts are reliable credit event detection, market manipulation on thin liquidity, getting both buyers and sellers, and legal structure, since protection like this is likely a derivative or insurance in most jurisdictions. This PRD treats those four as first class workstreams, not footnotes.
+1.4a Who is trusted in v1
+In v1 the trust root for payouts is a set of permissioned, bonded keepers plus a 4 of 7 committee. Every step is permissionless to trigger and every signal is recomputable, but keepers and reporters are permissioned and the committee resolves disputes.
+The committee must rule within a fixed deadline, with a default outcome if it does not (Section 6.4). The path away from this trust root is in Section 17.2: open keeper and reporter registration with higher stakes, and onchain verifiable signal disputes, in later versions.
 2. The problem
-On Stellar, a "dollar" or "naira" token is only as good as its issuer, yet there is no public measure of issuer risk and no way to hedge it.
+On Stellar, a "dollar" or "peso" token is only as good as its issuer, yet there is no public measure of issuer risk and no way to hedge it.
 2.1 Many issuers, one name
-Stellar's anchor model lets several companies issue tokens for the same currency. Two tokens both called USD or NGN can carry very different risk: different reserves, jurisdictions, banking partners and operational track records. Wallets usually show them side by side with no risk signal.
+Stellar's anchor model lets several companies issue tokens for the same currency. Two tokens both called USD or ARS can carry very different risk: different reserves, jurisdictions, banking partners and operational track records. Wallets usually show them side by side with no risk signal.
 2.2 Failure modes are real and varied
 • Depeg: the token trades well below its face value because people doubt redemption.
 • Issuer action: the issuer freezes accounts, revokes authorization or claws back balances (Stellar supports these asset flags).
@@ -64,7 +67,7 @@ There is no shared, onchain answer to two questions: how risky is this issuer ri
 Anchorline is a protocol, not an app: its rules live in Soroban contracts, anyone can read the risk feed, open a market or buy cover, and other protocols can build on its signals and events.
 3.1 Why it is a protocol
 • Rules onchain: signals, credit event status, collateral, premiums and payouts are held and enforced by contracts.
-• Permissionless use: any wallet or contract can read the feed; any user can buy or sell protection; anyone can report or dispute an event by staking.
+• Permissionless use: any wallet or contract can read the feed; any user can buy or sell protection; anyone can propose a data verified event, or challenge any event or signal by posting a bond. Keepers and reporters are permissioned in v1 (Section 1.4a).
 • Composable outputs: risk scores and credit event flags are onchain data that lenders, wallets and auto switch tools can act on.
 • Survives the team: deployed contracts keep running and paying out without us.
 3.2 What it is
@@ -105,7 +108,7 @@ Yes, per issuer
 Yes, per issuer, onchain
 The Appendix lists prior art and what remains to verify.
 4. Architecture
-Three Soroban contracts form the protocol: the Risk Oracle turns public data into signals, the Credit Event Registry turns signals and reports into declared events, and Protection Markets pay out on those events.
+Three components form the protocol: the Risk Oracle turns public data into signals, the Credit Event Registry turns signals and reports into declared events, and Protection Markets pay out on those events. They are built as seven Soroban contracts: the three components (the markets as a factory plus one contract per series), a Staking contract that holds every bond and stake, a Treasury that holds protocol fees, slashed funds and reward pools, and a Governor (technical-doc.md Section 3.1).
 Only the shaded area is the protocol. Data sources, readers, reporters and traders are outside participants that anyone can join or replace.
 5. Anchor Risk Oracle
 The oracle publishes, per issued asset, a set of raw signals plus one open formula risk score. Raw signals come first: the score is a convenience, the signals are the truth.
@@ -115,7 +118,7 @@ What it measures
 Source
 Onchain verifiable?
 Peg deviation
-Time weighted price vs reference (e.g. USD, NGN rate)
+Time weighted price vs reference (e.g. USD, EUR or ARS rate), plus the 10th percentile price so one wick cannot move the score
 Stellar DEX and AMMs; reference FX feed
 Mostly (reference FX needs an oracle)
 Liquidity depth
@@ -147,59 +150,60 @@ Partly (signature yes, truth no)
 • Formula published in the repo and stored as a versioned parameter set onchain. Changes go through governance (Section 17).
 • Score bands: Normal, Watch, Warning, Distress. A band change emits an event that wallets and lenders can subscribe to.
 5.3 How data gets onchain
-• Onchain signals: a keeper computes from ledger data and posts, with the raw inputs hash; anyone can recompute and dispute.
-• Endpoint probes: at least 3 independent reporters probe each anchor from different regions and post signed results. Disagreement is resolved by majority, and persistent outliers lose stake.
-• Reference FX rates: taken from an existing oracle where available (Reflector, DIA, Band and others are on Stellar); which feeds cover NGN and other local currencies must be checked in Phase 0.
+• Ledger signals: a bonded, permissioned keeper computes from ledger data and posts, with the raw inputs hash; anyone can recompute and dispute. Keepers can backfill missed hours within the 72 hour window, so a short outage leaves no gap.
+• Endpoint probes: at least 3 independent reporters probe each anchor from different regions and post signed results. The status is whatever a strict majority reports, Degraded if there is no strict majority, and persistent outliers lose stake. Endpoint status only ever comes from reporters, never from a keeper.
+• Reference FX rates: taken from an existing oracle where available (Reflector, DIA, Band and others are on Stellar). Some currencies have two rates: the market (parallel) ARS rate has at times been more than double the official one, so every fiat reference names which one it uses, fixed in the event definition. Which feeds cover ARS and other local currencies, and on which basis, must be checked in Phase 0.
 5.4 Coverage at launch
-Start with 5 to 10 issued assets that have meaningful supply and an anchor willing to engage, across USD, EUR and at least two local currencies. Add assets by governance, with a minimum liquidity requirement.
+Start with 5 to 10 issued assets that have meaningful supply and an anchor willing to engage, across USD, EUR, ARS and at least one other local currency, chosen from the Phase 0 data pull (technical-doc.md Section 1.7). Add assets by governance, with a minimum liquidity requirement.
 6. Credit events
-A credit event is the objective, published condition that makes protection pay. Every market references exactly one event definition, fixed when the market opens, so buyers and sellers know the rules before they commit.
+A credit event is the objective, published condition that makes protection pay. Each issued asset has one canonical, versioned definition per event type, set by governance. A market pins the current version of every event type it covers when it opens, so buyers and sellers know the rules before they commit, and nobody can pick a friendlier definition for one buyer. Events of different types are tracked separately: a declared withdrawal halt never blocks a later depeg on the same asset.
 6.1 Event types
 Event
 Definition (draft)
 Tier
 Depeg
-Time weighted price below 0.95 of reference for 72 hours, with liquidity above a minimum
-1: onchain
+Time weighted price below 0.95 of reference for 72 hours, with up to 6 of the 72 hourly readings allowed missing, and liquidity above a minimum in the week before the 72 hours began
+1: data verified (keeper posted, publicly recomputable)
 Issuer freeze
-Issuer revokes authorization or claws back from more than X% of holders or supply within 7 days, outside a declared compliance action
-1: onchain
+Issuer revokes authorization or claws back from more than X% of holders or supply within 7 days, outside a declared compliance action. Only offered for issuers whose account flags allow revocation or clawback
+1: data verified (keeper posted, publicly recomputable)
 Mint without backing
 Supply rises more than Y% in 24 hours with no matching inflow
-1: onchain (flag), 3 to confirm
+1: data verified (keeper posted, publicly recomputable) (flag), 3 to confirm
 Withdrawal halt
-Withdrawals disabled or failing for 72 hours across at least 3 reporters
+Withdrawals disabled or failing for 72 hours, shown by reporter probes, user reported SEP-24 withdrawals stuck in pending, and the anchor's own statements where available. The least reliable event type
 2: reporters
 Insolvency or enforcement
 Public insolvency filing, licence revocation, or regulator order against the issuer
 3: committee
-X and Y are set per asset by governance before the market opens.
-6.2 Tier 1: onchain triggers
-A contract checks ledger data directly (prices, flags, supply). Anyone can call check_event(asset); if conditions hold, the event is proposed and a short challenge window (24 hours) opens for evidence of manipulation.
+X and Y are set per asset by governance before the market opens. The first build covers Depeg and Issuer freeze; Withdrawal halt, Insolvency and Mint without backing come in a later build phase (technical-doc.md Section 1.2).
+6.2 Tier 1: data verified triggers (keeper posted, publicly recomputable)
+Soroban contracts cannot read classic DEX books or account history directly, so bonded keepers post the ledger data (prices, liquidity, flags, supply) with a hash of their inputs, and anyone can recompute and dispute it. Anyone can call propose_tier1(asset, event type), which checks that data against the asset's current definition; if conditions hold, the event is proposed and a short challenge window (24 hours) opens for evidence of manipulation.
 6.3 Tier 2: staked reporters
-Reporters stake collateral to post a claim, for example "Anchor X withdrawals failing since ledger N." Anyone can dispute by staking. Unresolved disputes escalate to the committee. Reuse the existing Soroban Optimistic Oracle rather than building a new dispute system, if it fits after review.
+Reporters stake collateral to post a claim, for example "Anchor X withdrawals failing since ledger N." Anyone can dispute by staking. Unresolved disputes escalate to the committee. Withdrawal halt is the least reliable event type, because endpoints can fail without a halt and a halt can hide behind endpoints that still answer, so it is Tier 2 only and its evidence combines reporter probes, user submitted SEP-24 transactions stuck in pending beyond a threshold, and anchor cooperation where available. Reuse the existing Soroban Optimistic Oracle rather than building a new dispute system, if it fits after review.
 6.4 Tier 3: determinations committee
 • 5 to 7 named members from different organizations (ecosystem builders, risk professionals, at least one legal voice), none tied to the asset in question.
 • Decides only on Tier 3 events and escalated disputes; votes and reasons published onchain.
+• Must rule within 14 days of a dispute being escalated. If it does not, anyone can close the case with a fixed default: a challenged Tier 1 event is declared (the data already met the definition, so the challenger carries the burden of proof), and a Tier 2 or Tier 3 claim is rejected. All bonds are refunded on a timeout, and missed deadlines count against the committee and are grounds for rotation.
 • Members rotate yearly; conflicts must be declared.
 6.5 After an event
-1. Event declared with a ledger timestamp; new cover on that asset stops.
+1. Event declared with a ledger timestamp; new cover on that asset stops, and no new market opens on the asset until governance re-enables it.
 2. Settlement window opens (Section 7.5).
 3. A cure is possible only if the definition allows it (for example price back above 0.98 within the challenge window); after declaration there is no reversal.
 6.6 False positives and negatives
 • False positive (payout when no real failure): limited by long windows, multiple sources and the challenge period.
 • False negative (real failure, no payout): limited by multiple event types, so a freeze or halt can trigger even if the price holds.
 7. Protection markets
-Each market is a fully collateralized pool for one issued asset and one event definition: sellers lock USDC, buyers pay premiums, and the pool pays buyers automatically if the event is declared.
+Each market is a fully collateralized pool for one issued asset and a fixed set of event definitions: sellers lock USDC, buyers pay premiums, and the pool pays buyers automatically if a covered event is declared.
 7.1 Market terms (fixed at opening)
 Term
 Example
 Reference asset
-NGN token issued by Anchor X
+ARS token issued by Anchor X
 Events covered
-Depeg, issuer freeze, withdrawal halt, insolvency
+Depeg and issuer freeze in the first build (withdrawal halt and insolvency later), each pinned to its current definition version
 Settlement asset
-USDC
+USDC; never the reference asset itself or another asset from the same issuer
 Term
 30 or 90 days, rolling series
 Payout type
@@ -213,34 +217,39 @@ Capped by liquidity depth (Section 8)
 7.3 Buyers
 • Choose amount of cover and term; pay the full premium upfront in USDC.
 • Receive a transferable protection token for that series.
-• No need to hold the reference asset (see legal note in Section 11 on whether to require it).
+• No need to hold the reference asset (see legal note in Section 11 on whether to require it). Where a market does require it, the holding is valued in USD at the current peg and FX rate.
+• No buying into a failure already under way: cover cannot be bought while any hourly price in the last 72 hours was below the depeg threshold, endpoints were down or degraded during the halt window, the issuer clawed back or revoked in the last 7 days, or any event is in progress.
 7.4 Pricing (v1)
 Sellers post rates (annual % of cover) in an order book; buyers take the cheapest available. No pricing model is trusted at launch. A model based reference rate is published from oracle data once enough history exists.
 7.5 Settlement
 • Event declared: each protection token redeems for its cover amount in USDC from the pool, during a 30 day claim window; sellers' collateral covers it.
-• No event by expiry: sellers withdraw collateral plus premiums; protection tokens expire worthless.
+• Which events count: an event covers a market if the failure started during the term. Because a depeg needs 72 hours of data before it can be proposed, a proposal is still accepted up to one event window (72 hours for a depeg) after expiry, and the market waits in a pending state meanwhile. A depeg that starts on day 88 of a 90 day market therefore still pays.
+• No event by expiry: once that waiting period ends, sellers withdraw collateral plus premiums; protection tokens expire worthless.
 • Cash only: no delivery of the failed token, because a frozen or clawed back token may not be transferable.
 7.6 Contract interfaces (draft)
-fn open_series(env, asset: Address, event_def: BytesN<32>, term: u32, cap: i128) -> SeriesId;
-fn deposit_collateral(env, seller: Address, series: SeriesId, amount: i128) -> i128; // share tokens
-fn quote(env, seller: Address, series: SeriesId, rate_bps: u32, amount: i128);
-fn buy_cover(env, buyer: Address, series: SeriesId, amount: i128, max_rate_bps: u32) -> i128; // protection tokens
-fn claim(env, holder: Address, series: SeriesId) -> i128;
-fn withdraw(env, seller: Address, series: SeriesId) -> i128;
-fn event_status(env, asset: Address) -> EventStatus; // from the Credit Event Registry
+fn open_series(env, terms: SeriesTerms) -> Address; // terms pin one definition version per covered event type
+fn deposit(env, seller: Address, amount: i128); // on the series contract
+fn quote(env, seller: Address, rate_bps: u32, available: i128);
+fn buy_cover(env, buyer: Address, amount: i128, max_rate_bps: u32) -> (i128, i128); // (filled, premium)
+fn claim(env, holder: Address, amount: i128) -> i128;
+fn withdraw(env, seller: Address, amount: i128) -> i128;
+fn event_status(env, asset: Address, kind: EventKind) -> AssetEventStatus; // from the Credit Event Registry, per asset and event type
+The full reference is technical-doc.md Section 12.
 7.7 Fees
-A small protocol fee on premiums (target 5 to 10% of premium, set by governance) funds oracle reporters, the committee and maintenance. No fee on collateral or payouts.
+A small protocol fee on premiums (target 5 to 10% of premium, set by governance) is paid into the protocol Treasury contract, which funds keeper and reporter rewards, the committee and maintenance. Slashed bonds also go to the Treasury. No fee on collateral or payouts.
 8. Pricing and risk limits
 The single biggest design risk is manipulation: on a thin market, a protection buyer can push the price down to trigger their own payout. Every limit below exists to make that unprofitable.
 8.1 Manipulation defences
 Defence
 How it works
 Long windows
-Depeg requires 72 hours below threshold, not a single trade
+Depeg requires 72 hours below threshold, not a single trade; the score uses the 10th percentile price, so one wick cannot move a band
 Multiple sources
 Price must break on Stellar DEX, AMMs and an external reference where one exists
 Liquidity floor
-Depeg only counts while depth near peg stays above a minimum; an empty book cannot trigger
+Depeg only counts if depth near peg was above a minimum in the week before the 72 hours began, so a book that was always empty cannot trigger. A collapse in depth during the failure is itself a warning signal, never a reason to block a payout
+No informed buying
+Cover cannot be bought while a failure signal is already present (Section 7.3), and an event only covers markets whose term contains the start of the failure
 Cover cap
 Total open cover per asset is capped at a fraction of measured liquidity depth (start at 25%), so pushing the price costs more than the payout
 Challenge window
@@ -282,7 +291,7 @@ Anchor
 Engages with the protocol, publishes attestations
 A public, verifiable safety signal
 9.1 Buyer journey
-1. NGO treasurer holds 50,000 USD worth of an NGN token for local payouts.
+1. NGO treasurer holds 50,000 USD worth of an ARS token for local payouts.
 2. Opens the Anchorline app, sees the issuer's score (Normal, 18/100) and its signals.
 3. Buys 90 days of cover for 20,000 USD at the best quoted rate, paying the premium in USDC.
 4. Holds a protection token in their wallet.
@@ -307,11 +316,11 @@ False reports
 Reporter claims a halt that did not happen
 Staked reporters, majority of 3+, disputes, slashing
 Committee capture
-Members collude on a ruling
-Diverse members, conflict rules, public reasons, rotation; only Tier 3 events
+Members collude on a ruling, or never rule
+Diverse members, conflict rules, public reasons, rotation; only Tier 3 events and escalated disputes; a 14 day ruling deadline with a fixed default outcome
 Oracle keeper failure
 Feed stops updating
-Anyone can post signals with inputs hash; staleness flag pauses new cover
+Several bonded keepers can post and backfill missed hours; anyone can recompute and dispute; staleness flag pauses new cover
 Contract bug drains collateral
 Accounting error in claims
 Isolated pools, invariant tests, fuzzing, audit via the SCF Audit Bank before mainnet
@@ -327,7 +336,7 @@ Definitions fixed per series; changes apply only to new series, with a timelock
 10.1 Process
 • Threat model and monitoring plan delivered at Tranche #2 (SCF requires both at that tranche).
 • Monitoring: alerts on score band changes, stale feeds, reporter disagreement, unusual cover purchases before price moves, and pool invariant breaks.
-• Audit through the SCF Audit Bank before mainnet. Not in the award budget.
+• Audit through the SCF Audit Bank before mainnet, covering all seven contracts.
 • SECURITY.md, disclosure process, and a bug bounty once mainnet collateral is meaningful.
 11. Legal and compliance plan
 The protection market is likely a derivative or insurance product in most jurisdictions, so mainnet launch of the market is gated on a legal opinion. This section lists the questions to answer; it is not legal advice.
@@ -358,8 +367,6 @@ Fairness and dispute path for named companies
 2. Mainnet: risk feed and credit event registry (data only).
 3. Mainnet: protection markets, only after a written legal opinion and with the restrictions it requires.
 The SCF Handbook says some projects may get a modified tranche structure or a testnet only deployment due to jurisdiction. Raise this with the SCF team early rather than at review.
-11.4 Cost
-Budget a separate $15K to $40K for legal opinions (estimate, to confirm with counsel). Whether SCF budgets may include legal costs is an open question to ask the SCF team; this PRD assumes they are funded separately.
 12. Integrations and ecosystem
 The protocol succeeds when other projects read its feed and route users to its markets, so integrations target readers and liquidity, not only end users.
 Role
@@ -423,7 +430,7 @@ Contracts reading the feed
 Calls to oracle getters
 Composability
 Independent reporters active
-Reporter stakes
+Staking contract
 Decentralization of data
 Unique buyers and sellers
 Positions
@@ -438,7 +445,7 @@ If the legal opinion restricts mainnet markets, the fallback target is feed adop
 All contract ids registered at award; a public dashboard shows every metric; team or related party positions are flagged and excluded.
 14. Pre SCF roadmap
 Legal scoping comes first and partners come before the application, because those decide whether the protocol can launch at all.
-Week numbers are relative to the start of Phase 0; the SCF #47 deadline is still to be confirmed. Failing a gate triggers the kill criteria in Section 18.
+Week numbers are relative to the start of Phase 0; the SCF #47 deadline is still to be confirmed. Failing a gate triggers the kill criteria in Section 18. Phase 0 includes a mainnet data pull of candidate assets (USD, EUR, ARS and others) with liquidity, trade history and issuer flags, which decides the launch assets and whether the cover cap is meaningful (technical-doc.md Section 1.7).
 15. SCF Open Track alignment and tranche plan
 Anchorline fits the Open Track's "novel protocols or primitives that solve for key ecosystem needs": it is new on Stellar, fully onchain, and built for others to use. Tranches follow SCF's 10 / 20 / 30 / 40 split and end at mainnet.
 15.1 Open Track checklist
@@ -479,11 +486,11 @@ Award acceptance
 n/a
 #1 MVP
 20%
-Risk oracle with onchain signals for 5+ assets; credit event registry with Tier 1 triggers; protection pools on testnet; web app alpha
+Risk oracle with keeper posted, recomputable signals for 5+ assets; credit event registry with Tier 1 triggers for Depeg and Issuer freeze on canonical definitions; protection pools on testnet; web app alpha
 Testnet contract ids, public feed, test suite, demo video
 #2 Testnet
 30%
-Tier 2 reporters and disputes; committee process; endpoint probes; seller order book; manipulation limits; threat model and monitoring plan; Audit Bank application; legal scoping
+Tier 2 reporters and disputes; committee process with ruling deadline; endpoint probes; seller order book; manipulation limits; threat model and monitoring plan
 Testnet trials with real buyers and sellers, dispute drill, threat model doc
 #3 Mainnet
 40%
@@ -492,7 +499,6 @@ Mainnet contract ids, dashboard over the agreed window
 Each tranche is submitted within 90 days of the previous payment. Notify the SCF team before any deadline that will slip.
 15.3 Questions to ask the SCF team before applying
 • Is a protection market acceptable in the Open Track, and under what jurisdiction conditions?
-• Can legal costs be part of the budget?
 • Would they accept the fallback Tranche #3 metric if markets are restricted to testnet?
 16. Budget
 Draft ask: $145K in XLM, close to the $150K lifetime cap per project, reflecting the full protocol scope. Figures are placeholders until team size and rates are set.
@@ -527,8 +533,6 @@ Total
 145,000
 
 16.1 Not in the budget
-• Security audit: SCF Build budgets exclude audit costs; contracts go through the SCF Audit Bank.
-• Legal opinions: $15K to $40K estimated, funded separately unless the SCF team confirms otherwise.
 • Seed liquidity: collateral for first pools comes from partners, never from award funds.
 • Marketing, incentives, liquidity mining: none; they would also distort the metrics.
 16.2 Sizing note
@@ -544,25 +548,31 @@ Multisig, later token or delegate governance
 Minimum liquidity rule; 7 day notice
 Event definitions for new series
 Multisig with risk advisor sign off
-Never applies to open series
+One canonical version per asset and event type; never applies to open series; a new version is registered only after markets on the old one have ended
 Score formula version
 Multisig
 Published diff; old version kept for history
 Protocol fee
 Multisig
 Capped (e.g. 10% of premium)
+Treasury allocation and spending
+Multisig
+Timelocked; only protocol fees and slashed funds, never collateral, bonds or stakes
 Committee membership
 Multisig plus committee
-Yearly rotation; conflicts declared
+Yearly rotation; conflicts declared; missed ruling deadlines are grounds for rotation
 Contract upgrades
 Multisig (team + external signers)
-7 day timelock; pools isolated
+14 day timelock; pools isolated; market contracts never upgraded
 17.2 Decentralization path
+In v1 the trust root for payouts is the permissioned, bonded keepers plus the 4 of 7 committee (Section 1.4a). The path away from it:
 1. Testnet and early mainnet: team multisig with at least 2 external signers.
-2. After 12 months: move parameter control to a broader council (anchors, readers, sellers).
-3. Freeze core pool contracts; new versions deploy alongside, users choose.
+2. Later versions: open keeper and reporter registration with higher stakes, instead of governance approval.
+3. Later versions: onchain verifiable signal disputes, replacing committee recomputation where the data can be proven onchain.
+4. After 12 months: move parameter control to a broader council (anchors, readers, sellers).
+5. Freeze core pool contracts; new versions deploy alongside, users choose.
 17.3 Sustainability
-• Protocol fee on premiums pays reporters, committee and maintenance.
+• Protocol fee on premiums goes to the Treasury contract and pays keeper and reporter rewards, the committee and maintenance.
 • The risk feed is a public good and can seek the SCF Public Goods Award (up to $50K per quarter, invitation only).
 • Code Apache-2.0; formula and event definitions public.
 17.4 If the team stops
@@ -657,16 +667,14 @@ Cover against stablecoin or protocol failure
 Concept exists elsewhere; not for Stellar anchors
 B. Open questions
 [ ] Is the name "Anchorline" free (projects, domains, npm)?
-[ ] Which oracles provide NGN and other local currency reference rates on Stellar?
-[ ] Which issued assets have enough supply and liquidity to cover at launch?
+[ ] Which oracles provide ARS and other local currency reference rates on Stellar, and do they publish the official rate, the market rate, or both?
+[ ] Which issued assets have enough supply and liquidity to cover at launch? (Phase 0 data pull, technical-doc.md Section 1.7)
 [ ] Legal classification in target jurisdictions (Section 11.1)
-[ ] Can SCF budgets include legal costs?
 [ ] Does SCF accept a protection market in the Open Track, and on what conditions?
 [ ] Who joins as risk or quant advisor, and who sits on the first committee?
 [ ] Does the Soroban Optimistic Oracle fit Tier 2 after a technical review?
 [ ] SCF #47 deadline date?
 C. Sources
 • SCF Handbook: Open Track
-• SCF Handbook: Integration Track (budget exclusions)
 • SCF Handbook: Public Goods Award
 • SCF Handbook: Welcome and changelog
