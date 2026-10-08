@@ -1,0 +1,64 @@
+# Anchorline mainnet configuration. technical-doc.md Section 22.3.
+# Contract ids are filled in by deploy.sh after each deployment step
+# (Section 22.2) and recorded in deployments/mainnet.json.
+#
+# Mainnet protection markets are additionally gated on a written legal
+# opinion (PRD Section 11.3); do not open series here before that exists.
+
+network = "mainnet"
+rpc_url = "https://soroban-rpc.mainnet.stellar.org"
+passphrase = "Public Global Stellar Network ; September 2015"
+
+[contracts]
+governor = ""
+risk_oracle = ""
+event_registry = ""
+reporter_staking = ""
+market_factory = ""
+series_wasm_hash = ""
+
+[tokens]
+usdc = ""
+
+[adapters]
+amm_soroswap = ""
+fx_reference = ""
+optimistic_oracle = ""
+
+# Defaults per technical-doc.md Section 23. Values are starting points to
+# revisit with testnet data; changes after launch go through the Governor.
+[params]
+epoch_secs = 3_600
+window_secs = 259_200
+signal_dispute_secs = 7_200
+signal_dispute_bond = 1_000_0000000      # 1,000 USDC, 7 decimals
+stale_after_epochs = 3
+amm_tolerance_bps = 300
+keeper_bond = 5_000_0000000
+keeper_slash = 1_000_0000000
+keeper_max_faults = 3
+keeper_reward = 5_000_000                # 0.50 USDC
+band_down_epochs = 3
+probe_secs = 900
+degraded_ms = 5_000
+min_reporters = 3
+reporter_stake = 1_000_0000000
+reporter_max_faults = 10
+reporter_slash_bps = 1_000
+depeg_threshold = 9_500_000              # 0.95, SCALE 1e7
+depeg_window_secs = 259_200
+halt_window_secs = 259_200
+challenge_secs = 86_400
+cure_threshold = 9_800_000               # 0.98, SCALE 1e7
+claim_bond = 2_000_0000000
+challenge_multiplier = 1
+cooldown_secs = 604_800
+liquidity_cover_ratio = 2_500_000        # 0.25, SCALE 1e7
+max_series_per_asset = 4
+min_deposit = 100_0000000
+max_quotes = 64
+sale_cutoff_secs = 259_200
+claim_window_secs = 2_592_000
+fee_bps = 750
+max_pause_secs = 1_209_600
+grace_secs = 1_209_600

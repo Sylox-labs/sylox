@@ -1,0 +1,19 @@
+#![no_std]
+
+//! Shared types for the Anchorline protocol, imported by every contract so
+//! encodings never drift between them. See technical-doc.md Section 4.
+
+pub mod assets;
+pub mod events;
+pub mod governance;
+pub mod score;
+pub mod series;
+
+pub use assets::*;
+pub use events::*;
+pub use governance::*;
+pub use score::*;
+pub use series::*;
+
+/// Fixed point scale for prices and ratios (1e7). See technical-doc.md Section 1.4.
+pub const SCALE: i128 = 10_000_000;
