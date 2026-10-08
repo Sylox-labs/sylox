@@ -1,6 +1,40 @@
 # Sylox Protocol: Technical Documentation
 
-Version: v1.1 draft, October 8, 2026 · Author: David Ejere
+Version: v1.2 draft, October 8, 2026 · Author: David Ejere
+
+## Changelog v1.2
+
+Every change from v1.1, driven entirely by building `RiskOracle` (PR #2) and documenting the approved deviations it surfaced. No code changes in this revision; `RiskOracle` is already built and merged to match what is documented here.
+
+**ADR-007 Event topic convention**
+
+- Every event's topics are `("sylox", <event_name>, <primary key>)`, three topics, not the v1.1 `("sylox", <contract>, <event>, <primary key>)`, four: `soroban-sdk`'s `#[contractevent]` macro cannot emit more than 2 custom prefix topics (a hard XDR schema limit). Applies to every contract, not only `RiskOracle`. Sections 13.
+
+**ADR-008 Per-epoch independent finality**
+
+- Finality is per epoch and fully independent: no epoch's state can block any other epoch from becoming Final. The newest Final epoch is found by scanning backward across the full backfill window on every state changing call, not by a cursor that advances one epoch at a time and stops at the first non Final epoch. Sections 5.7, 5.8, 8.2, 12.1.
+- A missing, Disputed or still Pending epoch inside an aggregate window is excluded from its sum or percentile, never counted as zero, and never blocks the aggregate itself. Sections 5.8, 6.5.
+- `signals_final` fires per epoch the first time it is observed Final, tracked by a one byte `final_announced` flag added to the packed ring slot (layout version 2); it can arrive out of epoch order. Sections 5.7, 5.8, 13, 13.1, 15.1.
+- New reads `is_final(asset, epoch)` and `effective_window(asset, start_epoch, count)`. Sections 12.1.
+
+**ADR-009 asset_stale as a transition event**
+
+- `asset_stale` fires once per transition into stale, not once per newly observed epoch that happens to already be stale: the original design never fired for the realistic "keepers stopped posting" case. Sections 5.5, 13, 13.1.
+- New permissionless `check_stale(asset) -> bool`, judged against the stored score's own epoch; a monitor calls it for every asset once per epoch. Sections 12.1, 22.4.
+- `is_stale(asset)` and `score(asset).stale`/`check_stale(asset)` remain two different signals, judged against different epochs; documented explicitly so an integrator does not read one as a substitute for the other. Section 5.5.
+
+**Other RiskOracle corrections, confirmed against the built contract**
+
+- `genesis = 0` (Unix epoch): epoch numbering is a pure function of ledger time, with no stored genesis. Section 5.2.
+- `epoch_secs` and the ring buffer's 240 slot size are frozen for v1, removed from the Section 23 governance parameter table: changing either needs a ring re-encoding migration, not a parameter change. Sections 5.8, 23.
+- Packed ring layout confirmed and measured: 112 bytes per slot, 26,889 bytes total including its 9 byte header, 41% of `contract_data_entry_size_bytes`; write cost 1.89M CPU instructions and 28,012 write bytes (21.2% of `tx_max_write_bytes`) against a full ring. No paging fallback needed. Sections 5.8, 15.3.
+- A new asset with fewer than 168 posted epochs reads as stale (not enough history for the 7 day baseline every score component needs), independent of recency based staleness. Section 5.5.
+- `Reference::Asset` is rejected by `add_asset` and `update_asset` in v1 (`ReferenceNotSupported`): no USD rate is defined anywhere in this spec for an asset pegged reference. Sections 4.1, 14.
+- `set_event_in_progress(asset, in_progress)`, registry authed, pushed by `EventRegistry` while any event is Proposed, Challenged or Escalated: forces the band to at least Distress as a read time floor, never written into the stored `RiskScore`, so clearing it cannot be mistaken for a new epoch of hysteresis evidence. Sections 6.3, 6.5, 8.1, 12.1, 15.1, 16.1.
+- `peg_ratio_p10` for component P and the Depeg check is computed onchain from the ring's `peg_ratio` history, not trusted from the keeper's posted `SignalSet.peg_ratio_p10` field (kept for recomputation and audit only). A single epoch's wick inside the window cannot move the band through P. Sections 4.1, 5.1, 6.5.
+- An overturned epoch's `Signals` entry moves to history (`Overturned(asset, epoch)`) so the epoch can be reposted, confirmed against the built contract. Sections 5.2, 15.1.
+- `AggregationFailed` (110) and `ReferenceNotSupported` (111) added to the RiskOracle error range; `Unauthorized` (3) documented as unreachable in `RiskOracle`, since every auth check goes through Soroban's native `require_auth()` rather than returning it. Section 14.
+- Section 12.1's RiskOracle API, Section 15.1's storage keys, and Section 12.3's note on the `Staking` interface `RiskOracle` actually calls, all updated to match the built contract exactly, including the still open gaps (`reward_keeper` declared but never called; no keeper side bond lock) carried into Section 24.2 rather than silently resolved.
 
 ## Changelog v1.1
 
@@ -345,7 +379,7 @@ pub struct IssuerFlags {
 pub enum Reference {
     Usd,                           // 1 unit = 1 USD
     Fiat(Symbol, FxRateSource),    // ISO 4217 code and rate basis, priced via FxAdapter
-    Asset(Address),                // pegged to another onchain asset
+    Asset(Address),                // pegged to another onchain asset; rejected by RiskOracle's add_asset/update_asset in v1 (ReferenceNotSupported, Section 14): no USD rate is defined anywhere in this spec for an asset pegged reference
 }
 
 #[contracttype]
@@ -356,7 +390,7 @@ pub struct SignalSet {
     pub epoch: u64,
     pub posted_at: u64,            // ledger timestamp
     pub peg_ratio: i128,           // TWAP price / reference, SCALE 1e7
-    pub peg_ratio_p10: i128,       // 10th percentile of the window's volume weighted prices / reference, SCALE 1e7
+    pub peg_ratio_p10: i128,       // keeper posted, for recomputation/audit only: RiskOracle computes its own peg_ratio_p10 onchain from the ring's peg_ratio history for component P and the Depeg check (Section 6.5)
     pub liquidity_2pct: i128,      // depth within 2% of peg, USDC units
     pub redemption_net: i128,      // net burned minus issued this epoch, asset units
     pub supply: i128,              // total circulating supply from ledger asset stats, asset units
@@ -540,7 +574,7 @@ The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by 
 
 | Signal | Computed from | How it is verified |
 | --- | --- | --- |
-| `peg_ratio`, `peg_ratio_p10` | Trades on the classic DEX and classic AMM pools for the asset against USDC and XLM, over the window, volume weighted; divided by the reference rate on the asset's `FxRateSource` basis (Section 4.1). `peg_ratio_p10` is the 10th percentile of the volume weighted price series in the window | Recompute from Horizon or RPC trade history; onchain cross check against `PriceAdapter`s where present |
+| `peg_ratio`, `peg_ratio_p10` | Trades on the classic DEX and classic AMM pools for the asset against USDC and XLM, over the window, volume weighted; divided by the reference rate on the asset's `FxRateSource` basis (Section 4.1). `peg_ratio_p10` is the 10th percentile of the volume weighted price series in the window, kept on `SignalSet` for recomputation and audit; `RiskOracle` itself computes its own `peg_ratio_p10` for component P from the ring's `peg_ratio` history onchain, not from this field (Section 6.5) | Recompute from Horizon or RPC trade history; onchain cross check against `PriceAdapter`s where present |
 | `liquidity_2pct` | Classic order book offers and pool reserves within 2% of peg, valued in USDC | Recompute from a ledger snapshot at the epoch's closing ledger |
 | `redemption_net` | Payments to and from the issuer account and burns, from ledger operations and SAC events | Recompute from ledger history |
 | `supply` | Keeper posted from ledger asset stats at the epoch's closing ledger | Recompute from ledger history. SEP-41 tokens expose no `total_supply` function, so this cannot be cross checked onchain |
@@ -549,7 +583,7 @@ The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by 
 
 ### 5.2 Epochs
 
-- Epoch length per asset: `epoch_secs` (default 3,600). Epoch `n` covers `[genesis + n * epoch_secs, genesis + (n + 1) * epoch_secs)`.
+- Epoch length: `epoch_secs`, frozen at 3,600 for v1 (Section 23). Epoch `n` covers `[n * epoch_secs, (n + 1) * epoch_secs)`, measured from the Unix epoch (`genesis = 0`): epoch numbering is a pure function of ledger time, the same for every asset, with no stored genesis to initialize or keep synchronized across contracts.
 - One accepted `SignalSet` per asset per epoch. Later postings for the same epoch are rejected unless the first is overturned by a dispute, which reopens the epoch for reposting.
 - Windowed signals (peg TWAP, `peg_ratio_p10`) look back `window_secs` (default 72 hours) ending at the epoch close.
 - **Backfill:** a keeper may post any epoch that closed inside the current `window_secs` and is not yet Final. A keeper outage therefore leaves no gap if keepers catch up within the window, and an overturned epoch is reposted rather than becoming a gap.
@@ -566,13 +600,15 @@ The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by 
 - Anyone calls `dispute_signals(asset, epoch, alt_hash)` with a hash of their own inputs bundle. `RiskOracle` records the dispute and has `Staking` lock a bond of `signal_dispute_bond` USDC from the disputer under `BondKey::SignalDispute(asset, epoch)`.
 - A dispute does not reset any window. The disputed epoch stays non final (Pending in the sense of Section 5.7, `Disputed` in its ring slot) until resolved; if overturned it reopens for reposting (Section 5.2).
 - The dispute is decided by the committee multisig in v1 (a recomputation is deterministic, so the committee runs the open source recomputation tool on both bundles). Moving this to onchain verifiable recomputation is on the decentralization path (Section 1.6).
-- Loser forfeits: 50% to the winner, 50% to the `Treasury`. If the keeper wins, `RiskOracle` instructs `Staking` to forfeit the disputer's bond to the keeper. If the disputer wins, `RiskOracle` instructs `Staking` to release the disputer's bond and slash the keeper by `keeper_slash` with the disputer as winner; `Staking` suspends a keeper after `keeper_max_faults`.
+- Loser forfeits: 50% to the winner, 50% to the `Treasury`. If the keeper wins, `RiskOracle` instructs `Staking` to forfeit the disputer's bond to the keeper. If the disputer wins, `RiskOracle` instructs `Staking` to release the disputer's bond and slash the keeper by `keeper_slash` with the disputer as winner; `Staking` suspends a keeper after `keeper_max_faults`. `resolve_signal_dispute`'s own `reason` argument is accepted but not persisted by `RiskOracle` and not forwarded to `Staking.slash` (which always receives a zero filled reason from this call site); a committee ruling's actual reason lives only in whatever offchain record the committee publishes, not onchain.
 
 ### 5.5 Staleness
 
-- An asset is **stale** if no `SignalSet` has been accepted for `stale_after_epochs` (default 3) epochs.
+- An asset is **stale** if the risk score has not been computed from a Final epoch within `stale_after_epochs` (default 3) epochs of the current one. A brand new asset with fewer than 168 posted epochs (the 7 day baseline every score component needs, Section 6.5) also reads as stale, even while actively posting: there is not yet enough history to compute a trustworthy score at all, which is a different condition from "the data has gone old" but uses the same `stale` field, since nothing else in this spec distinguishes them.
+- Two different reads can disagree about whether an asset is stale, by design: `is_stale(asset)` judges against the newest *posted* epoch; `score(asset).stale` and `check_stale(asset)` both judge against the *stored score's own epoch* (ADR-009). An asset whose finality has stalled behind a gap (ADR-008) can keep posting fresh epochs while its score stays frozen on an old one; `is_stale` alone would miss this, `score().stale` and `check_stale` catch it. Prefer `check_stale`/`score().stale` wherever "is this asset's risk data current" is the actual question.
 - While stale: `RiskScore.stale = true`; `MarketFactory` blocks new series and `Series` blocks new cover on that asset; existing cover is unaffected.
 - Staleness never triggers a credit event by itself.
+- `asset_stale` is emitted once per transition into stale, not once per epoch spent stale (ADR-009); `check_stale(asset)` is the permissionless call that actually detects and announces the transition, called once per epoch for every asset by the monitor (Section 22.4).
 
 ### 5.6 Keepers
 
@@ -582,7 +618,9 @@ The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by 
 
 ### 5.7 Signal lifecycle
 
-Every epoch's `SignalSet` moves through the same states, independent of every other epoch. `Final` is a precondition for a Tier 1 credit event check (Section 8.2); a signal that is still `Pending` or `Disputed` cannot count toward one. A dispute never resets a window: the disputed epoch simply stays non final until resolved.
+Every epoch's `SignalSet` moves through the same states, independent of every other epoch: no epoch's state can block another epoch from becoming Final (ADR-008). `Final` is a precondition for a Tier 1 credit event check (Section 8.2); a signal that is still `Pending` or `Disputed` cannot count toward one. A dispute never resets a window: the disputed epoch simply stays non final until resolved, and does not prevent any later epoch on the same asset from reaching Final.
+
+The newest Final epoch is found by scanning backward from the newest posted epoch, across the full backfill window, on every state changing call (ADR-008); a missing, Disputed, or still Pending epoch anywhere in that range is skipped, never a reason to stop. `signals_final` fires for an epoch the first time it is observed Final, tracked by a per-slot `final_announced` flag (Section 5.8); because a single scan can discover several epochs Final at once, and a backfilled epoch can become Final later than a newer epoch posted on time, `signals_final` events can arrive out of epoch order (Section 13.1).
 
 ```mermaid
 stateDiagram-v2
@@ -620,9 +658,9 @@ sequenceDiagram
   Oracle-->>Keeper: signals_posted event
 
   alt no dispute within signal_dispute_secs
-    Oracle->>Oracle: state = Final (anyone can call, or lazily on next read)
+    Oracle->>Oracle: effectively Final once signal_dispute_secs elapses; observed and announced by the backward scan on the next state changing call for this asset (ADR-008)
     Oracle->>Staking: reward_keeper(keeper)
-    Oracle-->>Keeper: signals_final event
+    Oracle-->>Keeper: signals_final event (once, when first observed Final)
   else disputed
     Disputer->>Oracle: dispute_signals(asset, epoch, alt_hash)
     Oracle->>Staking: lock_bond(SignalDispute(asset, epoch), disputer, signal_dispute_bond)
@@ -648,11 +686,12 @@ Note on the sequence above: the forfeiture rule in Section 5.4 is symmetric by r
 
 Tier 1 checks (Section 8.2), the cover gate (Section 9.4) and the 24 hour and 7 day score aggregates (Section 6.5) all read one entry per asset: `Ring(asset)`, a ring buffer of `RingSlot`s (Section 4.1), one slot per epoch. They never read the 72 or more separate `Signals(asset, epoch)` entries a window spans.
 
-- **Size:** 240 slots at the default `epoch_secs`, which is 10 days: the longest v1 depeg window (72 hours) plus the 7 day liquidity baseline before it (Section 8.2). The 24 hour and 7 day aggregates use the newest 168 slots.
-- **Per slot finality flag:** `post_signals` writes the slot as `Pending` with `pending_until = posted_at + signal_dispute_secs`; a reader treats a `Pending` slot past `pending_until` as Final without a write. `dispute_signals` sets `Disputed`; a resolution sets `Final`, or `Empty` when overturned so the epoch can be reposted. A slot whose stored `epoch` is not the epoch expected at that position is treated as `Empty`.
-- **Missing epochs:** an `Empty` slot, or one still `Pending` or `Disputed` when a check runs, is missing. Missing epochs count neither for nor against a Depeg; at most `max_missing_epochs` of them are tolerated (Section 8.2).
-- **Encoding:** slots are stored packed as fixed width fields (about 120 bytes per slot, so about 29 KB for 240 slots). The `ring(asset)` read returns them decoded as `Vec<RingSlot>`. Storing each slot as a `contracttype` map with field names would be several times larger.
-- **Write cost:** one ring write per accepted posting, plus the `Signals(asset, epoch)` entry kept for 30 days of direct history (Section 15.2). Rewriting a 29 KB entry every epoch is the dominant cost of `post_signals`, so it must be benchmarked in the first week of the `RiskOracle` build. Fallback if it is too expensive: page the ring into entries of 24 slots each (one day per entry), so a posting rewrites one page and a 72 hour check reads 3 pages plus 7 for the baseline (Section 15.3).
+- **Size:** 240 slots, frozen for v1 alongside `epoch_secs` (Section 23), which is 10 days: the longest v1 depeg window (72 hours) plus the 7 day liquidity baseline before it (Section 8.2). The 24 hour and 7 day aggregates use the newest 168 slots.
+- **Per slot finality flag:** `post_signals` writes the slot as `Pending` with `pending_until = posted_at + signal_dispute_secs`; a reader treats a `Pending` slot past `pending_until` as Final without a write. `dispute_signals` sets `Disputed`; a resolution sets `Final`, or `Empty` when overturned so the epoch can be reposted. A slot whose stored `epoch` is not the epoch expected at that position is treated as `Empty`. The newest Final epoch is found by scanning backward across the full backfill window on every state changing call (ADR-008), never by a cursor that depends on any other epoch's state.
+- **Missing epochs:** an `Empty` slot, or one still `Pending` or `Disputed` when a check runs, is missing. Missing epochs count neither for nor against a Depeg (Section 8.2) nor against the score's own aggregates (Section 6.5): a missing epoch's contribution to a sum is 0 and uncounted, and a missing epoch is excluded from `peg_ratio_p10`'s percentile input entirely, not treated as present with some default value.
+- **`final_announced` flag:** one byte per slot (layout version 2) marking whether `signals_final` has already been emitted for that epoch, so the backward scan never re-announces the same epoch. Set `true` only when a scan or a resolution first observes the epoch Final; reset to unannounced on a repost after an overturn. Not part of the `RingSlot` shape `ring(asset)` returns; it is bookkeeping for event emission, not signal data.
+- **Encoding:** slots are stored packed as fixed width fields, no field names: 112 bytes per slot (106 used, padded for fixed offsets), plus a 9 byte header (layout version, slot count, slot width) validated on every read, 26,889 bytes for a full 240 slot ring. Measured against a naive `Vec<RingSlot>` using the SDK's own `#[contracttype]` derive (which encodes a struct as an XDR map of named fields): about 440 bytes per slot, 105,732 bytes for 240 slots, 61% over `contract_data_entry_size_bytes` (65,536). The packed encoding is required to fit at all; it is not achievable by storing the existing `RingSlot` type directly, only by hand (de)serializing it. The `ring(asset)` read still returns `Vec<RingSlot>` to callers; only the persisted representation is packed.
+- **Write cost:** one ring write per accepted posting, plus the `Signals(asset, epoch)` entry kept for 30 days of direct history (Section 15.2). Measured against a full 240 slot ring: 1,891,655 CPU instructions (0.47% of `tx_max_instructions`), 28,012 bytes written (21.21% of `tx_max_write_bytes`, the binding constraint, though still well under it). The packed single entry design fits with headroom; no paging fallback is needed.
 
 ## 6. Risk score
 
@@ -668,7 +707,7 @@ Let `clamp(x) = min(max(x, 0), 1)`. All divisions are fixed point with `SCALE = 
 | Endpoint health | E | Up 0, Unknown 30, Degraded 50, Down 100 |  |
 | Redemption pressure | R | 100 × clamp(redemption\_net\_24h / (supply × r\_max)) | r\_max = 0.10 |
 | Issuer actions | I | 100 × clamp(clawback\_amount\_7d / (supply × c\_max) + auth\_revocations\_7d / k\_max) | c\_max = 0.01, k\_max = 20 |
-| Liquidity | L | 100 × clamp(1 − liquidity\_2pct / L\_target) | L\_target per asset |
+| Liquidity | L | 100 × clamp(1 − liquidity\_2pct / L\_target) | L\_target per asset; v1 uses `AssetConfig.min_liquidity` as `L_target` (no separate `l_target` field exists yet; open item, Section 24.2) |
 | Supply shock | S | 100 × clamp(\|supply\_change\_24h\_bps\| / s\_max\_bps) | s\_max\_bps = 2,000 |
 
 ### 6.2 Combined score
@@ -686,7 +725,7 @@ Default weights (sum to 1): w\_P 0.35, w\_E 0.20, w\_R 0.15, w\_I 0.15, w\_L 0.1
 | Normal | 0 to 24 |  |
 | Watch | 25 to 49 |  |
 | Warning | 50 to 74 | Forced to at least Warning if P = 100 or E = 100 |
-| Distress | 75 to 100 | Forced to Distress if a credit event of any kind is Proposed, Challenged or Escalated for this asset |
+| Distress | 75 to 100 | Forced to at least Distress while `EventRegistry` has called `set_event_in_progress(asset, true)` and not yet cleared it with `set_event_in_progress(asset, false)` |
 | Event | n/a | Set when a credit event is Declared; sticky until governance re-enables the asset by registering a new canonical version for every Declared kind (Section 8.8) |
 
 ### 6.4 Hysteresis
@@ -696,8 +735,9 @@ To stop bands flapping, an upward move (towards Distress) applies immediately, b
 ### 6.5 Implementation notes
 
 - 24 hour and 7 day aggregates (`redemption_net_24h`, `clawback_amount_7d`, `auth_revocations_7d`) are computed onchain from the newest 168 slots of the asset's ring buffer (Section 5.8), not trusted from the keeper. This is the same ring Tier 1 checks read.
-- Component P uses `peg_ratio_p10`, not a window minimum, so one wick at a bad price cannot force a band change. A live liquidity collapse raises component L; it never blocks a payout (Section 8.2).
-- All math in `i128`; intermediate products are bounded by sanity checks on inputs (Section 11), so overflow is unreachable for realistic supplies. Use checked arithmetic anyway and return `MathOverflow`.
+- Component P uses `peg_ratio_p10`, computed onchain as the 10th percentile of `peg_ratio` across the newest `depeg_window_secs` slots of the ring, with missing epochs excluded from the percentile input, never the keeper posted `SignalSet.peg_ratio_p10` field (that field is kept for recomputation and audit only). A single epoch's wick inside the window therefore cannot move component P, the same guarantee as a window minimum would have broken; a sustained depeg across the window still moves it. A live liquidity collapse raises component L; it never blocks a payout (Section 8.2).
+- The `set_event_in_progress` override (Section 6.3) is pushed by `EventRegistry`, registry authed; `RiskOracle` never calls into `EventRegistry` to check this itself. It is applied as a read time floor on every `score()`/`band()` call, not written into the stored `RiskScore`: the hysteresis streak that governs downward band moves (Section 6.4) is computed only from genuinely new epochs, never from this flag changing, so clearing the override cannot be mistaken for a new epoch of evidence and cannot corrupt the streak's own count.
+- All math in `i128`; intermediate products are bounded by sanity checks on inputs (Section 11) where sanity checks apply; fields with no such bound (`clawback_amount`, `redemption_net`) can still overflow the 24 hour or 7 day sum across many epochs, which is reachable and intended, not a theoretical case. Use checked arithmetic throughout and return `MathOverflow`.
 - The score is advisory data. Only credit events (Section 8), never the score, release payouts.
 
 ## 7. Reporter network and endpoint probing
@@ -877,9 +917,11 @@ stateDiagram-v2
 
 Escalation happens in the same call as the challenge so that no event can sit in Challenged with no clock running: if escalation were a separate call, a challenger could stall a Tier 1 event indefinitely by never escalating.
 
+While any event of any kind is Proposed, Challenged or Escalated for an asset, `EventRegistry` calls `RiskOracle.set_event_in_progress(asset, true)` (Section 6.3, 12.1), forcing the band to at least Distress; it clears the flag with `set_event_in_progress(asset, false)` on every transition out of those three states (to Declared, Cured, Rejected, or None). `RiskOracle` never calls into `EventRegistry` to check this itself; the flag is purely pushed.
+
 ### 8.2 Tier 1 checks (keeper data, recomputable)
 
-`propose_tier1(caller, asset, kind)` takes only (asset, kind) and always uses the current canonical definition for that pair (Section 8.8); the caller cannot pick a version. It reads the asset's ring buffer from `RiskOracle` in one call (`ring(asset)`, Section 5.8), never the 72 or more separate `Signals` entries a window spans, and checks only Final slots:
+`propose_tier1(caller, asset, kind)` takes only (asset, kind) and always uses the current canonical definition for that pair (Section 8.8); the caller cannot pick a version. It reads the asset's ring buffer from `RiskOracle` in one call (`ring(asset)`, Section 5.8), never the 72 or more separate `Signals` entries a window spans, and checks only slots `RiskOracle.effective_window` reports effectively Final (ADR-008): a slot whose stored state is still `Pending` but whose `pending_until` has already passed counts as Final here too, the same as everywhere else in `RiskOracle`, so `EventRegistry` never derives finality by re-deriving it from `ring()`'s raw state field itself.
 
 - **Depeg:** the window is the `depeg_window_secs` ending at the close of the latest Final epoch. It passes if every present (Final) slot in the window has `peg_ratio < depeg_threshold`, and the number of missing slots (no Final posting, Section 5.8) is at most `max_missing_epochs` (default 6 of 72). Missing epochs count neither for nor against. Liquidity floor: the median `liquidity_2pct` of the Final slots in the 7 days before the window started must be at least `min_liquidity`; liquidity inside the window is never checked. A live liquidity collapse is its own signal (component L, Section 6.1) and an input for the committee if the event is challenged, never a reason to block a payout. `window_start` = the start of the window's first epoch.
 - **IssuerFreeze:** only definable for an asset whose `AssetConfig.issuer_flags` has `auth_revocable` or `clawback_enabled` set; `register_definition` rejects it otherwise (Section 8.8). Over the 7 days ending at the latest Final epoch, `clawback_amount / supply >= freeze_pct_bps` or `auth_revocations` above the threshold, and no governance flag marks the issuer's action as a declared compliance action. `window_start` = the start of the epoch holding the first counted clawback or revocation in those 7 days.
@@ -1267,7 +1309,7 @@ To hold the price below 0.95 for 72 hours, an attacker must keep absorbing the b
 
 | Field | Bound |
 | --- | --- |
-| `peg_ratio`, `peg_ratio_p10` | 0 to 2 × SCALE each. No ordering between them: a 10th percentile can sit above a volume weighted mean when a few large trades print far below the rest |
+| `peg_ratio`, `peg_ratio_p10` | 0 to 2 × SCALE each, and `peg_ratio_p10 <= peg_ratio`. This ordering bound is enforced in the built contract despite the general statement elsewhere in this section that a 10th percentile can sit above a volume weighted mean; it is kept as an explicit review decision, not resolved either way, since `peg_ratio_p10` is audit only (Section 6.5) and does not feed the score. Whether this bound should be relaxed to match the general statement, or the general statement narrowed to describe `RiskOracle`'s own onchain `peg_ratio_p10` computation (which has no such ordering constraint against any single epoch's `peg_ratio`), is open (Section 24.2) |
 | `liquidity_2pct`, `supply` | 0 to `i128::MAX / SCALE` |
 | `supply_change_bps` | Matches `supply` vs previous epoch within 1 bps |
 | Epoch | Closed inside the current `window_secs`, and not already posted (Pending, Disputed or Final) |
@@ -1309,26 +1351,31 @@ Every public function per contract, with who may call it. "Auth" names the addre
 
 ```rust
 fn initialize(env, governor: Address, registry: Address, staking: Address);
-fn add_asset(env, cfg: AssetConfig);                       // auth: governor
-fn update_asset(env, asset: Address, cfg: AssetConfig);    // auth: governor; rejects a change to cfg.reference
+fn add_asset(env, cfg: AssetConfig);                       // auth: governor; rejects cfg.reference = Asset (v1, no USD rate is defined for an asset pegged reference)
+fn update_asset(env, asset: Address, cfg: AssetConfig);    // auth: governor; rejects a change to cfg.reference; rejects cfg.reference = Asset
 fn disable_asset(env, asset: Address);                     // auth: governor
-fn post_signals(env, keeper: Address, asset: Address, s: SignalSet); // auth: keeper; any closed, non Final epoch inside window_secs; s.endpoint ignored
-fn dispute_signals(env, disputer: Address, asset: Address, epoch: u64, alt_hash: BytesN<32>); // auth: disputer; bond locked in Staking
-fn resolve_signal_dispute(env, asset: Address, epoch: u64, keeper_wins: bool, reason: BytesN<32>); // auth: committee; instructs Staking
-fn finalize_endpoint(env, asset: Address, epoch: u64);     // anyone, after the epoch closes; reads Staking.aggregate, then Staking.settle_probes
+fn post_signals(env, keeper: Address, asset: Address, s: SignalSet); // auth: keeper; any closed, non Final epoch inside window_secs; s.endpoint ignored; checks staleness (check_stale) on the way out
+fn dispute_signals(env, disputer: Address, asset: Address, epoch: u64, alt_hash: BytesN<32>); // auth: disputer; bond locked in Staking; checks staleness on the way out
+fn resolve_signal_dispute(env, asset: Address, epoch: u64, keeper_wins: bool, reason: BytesN<32>); // auth: committee; instructs Staking; checks staleness on the way out
+fn finalize_endpoint(env, asset: Address, epoch: u64);     // anyone, after the epoch closes; reads Staking.aggregate, then Staking.settle_probes; checks staleness on the way out
 fn set_event_band(env, asset: Address);                    // auth: registry contract
 fn clear_event_band(env, asset: Address);                  // auth: registry contract (re-enable, Section 8.8)
+fn set_event_in_progress(env, asset: Address, in_progress: bool); // auth: registry contract; Section 6.3's forced-Distress override, push model (Section 6.5)
 fn set_formula(env, version: u32, weights: Vec<u32>, params: Map<Symbol, i128>); // auth: governor
 
 // reads
 fn signals(env, asset: Address, epoch: u64) -> Option<SignalSet>;
+fn overturned_signals(env, asset: Address, epoch: u64) -> Option<SignalSet>; // the SignalSet an overturned epoch's posting had before it was moved out of signals(); audit only
 fn latest(env, asset: Address) -> Option<SignalSet>;
 fn ring(env, asset: Address) -> Vec<RingSlot>;             // oldest first, one storage read (Section 5.8)
+fn is_final(env, asset: Address, epoch: u64) -> bool;      // effective finality (ADR-008): Final by stored state, or Pending with now >= pending_until
+fn effective_window(env, asset: Address, start_epoch: u64, count: u32) -> Vec<Option<SlotState>>; // per-epoch effective state over a range, for EventRegistry's Tier 1 checks (8.2)
 fn score(env, asset: Address) -> RiskScore;
 fn band(env, asset: Address) -> Band;
-fn is_stale(env, asset: Address) -> bool;
+fn check_stale(env, asset: Address) -> bool;               // permissionless; emits asset_stale on the transition into stale (ADR-009); see also is_stale below
+fn is_stale(env, asset: Address) -> bool;                  // judged against the newest POSTED epoch, not the stored score's epoch; see Section 5.5, ADR-009 for how this differs from check_stale
 fn median_liquidity(env, asset: Address) -> i128;          // last 168 slots, for the cover cap (11.1)
-fn reference_rate(env, asset: Address) -> i128;            // reference to USD, SCALE 1e7: Usd = SCALE, Fiat via FxAdapter; fails if stale or Asset
+fn reference_rate(env, asset: Address) -> i128;            // reference to USD, SCALE 1e7: Usd = SCALE, Fiat via FxAdapter; fails if stale, or the reference is Asset (rejected at add_asset/update_asset in v1, so unreachable in practice)
 fn asset_config(env, asset: Address) -> Option<AssetConfig>;
 fn assets(env) -> Vec<Address>;
 ```
@@ -1398,6 +1445,21 @@ fn claimable(env, who: Address) -> i128;
 fn probes(env, asset: Address, epoch: u64) -> Vec<ProbeReport>;
 fn aggregate(env, asset: Address, epoch: u64) -> EndpointStatus; // strict majority, else Degraded (7.4)
 ```
+
+`RiskOracle`'s own view of this interface, confirmed against the built contract (Section 5.4, 7.4, 7.8):
+
+| Function | Called from `RiskOracle` | Notes |
+| --- | --- | --- |
+| `is_active_keeper` | `post_signals` | Gates every posting; `false` rejects with `KeeperNotActive` |
+| `aggregate` | `post_signals`, `finalize_endpoint` | Sole source of `SignalSet.endpoint`; any keeper posted value is discarded |
+| `settle_probes` | `finalize_endpoint` | Called unconditionally once per `finalize_endpoint` call, regardless of whether that call is what resolved the endpoint |
+| `lock_bond` | `dispute_signals` | `key = BondKey::SignalDispute(asset, epoch)`, `owner` = the disputer |
+| `release_bond` | `resolve_signal_dispute`, disputer wins | Same key; releases the disputer's own bond back to them |
+| `forfeit_bond` | `resolve_signal_dispute`, keeper wins | Same key; `winner` = the original poster (the keeper) |
+| `slash` | `resolve_signal_dispute`, disputer wins | `who` = the keeper, by address directly, not a `BondKey` operation |
+| `reward_keeper` | nowhere yet | Declared in this interface but no `RiskOracle` call site invokes it; see Section 24.2 |
+
+There is exactly one `BondKey` `RiskOracle` ever uses, `BondKey::SignalDispute(asset, epoch)`, always the disputer's own bond. `RiskOracle` never locks a bond for a keeper's own posting; `slash` is the only call that touches a keeper's stake, directly by address, assuming `Staking` already holds a slashable stake for every address `is_active_keeper` returns `true` for. Whether a keeper is meant to post its own per-signal bond, symmetric to the disputer's, is an open question (Section 24.2).
 
 ### 12.4 MarketFactory
 
@@ -1490,7 +1552,7 @@ fn accrued(env, who: Address) -> i128;                     // accrued and not ye
 
 ## 13. Events reference
 
-Every state change emits a contract event. Topics are `("sylox", <contract>, <event>, <primary key>)`; data is a single `#[contracttype]` struct. Indexers and the SDK subscribe through Soroban RPC `getEvents`, filtering on the first two topics.
+Every state change emits a contract event. Topics are `("sylox", <event>, <primary key>)` (ADR-007); data is a single `#[contracttype]` struct. The emitting contract's own address is already attached to every Soroban event outside its topics, so the topic tuple does not repeat it. Indexers and the SDK subscribe through Soroban RPC `getEvents`, filtering on the first two topics to get one event type across every contract.
 
 | Contract | Event | Primary key topic | Data fields |
 | --- | --- | --- | --- |
@@ -1501,7 +1563,7 @@ Every state change emits a contract event. Topics are `("sylox", <contract>, <ev
 | RiskOracle | `endpoint_finalized` | asset | epoch, status |
 | RiskOracle | `score_updated` | asset | epoch, score, formula\_version |
 | RiskOracle | `band_changed` | asset | from, to, epoch |
-| RiskOracle | `asset_stale` | asset | last\_epoch |
+| RiskOracle | `asset_stale` | asset | last\_epoch (the stored score's epoch at the moment of the transition; fires once per transition into stale, never per call, ADR-009) |
 | EventRegistry | `definition_registered` | asset | kind, version, previous\_version |
 | EventRegistry | `event_proposed` | asset | event\_id, kind, def\_version, tier, window\_start, proposer, evidence |
 | EventRegistry | `event_challenged` | asset | event\_id, challenger, evidence |
@@ -1537,9 +1599,10 @@ Every state change emits a contract event. Topics are `("sylox", <contract>, <ev
 
 ### 13.1 Indexer guidance
 
-- Order by ledger sequence, then by event index within the ledger.
+- Order by ledger sequence, then by event index within the ledger; never assume `signals_final` arrives in epoch order (ADR-008): a single finality scan can announce several epochs at once, and a backfilled epoch can become Final later than a newer epoch posted on time. Dedupe `signals_final` on `(asset, epoch)`, since the finality scan's own bookkeeping already prevents more than one emission per epoch onchain, but a client replaying from an earlier ledger range should not assume it saw each one exactly once either.
 - `cover_bought.fills` gives per seller attribution without reading storage.
 - Treat `signals_posted` values as provisional until `signals_final`, and the endpoint field as `Unknown` until `endpoint_finalized`.
+- `asset_stale` fires once per transition into stale, never per call that merely observes an already announced stale state (ADR-009); treat its absence as "still fresh or already announced," not as "definitely fresh." A monitor calling `check_stale(asset)` once per epoch for every asset is what makes this event reliable in practice (Section 22.4).
 - Event status is per (asset, kind): key event history on (asset, kind, def\_version), not on asset alone.
 - `band_changed` and `event_declared` are the two events wallets and lenders should alert on; `event_escalated` carries the ruling deadline committee tooling should track.
 - Money movements reconcile per contract: `Series` events against collateral and premiums, `Staking` events against bonds and stakes, `Treasury` events against fees, slashed funds and rewards.
@@ -1552,7 +1615,7 @@ Each contract defines a `#[contracterror]` enum with `u32` codes in its own rang
 | --- | --- | --- | --- |
 | 1 | `AlreadyInitialized` | all | `initialize` called twice |
 | 2 | `NotInitialized` | all | Called before `initialize` |
-| 3 | `Unauthorized` | all | Caller lacks the required role |
+| 3 | `Unauthorized` | all | Caller lacks the required role. Unreachable in `RiskOracle` as built: every authorization check goes through Soroban's native `Address::require_auth()`, which traps the host call directly rather than returning this code; kept only for code number compatibility across contracts |
 | 4 | `Paused` | all | Scope is paused by the guardian |
 | 5 | `MathOverflow` | all | Checked arithmetic failed |
 | 100 | `UnknownAsset` | RiskOracle | Asset not registered or disabled |
@@ -1564,7 +1627,9 @@ Each contract defines a `#[contracterror]` enum with `u32` codes in its own rang
 | 106 | `DisputeWindowClosed` | RiskOracle | Too late to dispute |
 | 107 | `WeightsInvalid` | RiskOracle | Formula weights do not sum to 10,000 |
 | 108 | `ReferenceImmutable` | RiskOracle | `update_asset` tried to change `reference` |
-| 109 | `ReferenceRateUnavailable` | RiskOracle | `reference_rate` has no fresh rate: FX adapter missing or stale, or the reference is `Asset` |
+| 109 | `ReferenceRateUnavailable` | RiskOracle | `reference_rate` has no fresh rate: FX adapter missing or stale |
+| 110 | `AggregationFailed` | RiskOracle | The ring does not have enough history, or a required window read came back empty, for computing the score from a Final epoch; distinct from `SanityBoundFailed`, which is about one posted `SignalSet`'s own fields |
+| 111 | `ReferenceNotSupported` | RiskOracle | `add_asset` or `update_asset` was given `Reference::Asset`, rejected in v1: no USD rate is defined anywhere in this spec for an asset pegged reference |
 | 200 | `UnknownDefinition` | EventRegistry | No canonical definition for (asset, kind), or no such version |
 | 201 | `EventInProgress` | EventRegistry | Another event is open for this (asset, kind) |
 | 202 | `Tier1CheckFailed` | EventRegistry | Ring buffer data does not meet the definition, including too many missing epochs or a low baseline liquidity |
@@ -1625,11 +1690,18 @@ Soroban storage has three classes with different lifetimes and costs: instance (
 
 | Contract | Key | Class | Value |
 | --- | --- | --- | --- |
-| RiskOracle | `Config` | instance | governor, registry, staking addresses, formula version |
+| RiskOracle | `Config` | instance | governor, registry, staking addresses |
+| RiskOracle | `Formula` | instance | Current score `Formula`: version, weights, params |
+| RiskOracle | `Assets` | instance | List of every registered asset address |
 | RiskOracle | `Asset(asset)` | persistent | `AssetConfig` |
 | RiskOracle | `Signals(asset, epoch)` | persistent | `SignalSet` plus `Pending`, `Disputed` or `Final` |
-| RiskOracle | `Ring(asset)` | persistent | Ring buffer of 240 packed `RingSlot`s with a per slot finality flag: Tier 1 checks, cover gate, 24h and 7d aggregates, liquidity median and baseline (Section 5.8) |
-| RiskOracle | `Score(asset)` | persistent | Latest `RiskScore`, band, hysteresis counter |
+| RiskOracle | `Overturned(asset, epoch)` | persistent | An overturned epoch's `SignalSet`, moved here from `Signals(asset, epoch)` on resolution so a fresh posting can be accepted for the same epoch (ADR-005); audit only |
+| RiskOracle | `Ring(asset)` | persistent | Ring buffer of 240 packed `RingSlot`s, layout version 2, with a per slot `final_announced` flag (ADR-008): Tier 1 checks, cover gate, 24h and 7d aggregates, liquidity median and baseline (Section 5.8) |
+| RiskOracle | `NewestFinal(asset)` | persistent | Newest epoch the backward finality scan has found effectively Final (ADR-008); `None` until the asset's first epoch becomes Final |
+| RiskOracle | `Score(asset)` | persistent | Latest `RiskScore` |
+| RiskOracle | `DownStreak(asset)` | persistent | Hysteresis down streak counter (Section 6.4), kept separate from `Score(asset)` so advancing it does not require rewriting the whole `RiskScore` |
+| RiskOracle | `EventInProgress(asset)` | persistent | Set by `EventRegistry` via `set_event_in_progress`; forces the band to at least Distress at read time while `true` (Section 6.3) |
+| RiskOracle | `StaleAnnounced(asset)` | persistent | Whether `asset_stale` has already been emitted for the asset's current stale period (ADR-009); cleared when a fresh, non-stale epoch is scored |
 | RiskOracle | `Dispute(asset, epoch)` | persistent | Dispute record only (disputer, alt hash, outcome); the bond is in `Staking` |
 | EventRegistry | `Config` | instance | governor, oracle, staking, factory addresses; next event id |
 | EventRegistry | `Def(asset, kind, version)` | persistent | `EventDefinition`, never overwritten |
@@ -1678,7 +1750,7 @@ A claimant whose balance entry was archived can restore it with a standard resto
 
 ### 15.3 Size limits
 
-- The ring buffer holds 240 slots packed at about 120 bytes each, about 29 KB per asset (Section 5.8). This fits a single entry, but rewriting it on every posting is the dominant write cost of `post_signals`. Benchmark the write cost in the first week of the `RiskOracle` build; if it is too high, fall back to paging the ring into entries of 24 slots each. Confirm entry size and per transaction write limits against the current network configuration at the same time.
+- The ring buffer holds 240 slots packed at 112 bytes each, 26,889 bytes per asset including its header (Section 5.8). Measured against the `RiskOracle` build: fits a single entry at 41% of `contract_data_entry_size_bytes`, and rewriting it every posting costs 28,012 write bytes (21.2% of `tx_max_write_bytes`), both with headroom. No paging fallback was needed.
 - The quote vector is capped at 64 entries to bound read and write cost of `buy_cover`.
 - `register_definition`'s live series check reads at most `max_series_per_asset` (default 4) series terms.
 
@@ -1698,15 +1770,15 @@ Every privileged call checks a role address with `require_auth()`; there are no 
 | Buyer | Anyone; holding the asset if `require_holding` | Buy cover while the cover gate is `Clear` (Section 9.4) | Buy while an event is in progress or a trailing failure signal is present |
 | Holder | Anyone holding cover units | Transfer cover units (SEP-41), claim in Triggered | Claim outside Triggered |
 | Anyone | Any address | Permissionless triggers: `propose_tier1`, `finalize`, `resolve_timeout`, `finalize_endpoint`, `settle_probes`, `trigger`, `sync`, `claim_for` after the claim window, `deposit` into `Treasury` | Anything that needs one of the roles above |
-| EventRegistry to RiskOracle | Contract | `set_event_band`, `clear_event_band` | Anything else |
+| EventRegistry to RiskOracle | Contract | `set_event_band`, `clear_event_band`, `set_event_in_progress` | Anything else |
 | Series to MarketFactory | Contract, only series in `Deployed` | `reserve_cover`, `release_cover` | Anything else |
-| RiskOracle to Staking | Contract | `lock_bond`, `release_bond`, `forfeit_bond` for `SignalDispute` keys; `slash` keepers; `reward_keeper` | Touch event bonds |
+| RiskOracle to Staking | Contract | `lock_bond`, `release_bond`, `forfeit_bond` for `SignalDispute` keys; `slash` keepers | Touch event bonds. `reward_keeper` is declared in the interface `RiskOracle` depends on (Section 12.3) but has no call site yet; see Section 24.2 |
 | EventRegistry to Staking | Contract | `lock_bond`, `release_bond`, `forfeit_bond` for `EventProposal` and `EventChallenge` keys; `slash` | Touch signal dispute bonds |
 | Staking to Treasury | Contract | `accrue_reward` against `KeeperRewards` and `ReporterRewards` | `allocate`, `spend`, any other bucket |
 
 ### 16.1 Contract to contract auth
 
-- The oracle stores the registry's address at `initialize` and checks `registry.require_auth()` in `set_event_band` and `clear_event_band`; in Soroban a contract authorizes its own direct calls, so this succeeds only when the registry is the caller.
+- The oracle stores the registry's address at `initialize` and checks `registry.require_auth()` in `set_event_band`, `clear_event_band` and `set_event_in_progress`; in Soroban a contract authorizes its own direct calls, so this succeeds only when the registry is the caller.
 - The factory records every series it deploys in a `Deployed(series)` set and checks membership plus `series.require_auth()` in `reserve_cover` and `release_cover`.
 - `Staking` stores the oracle and registry addresses at `initialize`. `lock_bond`, `release_bond` and `forfeit_bond` require the oracle's auth for a `SignalDispute` key and the registry's auth for `EventProposal` and `EventChallenge` keys, so neither contract can touch the other's bonds. `slash` requires the oracle, the registry or the committee (false probe evidence only); `reward_keeper` requires the oracle.
 - `Treasury` stores the `Staking` address at `initialize` and checks `staking.require_auth()` in `accrue_reward`. `deposit` needs only the depositor's own auth.
@@ -2144,7 +2216,7 @@ sylox/
 
 Deployment order (22.2) is the order contracts are *invoked* on a live network; it assumes every contract already exists. Build order is the order they get *written and tested*, and it is driven by the dependency graph in Section 3.5: a contract can only be implemented once the things it reads from compile. The build runs in three phases after the Phase 0 data pull (Section 1.7):
 
-- **Phase A, data layer:** shared types, `RiskOracle` with the ring buffer (write cost benchmarked in its first week, Section 5.8), `Staking`, `Treasury`, the adapters, the keeper and recompute library, the reporter node.
+- **Phase A, data layer:** shared types, `RiskOracle` (built; ring buffer write cost measured, Section 5.8), `Staking`, `Treasury`, the adapters, the keeper and recompute library, the reporter node.
 - **Phase B, first event scope and markets:** `EventRegistry` with canonical Depeg and IssuerFreeze definitions (Tier 1), challenges and the ruling deadline; `MarketFactory`; `Series`; `Governor`; indexer, API and SDK.
 - **Phase C, later event scope:** WithdrawalHalt (Tier 2) with its evidence handling, Insolvency (Tier 3) with committee tooling, and MintWithoutBacking.
 
@@ -2199,7 +2271,7 @@ All per network settings live in `deploy/<network>.toml` (contract ids, USDC SAC
 
 | Alert | Condition | Severity |
 | --- | --- | --- |
-| Feed stale | Any asset missed 2 epochs | High |
+| Feed stale | The monitor calls `check_stale(asset)` for every registered asset once per epoch; alert on its `asset_stale` event or a `true` return (ADR-009) | High |
 | Keeper disagreement | Two keepers' computed values differ beyond tolerance | High |
 | Reporter split | No majority for an asset in an epoch | Medium |
 | Band up move | Any asset moves to Warning or Distress | Medium, notify subscribers |
@@ -2222,11 +2294,10 @@ All per network settings live in `deploy/<network>.toml` (contract ids, USDC SAC
 
 ## 23. Parameter reference
 
-Every tunable value in one place, with its v1 default. All defaults are starting points to revisit with testnet data; changes go through the governor (Section 17).
+Every tunable value in one place, with its v1 default. All defaults are starting points to revisit with testnet data; changes go through the governor (Section 17). `epoch_secs` (3,600 seconds) and `RING_SLOTS` (240) are frozen for v1, not governance parameters, so they are not in this table: either value changing would require re-encoding every asset's existing packed `Ring(asset)` entry under a new layout version, which is a migration, not a parameter change `SetParam` should be able to trigger silently (Section 5.8).
 
 | Parameter | Default | Unit | Used in |
 | --- | --- | --- | --- |
-| `epoch_secs` | 3,600 | seconds | Oracle epochs |
 | `window_secs` | 259,200 (72h) | seconds | Peg TWAP and `peg_ratio_p10` window; backfill limit for posting |
 | `signal_dispute_secs` | 7,200 (2h) | seconds | Signal dispute window |
 | `signal_dispute_bond` | 1,000 | USDC | Signal disputes |
@@ -2304,7 +2375,7 @@ Every tunable value in one place, with its v1 default. All defaults are starting
 
 - [ ] Which FX oracles on Stellar provide ARS and other local currency rates, on which basis (official, market or both), at what update frequency and with what methodology? (Phase 0 data pull, Section 1.7.)
 - [ ] Can Soroban AMM adapters cover enough of the target assets to make the cross check meaningful?
-- [ ] Ring buffer write cost and the per entry and per transaction limits for a 240 slot entry on the current network configuration (benchmark in the first week of the `RiskOracle` build, Section 5.8).
+- [x] Ring buffer write cost and the per entry and per transaction limits for a 240 slot entry: measured in the `RiskOracle` build (Section 5.8); fits with headroom, no paging needed.
 - [ ] Should `min_liquidity` move from `AssetConfig` into the Depeg definition, so that an `UpdateAsset` cannot change the liquidity floor a live series is judged against?
 - [ ] Insolvency has no measurement window, so under Section 8.6 it must be proposed by series expiry. Is a post expiry acceptance period needed for Tier 3 when it is built?
 - [ ] What pending time makes a user submitted SEP-24 transaction count as stuck for WithdrawalHalt evidence, and should it be a definition parameter?
@@ -2316,3 +2387,9 @@ Every tunable value in one place, with its v1 default. All defaults are starting
 - [ ] How to source historical depeg data for scenario tests on Stellar issued assets specifically.
 - [ ] Cost per epoch of `post_signals` for 10 assets, and whether batching postings per transaction is needed.
 - [ ] Legal review of event definitions wording before they are registered onchain.
+- [ ] Should `AssetConfig` gain a real `l_target` field for component L, or should the spec simply say `min_liquidity` doubles as `L_target` in v1 (Section 6.1)? `RiskOracle` uses `min_liquidity` today with no separate field.
+- [ ] Does `Staking.reward_keeper` need a symmetric per-signal bond lock from the keeper (mirroring the disputer's `signal_dispute_bond`), or is slashing a keeper's general stake by address, with no per-signal bond, the intended v1 design? `RiskOracle` has no call that locks a keeper bond today; only `slash`, directly by address, touches a keeper's stake on a lost dispute.
+- [ ] Is `Staking.reward_keeper` meant to be called from `RiskOracle` at all in v1, and if so, on which transition? It is declared in the `Staking` interface `RiskOracle` depends on (Section 12.3) but no `RiskOracle` call site invokes it yet.
+- [ ] Should `signal_dispute_bond` and `keeper_slash` (Section 23) become per-asset or formula-level configurable parameters rather than contract constants, given that cover value likely scales with cover cap per asset?
+- [ ] `add_asset` does not yet validate that a `Fiat` reference's `fx_adapter` is actually set, or that `amm_adapters` entries are well formed; is this validation meant to live in `add_asset` itself, or in a separate governance review step before an asset goes live?
+- [ ] `peg_ratio_p10 <= peg_ratio` is enforced as a sanity bound on posted signals (Section 11.3) while this document's general statement elsewhere says a 10th percentile can sit above a volume weighted mean. Since `RiskOracle` now computes its own `peg_ratio_p10` onchain for scoring and treats the keeper posted field as audit only, should the posted field's bound be relaxed to match the general statement, or should the general statement be narrowed to describe only the onchain computation?
