@@ -294,13 +294,23 @@ pub fn aggregate_from_ring(
     })
 }
 
+/// Section 6.2's combined score, plus whether Section 6.3's "forced to
+/// at least Warning if P = 100 or E = 100" override applies. Kept
+/// alongside the score (rather than recomputed from it) because once
+/// collapsed into the weighted sum, a component reading exactly 100
+/// cannot be reliably recovered from the final rounded total.
+pub struct ScoreResult {
+    pub score: u32,
+    pub forced_warning: bool,
+}
+
 /// Combines the six components into the Section 6.2 score, `w_P P + w_E E
 /// + ... + w_S S`, rounded to the nearest whole point.
 pub fn combined_score(
     formula: &Formula,
     aggregates: &Aggregates,
     l_target: i128,
-) -> Result<u32, Error> {
+) -> Result<ScoreResult, Error> {
     let d_max = formula.params.get(D_MAX).unwrap_or(SCALE / 10);
     let r_max = formula.params.get(R_MAX).unwrap_or(SCALE / 10);
     let c_max = formula.params.get(C_MAX).unwrap_or(SCALE / 100);
@@ -343,10 +353,23 @@ pub fn combined_score(
         .ok_or(Error::MathOverflow)?
         .checked_div(10_000)
         .ok_or(Error::MathOverflow)?;
-    rounded
+    let score: u32 = rounded
         .clamp(0, 100)
         .try_into()
-        .map_err(|_| Error::MathOverflow)
+        .map_err(|_| Error::MathOverflow)?;
+
+    // Section 6.3: "Forced to at least Warning if P = 100 or E = 100",
+    // checked on the components themselves (each already clamped to
+    // 0..=100 before the weighted sum), not on the rounded total: a
+    // component pinned at its max can still land the final weighted
+    // score below the Warning range once scaled by its weight, which is
+    // exactly the case this override exists to catch.
+    let forced_warning = p == 100 || e == 100;
+
+    Ok(ScoreResult {
+        score,
+        forced_warning,
+    })
 }
 
 /// Section 6.3's score-range bands, before any override or hysteresis.
@@ -375,9 +398,15 @@ pub fn band_for_score(score: u32) -> Band {
 /// hysteresis streak computed here only ever reflects genuine new-epoch
 /// evidence, never an `EventRegistry` flag flip (see `score`'s doc
 /// comment and the PR's "Review fixes" section, D1). The "forced to at
-/// least Warning if P = 100 or E = 100" override and the sticky `Event`
-/// band (via `set_event_band`/`clear_event_band`) are both implemented
-/// here as before.
+/// least Warning if P = 100 or E = 100" override is applied by the
+/// caller (`recompute_score` in lib.rs) to `raw_band` before it ever
+/// reaches this function, using `ScoreResult::forced_warning` from
+/// `combined_score`, so an upward move from that override goes through
+/// the same "applies immediately" path below as any other raw band
+/// increase. The sticky `Event` band (via
+/// `set_event_band`/`clear_event_band`) is handled by the caller
+/// skipping this function entirely while it is set (see
+/// `recompute_score`'s own `Band::Event` check).
 pub fn apply_hysteresis(
     current: &RiskScore,
     raw_band: Band,

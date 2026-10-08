@@ -896,8 +896,19 @@ fn recompute_score(env: &Env, asset: &Address, newest_final: u64) -> Result<(), 
     let formula = storage::get_formula(env).ok_or(Error::NotInitialized)?;
     let l_target = l_target_for(&cfg);
     let aggregates = score::aggregate_from_ring(env, asset, newest_final)?;
-    let raw = score::combined_score(&formula, &aggregates, l_target)?;
-    let raw_band = score::band_for_score(raw);
+    let score::ScoreResult {
+        score: raw,
+        forced_warning,
+    } = score::combined_score(&formula, &aggregates, l_target)?;
+    let mut raw_band = score::band_for_score(raw);
+    if forced_warning && raw_band < Band::Warning {
+        // Section 6.3: "Forced to at least Warning if P = 100 or E =
+        // 100", checked on the pre-weighting components in
+        // combined_score; applied here, before hysteresis, so a
+        // forced-up move is subject to the same "upward moves apply
+        // immediately" rule (Section 6.4) as any other band increase.
+        raw_band = Band::Warning;
+    }
 
     let down_streak = storage::get_down_streak(env, asset);
     let (band, new_streak) = match &stored {

@@ -1631,6 +1631,82 @@ fn post_signals_reports_math_overflow_when_the_7d_clawback_sum_cannot_fit_i128()
     unreachable!("loop always returns at epoch 169");
 }
 
+// -- Section 6.3 override: forced to at least Warning if P = 100 or E = 100 --
+
+#[test]
+fn score_is_forced_to_at_least_warning_when_endpoint_is_down() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    // Every component other than E stays at 0 (same healthy baseline as
+    // score_is_normal_band_with_healthy_signals); only the latest final
+    // epoch's endpoint is Down. With w_E = 0.20, an unforced weighted
+    // score would be 100 * 2000 / 10000 = 20 (Band::Normal), well under
+    // Warning's 50..=74 range: the override, not the raw weighted sum,
+    // is what moves this to Warning.
+    for epoch in 0..170u64 {
+        let status = if epoch == 167 {
+            EndpointStatus::Down
+        } else {
+            EndpointStatus::Up
+        };
+        staking_client.set_aggregate(&asset, &epoch, &status);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s = signal_set(&env, epoch, sylox_types::SCALE);
+        s.liquidity_2pct = 100_000_000_000;
+        s.supply_change_bps = 0;
+        fx.client.post_signals(&keeper, &asset, &s);
+    }
+
+    let score = fx.client.score(&asset);
+    assert!(!score.stale);
+    assert_eq!(
+        score.score, 20,
+        "the raw weighted score itself is unaffected by the override"
+    );
+    assert_eq!(
+        score.band,
+        Band::Warning,
+        "E = 100 must force at least Warning even though the weighted score alone is Normal"
+    );
+}
+
+#[test]
+fn score_is_forced_to_at_least_warning_when_p_saturates_at_100() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    // d_max defaults to 0.10 (SCALE / 10); a peg_ratio deviating by more
+    // than that from SCALE clamps component P at exactly 100. Every
+    // other component stays at 0, so the unforced weighted score would
+    // be 100 * 3500 / 10000 = 35 (Band::Watch), under Warning's range.
+    let depegged_ratio = sylox_types::SCALE / 2; // 50% off peg, far past d_max
+    for epoch in 0..170u64 {
+        staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s = signal_set(&env, epoch, depegged_ratio);
+        s.liquidity_2pct = 100_000_000_000;
+        s.supply_change_bps = 0;
+        fx.client.post_signals(&keeper, &asset, &s);
+    }
+
+    let score = fx.client.score(&asset);
+    assert!(!score.stale);
+    assert_eq!(
+        score.score, 35,
+        "the raw weighted score itself is unaffected by the override"
+    );
+    assert_eq!(
+        score.band,
+        Band::Warning,
+        "P = 100 must force at least Warning even though the weighted score alone is Watch"
+    );
+}
+
 // -- Required test: backfill equivalence --
 
 /// One signal per epoch, varying slightly by epoch so a position or
