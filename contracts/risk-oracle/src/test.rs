@@ -1821,3 +1821,203 @@ fn backfill_after_an_outage_matches_no_outage() {
     assert!(!score_a.stale);
     assert!(!score_b.stale);
 }
+
+// -- Re-review item C6: finality must not stall on a gap --
+//
+// try_advance_finality (as of this round) walks a sequential cursor
+// forward from the last known-Final epoch and stops at the first one
+// that is not Final. A permanently missing epoch, an overturned epoch
+// that is never reposted, or an unresolved dispute therefore freezes
+// every later epoch's finality (and so the score) forever, even though
+// every one of those later epochs individually closed and became
+// Final long ago. These four tests are written to FAIL against that
+// design, per the review's "write failing tests first" instruction;
+// the fix follows in the next commit.
+
+/// Posts a plain healthy epoch (no flush, caller controls finality
+/// entirely) — used by the C6 tests to build a long posting history
+/// with a deliberate gap, without fill_ring_with_constant_signal's
+/// automatic flush/finalize_endpoint call masking the gap.
+fn post_one_healthy_epoch(env: &Env, client: &RiskOracleClient, staking: &Address, asset: &Address, epoch: u64) {
+    let keeper = Address::generate(env);
+    let staking_client = crate::mocks::MockStakingClient::new(env, staking);
+    staking_client.set_aggregate(asset, &epoch, &EndpointStatus::Up);
+    env.ledger().set_timestamp((epoch + 1) * 3_600);
+    let mut s = signal_set(env, epoch, sylox_types::SCALE);
+    s.liquidity_2pct = 100_000_000_000;
+    s.supply_change_bps = 0;
+    client.post_signals(&keeper, asset, &s);
+}
+
+#[test]
+fn finality_keeps_advancing_past_a_permanently_missing_epoch() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+
+    // Post 0..100 normally, reaching well past the 168 epoch warm-up
+    // (so scoring is already active), skip epoch 100 forever, then
+    // keep posting 101..230 (comfortably past epoch 100's own 72 epoch
+    // backfill window, and still inside RING_SLOTS=240 so the gap is
+    // not simply overwritten by wraparound).
+    for epoch in 0..100u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    // epoch 100 intentionally never posted.
+    for epoch in 101..230u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+
+    let score = fx.client.score(&asset);
+    assert!(
+        score.epoch >= 220,
+        "score must keep advancing to near the newest Final epoch even though \
+         epoch 100 is permanently missing; got stuck at epoch {}",
+        score.epoch
+    );
+    assert!(!score.stale, "a score this close to the newest epoch must not read stale");
+}
+
+#[test]
+fn finality_keeps_advancing_past_an_overturned_epoch_that_is_never_reposted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let governor_client = crate::mocks::MockGovernorClient::new(&env, &governor);
+    let committee = Address::generate(&env);
+    governor_client.set_committee(&committee);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+
+    for epoch in 0..101u64 {
+        post_one_healthy_epoch(&env, &client, &staking, &asset, epoch);
+    }
+    // Dispute and overturn epoch 100 (disputer wins), then never repost it.
+    let disputer = Address::generate(&env);
+    client.dispute_signals(&disputer, &asset, &100, &BytesN::from_array(&env, &[9u8; 32]));
+    client.resolve_signal_dispute(&asset, &100, &false, &BytesN::from_array(&env, &[0u8; 32]));
+
+    for epoch in 101..230u64 {
+        post_one_healthy_epoch(&env, &client, &staking, &asset, epoch);
+    }
+
+    let score = client.score(&asset);
+    assert!(
+        score.epoch >= 220,
+        "score must keep advancing past an overturned-and-never-reposted epoch; \
+         got stuck at epoch {}",
+        score.epoch
+    );
+    assert!(!score.stale);
+}
+
+#[test]
+fn finality_keeps_advancing_past_an_unresolved_dispute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let governor_client = crate::mocks::MockGovernorClient::new(&env, &governor);
+    let committee = Address::generate(&env);
+    governor_client.set_committee(&committee);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+
+    for epoch in 0..101u64 {
+        post_one_healthy_epoch(&env, &client, &staking, &asset, epoch);
+    }
+    // Dispute epoch 100 and never resolve it: it stays Disputed forever.
+    let disputer = Address::generate(&env);
+    client.dispute_signals(&disputer, &asset, &100, &BytesN::from_array(&env, &[9u8; 32]));
+
+    for epoch in 101..230u64 {
+        post_one_healthy_epoch(&env, &client, &staking, &asset, epoch);
+    }
+
+    let score = client.score(&asset);
+    assert!(
+        score.epoch >= 220,
+        "later epochs must still finalize and the score must keep advancing even \
+         though epoch 100's dispute is never resolved; got stuck at epoch {}",
+        score.epoch
+    );
+    assert!(!score.stale);
+}
+
+#[test]
+fn a_frozen_score_must_report_stale_judged_against_its_own_epoch() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+
+    // Post exactly enough healthy epochs to produce one real score,
+    // then go quiet (no further posting at all): the newest POSTED
+    // epoch and the newest FINAL epoch are the same here, so this
+    // establishes the baseline "stale eventually goes true" behavior
+    // before the sharper assertion below.
+    for epoch in 0..170u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    let fresh = fx.client.score(&asset);
+    assert!(!fresh.stale);
+    let scored_epoch = fresh.epoch;
+
+    env.ledger()
+        .set_timestamp((scored_epoch + 1 + 200) * 3_600);
+    let frozen = fx.client.score(&asset);
+    assert!(
+        frozen.stale,
+        "a score computed from an epoch this far in the past must report stale, \
+         judged against the epoch it was actually computed from"
+    );
+}
+
+#[test]
+fn is_stale_must_not_mask_a_score_frozen_behind_a_gap() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+
+    // Reach a real score, then leave a permanent gap at epoch 100 and
+    // keep posting for 200+ further epochs. Posting never stops, so
+    // is_stale (which reads the newest POSTED epoch, not the newest
+    // FINAL/scored one) reports fresh throughout, even once the gap has
+    // frozen the actual score far enough in the past for score().stale
+    // to correctly flip true on its own terms. A caller that checks
+    // only is_stale() — exactly the field named for this purpose — is
+    // misled into believing the asset's risk data is current when the
+    // real score has not moved in hundreds of epochs. This is true
+    // whether or not try_advance_finality itself gets fixed (C6's fix
+    // does not touch is_stale()'s own newest-posted-epoch semantics),
+    // so this failure is about is_stale()'s definition, not about the
+    // finality-stall bug the other three tests above target; recorded
+    // here because the review grouped it under the same "frozen score"
+    // heading.
+    for epoch in 0..100u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+    // epoch 100 intentionally never posted.
+    for epoch in 101..300u64 {
+        post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
+    }
+
+    assert!(
+        !fx.client.is_stale(&asset),
+        "is_stale reads the newest posted epoch, which stays fresh since posting never stopped"
+    );
+    let score = fx.client.score(&asset);
+    assert!(
+        score.stale,
+        "score().stale, judged against the epoch the score was actually computed from, \
+         must report stale here even though is_stale() does not — proving is_stale() \
+         alone is not a safe substitute for score().stale"
+    );
+}
