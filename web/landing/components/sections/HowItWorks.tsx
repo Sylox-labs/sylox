@@ -12,9 +12,9 @@ import { useScrollReveal } from "@/lib/motion/useScrollReveal";
 // per row (ProofBridge's feature-grid reference) instead of a uniform
 // card grid, so each part reads as its own full-bleed moment.
 const PANELS = [
-  { src: "/brand/how-it-works-oracle.jpg", alt: "Wireframe render of an eye, representing continuous risk monitoring" },
-  { src: "/brand/how-it-works-registry.jpg", alt: "Wireframe render of a wax seal stamp mid-impact, representing a declared credit event" },
-  { src: "/brand/how-it-works-markets.jpg", alt: "Wireframe render of interlocking chain links under tension, representing locked collateral" },
+  { src: "/brand/how-it-works-oracle.webp", alt: "Wireframe render of an eye, representing continuous risk monitoring" },
+  { src: "/brand/how-it-works-registry.webp", alt: "Wireframe render of a wax seal stamp mid-impact, representing a declared credit event" },
+  { src: "/brand/how-it-works-markets.webp", alt: "Wireframe render of interlocking chain links under tension, representing locked collateral" },
 ];
 
 export function HowItWorks() {

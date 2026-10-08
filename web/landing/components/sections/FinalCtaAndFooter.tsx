@@ -117,7 +117,7 @@ export function FinalCtaAndFooter() {
         <div className="mx-auto max-w-5xl">
           <div className="flex items-center gap-3">
             <Image
-              src="/brand/sylox-mark.png"
+              src="/brand/sylox-mark.webp"
               alt=""
               width={56}
               height={48}

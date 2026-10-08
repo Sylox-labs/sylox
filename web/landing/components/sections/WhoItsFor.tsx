@@ -13,10 +13,10 @@ import { useScrollReveal } from "@/lib/motion/useScrollReveal";
 // (the product's own namesake). Keyed by `word` so content.ts stays the
 // single source of truth for copy.
 const CARD_IMAGE: Record<string, string> = {
-  HOLDERS: "/brand/who-holders.jpg",
-  WALLETS: "/brand/who-wallets.jpg",
-  LENDERS: "/brand/who-lenders.jpg",
-  ANCHORS: "/brand/who-anchors.jpg",
+  HOLDERS: "/brand/who-holders.webp",
+  WALLETS: "/brand/who-wallets.webp",
+  LENDERS: "/brand/who-lenders.webp",
+  ANCHORS: "/brand/who-anchors.webp",
 };
 
 /**
