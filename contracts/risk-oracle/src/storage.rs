@@ -99,6 +99,8 @@ pub enum DataKey {
     /// Dispute record only; the bond itself lives in `Staking` under
     /// `BondKey::SignalDispute` (Section 4.5, 7.8).
     Dispute(Address, u64),
+    /// ADR-010: committee misses on signal dispute ruling deadlines.
+    CommitteeMisses(Address),
     /// Review item C4: history for an overturned epoch's `SignalSet`.
     /// `resolve_signal_dispute` moves it here from `Signals(asset, epoch)`
     /// on an overturn, so `get_signals` no longer finds it and
@@ -122,6 +124,31 @@ pub enum DataKey {
 pub struct DisputeRecord {
     pub disputer: Address,
     pub alt_hash: BytesN<32>,
+    /// Ledger timestamp `dispute_signals` opened this dispute at.
+    /// `resolve_signal_dispute_timeout` (ADR-010) uses this, not
+    /// `pending_until`, as the ruling deadline's start: the deadline
+    /// is about how long the COMMITTEE may take to rule once a dispute
+    /// exists, a separate clock from the original posting's own
+    /// dispute window.
+    pub opened_at: u64,
+}
+
+/// ADR-010: counts, per committee address, how many signal disputes
+/// that committee let run out its ruling deadline without a ruling.
+/// Grounds for rotating the committee through governance, the same
+/// role `CommitteeMisses` plays for event ruling timeouts (ADR-002).
+pub fn get_committee_misses(env: &Env, committee: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CommitteeMisses(committee.clone()))
+        .unwrap_or(0)
+}
+
+pub fn record_committee_miss(env: &Env, committee: &Address) {
+    let count = get_committee_misses(env, committee) + 1;
+    env.storage()
+        .persistent()
+        .set(&DataKey::CommitteeMisses(committee.clone()), &count);
 }
 
 pub fn get_asset_config(env: &Env, asset: &Address) -> Option<AssetConfig> {

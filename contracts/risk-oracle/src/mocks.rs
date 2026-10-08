@@ -52,9 +52,9 @@ impl MockStaking {
         let _ = (asset, epoch);
     }
 
-    pub fn lock_bond(env: Env, key: BondKey, owner: Address, amount: i128) {
+    pub fn lock_bond(env: Env, key: BondKey, owner: Address, amount: i128, subject: Option<Address>) {
         record_call(&env, "lock_bond");
-        let _ = (key, owner, amount);
+        let _ = (key, owner, amount, subject);
     }
 
     pub fn release_bond(env: Env, key: BondKey) {

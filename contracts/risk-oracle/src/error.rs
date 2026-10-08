@@ -45,4 +45,9 @@ pub enum Error {
     /// (review decision D3): no USD rate is defined anywhere in the spec
     /// for an asset pegged reference (see the PR's "Spec deviations").
     ReferenceNotSupported = 111,
+    /// ADR-010 (feat/staking, issue #4 fix): `resolve_signal_dispute_timeout`
+    /// called before `SIGNAL_DISPUTE_RULING_SECS` has passed since the
+    /// dispute opened. Named to match ADR-002's `RulingDeadlineNotReached`
+    /// precedent for the analogous event-ruling timeout.
+    RulingDeadlineNotReached = 112,
 }
