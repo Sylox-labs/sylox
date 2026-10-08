@@ -1,0 +1,60 @@
+/* Sylox brand tokens. Source: _moodboard/brand-identity.jpg (v1.0 board). */
+
+:root {
+  /* Primitives — exact values from the brand board. Never reference these
+     directly from components; always go through a semantic token below. */
+  --color-slate-black: #0b0c0e;
+  --color-silo-oatmeal: #f1efe9;
+  --color-anchor-graphite: #2d3037;
+  --color-cement-grey: #8a9099;
+  --color-cyber-tin: #b0b5bc;
+  --color-risk-crimson: #ff3b30;
+
+  /* Warning band tint: Risk Crimson blended 45% toward Silo Oatmeal
+     (a lighten, not a new hue) so the five-band ramp reads as one
+     intensity scale heating toward crimson. Contrast against Slate
+     Black is 8.49:1 (AA/AAA at any size) — see lib/risk-bands.ts. */
+  --color-risk-crimson-tint: #f98c83;
+
+  /* Risk-band traffic-light colors: Normal (muted green) through Watch
+     (muted amber) and Warning (muted orange) to Distress/Event (Risk
+     Crimson). Desaturated to sit next to the brand's muted grays rather
+     than reading as a generic saturated status-light kit — full
+     saturation is reserved for crimson. Contrast vs Slate Black:
+     green 8.50:1, amber 10.43:1, orange 7.38:1 — see lib/risk-bands.ts. */
+  --color-risk-normal: #7fb88a;
+  --color-risk-watch: #e0b860;
+  --color-risk-warning: #e08a4f;
+
+  --font-display: var(--font-display-family), var(--font-sans-family);
+  --font-sans-family: var(--font-inter);
+  --font-mono-family: var(--font-space-mono);
+}
+
+/* Dark section theme. Also the document default, since the page opens on
+   the dark hero before any section-level [data-theme] applies. */
+:root,
+[data-theme="dark"] {
+  --surface: var(--color-slate-black);
+  --surface-raised: var(--color-anchor-graphite);
+  --text-primary: var(--color-silo-oatmeal);
+  --text-secondary: var(--color-cyber-tin);
+  --border: var(--color-cement-grey);
+  --border-hover: var(--color-silo-oatmeal);
+  --accent: var(--color-risk-crimson);
+  --on-accent: var(--color-slate-black);
+  --focus-ring: var(--color-risk-crimson);
+}
+
+/* Light section theme. */
+[data-theme="light"] {
+  --surface: var(--color-silo-oatmeal);
+  --surface-raised: #ffffff;
+  --text-primary: var(--color-slate-black);
+  --text-secondary: var(--color-anchor-graphite);
+  --border: var(--color-cement-grey);
+  --border-hover: var(--color-slate-black);
+  --accent: var(--color-risk-crimson);
+  --on-accent: var(--color-slate-black);
+  --focus-ring: var(--color-slate-black);
+}
