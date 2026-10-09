@@ -1,16 +1,20 @@
 //! Property test required by the task brief: random sequences of
 //! `stake`, `unstake`, `submit_probe`, `settle_probes`, `lock_bond`,
-//! `release_bond`, `forfeit_bond`, `fund_rewards` and `claim_rewards`
-//! never break S1-S3.
+//! `release_bond`, `forfeit_bond`, `slash` and `claim` never break
+//! S1-S3, now against the feat/treasury split (every protocol fund
+//! lives in a real `Treasury`, called cross-contract, never a local
+//! stand-in).
 //!
-//! S1. USDC balance of Staking >= total keeper bonds + total reporter
-//!     stake + total locked bonds + unclaimed rewards + unallocated
-//!     reward balance.
+//! S1. USDC balance of Staking EQUALS total keeper bonds + total
+//!     reporter stake (including stake in cooldown) + total locked
+//!     bonds + unclaimed `claimable` balances, apart from direct
+//!     donations.
 //! S2. A bond is either Locked, Released or Forfeited, and moves at
 //!     most once.
 //! S3. No function moves a participant's stake or bond to anyone
-//!     other than that participant, a dispute winner, or the
-//!     treasury.
+//!     other than that participant or a dispute winner (the treasury
+//!     half of a slash/forfeit leaves via a real `Treasury.deposit`
+//!     call, never a local `Claimable` credit here).
 //!
 //! One real contract per case (every operation here is a genuine
 //! cross-call state transition over real USDC balances, not a pure
@@ -24,7 +28,7 @@ use std::vec;
 use proptest::prelude::*;
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::Address;
-use sylox_types::{BondKey, EndpointStatus};
+use sylox_types::{BondKey, EndpointStatus, TreasuryBucket};
 
 use super::{
     add_and_fund_keeper, add_and_fund_reporter, epoch_close, probe, region, settlement_opens, setup,
@@ -41,8 +45,8 @@ enum Op {
     LockBond,
     ReleaseBond,
     ForfeitBond,
-    FundRewards,
-    ClaimRewards,
+    FundTreasuryBucket,
+    ClaimFromTreasury,
     AdvanceTime(u16),
     /// Review fix S5: `amount` is drawn from a range that regularly
     /// exceeds `KEEPER_BOND`/`REPORTER_STAKE` (up to 3x either), so
@@ -62,22 +66,24 @@ fn op() -> impl Strategy<Value = Op> {
         Just(Op::LockBond),
         Just(Op::ReleaseBond),
         Just(Op::ForfeitBond),
-        Just(Op::FundRewards),
-        Just(Op::ClaimRewards),
+        Just(Op::FundTreasuryBucket),
+        Just(Op::ClaimFromTreasury),
         (0u16..7_300).prop_map(Op::AdvanceTime),
         (0u8..2, 0i128..(3 * params::KEEPER_BOND)).prop_map(|(w, a)| Op::Slash(w, a)),
     ]
 }
 
-/// S1: Staking's own USDC balance must at all times cover every
-/// liability it tracks. Checked after every single operation, not
-/// just at the end, so a violation is caught at the exact op that
-/// caused it.
+/// S1: Staking's own USDC balance must EXACTLY equal every liability
+/// it still tracks (feat/treasury tightened this from `>=` to `==`:
+/// every reward-related balance now lives in `Treasury`, never here).
+/// Checked after every single operation, not just at the end, so a
+/// violation is caught at the exact op that caused it.
 fn assert_s1(
     fx: &super::Fixture,
     keepers: &[Address],
     reporters: &[Address],
     bond_keys: &[BondKey],
+    claimants: &[Address],
 ) -> Result<(), TestCaseError> {
     let mut liabilities: i128 = 0;
     for k in keepers {
@@ -85,21 +91,29 @@ fn assert_s1(
     }
     for r in reporters {
         liabilities += fx.client.reporter(r).map(|i| i.stake).unwrap_or(0);
-        liabilities += fx.client.accrued_reward(r);
-        liabilities += fx.client.claimable(r);
     }
     for k in bond_keys {
         if let Some((_, amount)) = fx.client.bond(k) {
             liabilities += amount;
         }
     }
-    liabilities += fx.client.claimable(&fx.treasury);
-    liabilities += fx.client.reward_pool();
+    // Every address this test suite could ever credit a Claimable
+    // balance to: keepers and reporters themselves (slash's winner
+    // can be either), plus the disputer (forfeit_bond/slash's own
+    // winner in every op below). Found by a genuine property test
+    // failure: the disputer's own Claimable balance was not counted
+    // here at first, so a 1-unit winner share from an odd-amount
+    // slash/forfeit looked like a real S1 violation when it was
+    // actually just an undercounted liability.
+    for c in claimants {
+        liabilities += fx.client.claimable(c);
+    }
 
     let balance = fx.usdc_client.balance(&fx.contract_id);
-    prop_assert!(
-        balance >= liabilities,
-        "S1 violated: Staking balance {} < tracked liabilities {}",
+    prop_assert_eq!(
+        balance,
+        liabilities,
+        "S1 violated: Staking balance {} != tracked liabilities {}",
         balance,
         liabilities
     );
@@ -125,6 +139,7 @@ proptest! {
         let reporters = [r1.clone(), r2.clone(), r3.clone()];
         let bond_key = BondKey::SignalDispute(asset.clone(), 0);
         let bond_keys = [bond_key.clone()];
+        let claimants = [keeper.clone(), r1.clone(), r2.clone(), r3.clone(), disputer.clone()];
 
         let mut current_epoch: u64 = 0;
         env.ledger().set_timestamp(epoch_close(current_epoch));
@@ -157,6 +172,13 @@ proptest! {
                     );
                 }
                 Op::SettleProbes => {
+                    // Exercises the real cross-contract
+                    // Treasury.accrue_reward call; S1 as checked here
+                    // only covers Staking's own balance, which this
+                    // call never credits a liability into (the
+                    // reward lands in Treasury, not here), so no
+                    // special handling is needed beyond letting it
+                    // run.
                     let _ = fx.client.try_settle_probes(&asset, &current_epoch);
                 }
                 Op::LockBond => {
@@ -191,14 +213,24 @@ proptest! {
                         let _ = fx.client.try_forfeit_bond(&bond_key, &Some(disputer.clone()));
                     }
                 }
-                Op::FundRewards => {
+                Op::FundTreasuryBucket => {
+                    // Funds Treasury directly (not through Staking):
+                    // this is Treasury's own balance moving, entirely
+                    // outside Staking's S1, included here only so
+                    // SettleProbes/slash's reward and treasury-share
+                    // paths have something real to interact with.
                     super::fund(&fx, &disputer, 1_000_000);
-                    let _ = fx.client.try_fund_rewards(&disputer, &1_000_000);
+                    let _ = fx
+                        .treasury_client
+                        .try_deposit(&disputer, &TreasuryBucket::ReporterRewards, &1_000_000);
                 }
-                Op::ClaimRewards => {
-                    let _ = fx.client.try_claim_rewards(&r1);
-                    let _ = fx.client.try_claim_rewards(&r2);
-                    let _ = fx.client.try_claim_rewards(&r3);
+                Op::ClaimFromTreasury => {
+                    // Also Treasury's own balance moving, not
+                    // Staking's; included so accrued probe rewards
+                    // get claimed out in some sequences.
+                    let _ = fx.treasury_client.try_claim_reward(&r1);
+                    let _ = fx.treasury_client.try_claim_reward(&r2);
+                    let _ = fx.treasury_client.try_claim_reward(&r3);
                     let _ = fx.client.try_claim(&disputer);
                 }
                 Op::AdvanceTime(secs) => {
@@ -220,7 +252,7 @@ proptest! {
                 }
             }
 
-            assert_s1(&fx, &keepers, &reporters, &bond_keys)?;
+            assert_s1(&fx, &keepers, &reporters, &bond_keys, &claimants)?;
 
             // S2: once bond_state reaches 2 (settled, via either
             // release or forfeit), the bond record must be gone, and
@@ -235,15 +267,17 @@ proptest! {
         // S3 is enforced structurally by this property's own op set:
         // every transfer-performing call above moves funds only to
         // the operation's own participant (stake/unstake), the
-        // bond's owner (release_bond), a named winner/the treasury
-        // (forfeit_bond, with winner always `disputer` or `None`
-        // here), or back to the caller (claim/claim_rewards) — no
-        // operation in this suite has a code path to an arbitrary
-        // third address, which `lib.rs`'s own functions structurally
-        // guarantee (see the PR's S3 discussion). The explicit
-        // per-step S1 check above, run after every single op, is the
-        // part that actually needs fuzzing (arithmetic across random
-        // sequences), which is why it is asserted here, not S3.
+        // bond's owner (release_bond), a named winner (forfeit_bond/
+        // slash, with winner always `disputer` or `None` here), or
+        // Treasury itself (the treasury half of forfeit_bond/slash,
+        // via a real Treasury.deposit call, never a local Claimable
+        // credit) — no operation in this suite has a code path to an
+        // arbitrary third address, which `lib.rs`'s own functions
+        // structurally guarantee (see the PR's S3 discussion). The
+        // explicit per-step S1 check above, run after every single
+        // op, is the part that actually needs fuzzing (arithmetic
+        // across random sequences), which is why it is asserted
+        // here, not S3.
         let _ = settlement_opens(0);
     }
 }

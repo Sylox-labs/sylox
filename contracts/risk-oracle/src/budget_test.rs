@@ -277,3 +277,119 @@ fn budget_finality_backward_scan_across_a_full_backfill_window() {
         resources.instructions
     );
 }
+
+/// Issue #11 fix (feat/treasury): the worst case for
+/// `reward_posters_for_newly_final_epochs` is a FULL backfill window
+/// (`FINALITY_LOOKBACK_EPOCHS`, 73 at the defaults) becoming Final in
+/// one call, posted by SEVERAL different keepers rotating through
+/// the window, so the grouping step's `Map` holds as many distinct
+/// posters as the scenario allows and the single measured call must
+/// both scan the whole window AND issue one `reward_keeper` cross
+/// contract call per distinct poster found in it, not just walk past
+/// a long missing gap the way
+/// `budget_finality_backward_scan_across_a_full_backfill_window`
+/// measures.
+///
+/// Builds this by posting `FINALITY_LOOKBACK_EPOCHS` consecutive
+/// epochs in quick succession (each one still Pending, none yet
+/// observed Final: every post lands well inside the previous
+/// posts' own `SIGNAL_DISPUTE_SECS` windows), rotating through 5
+/// keepers round robin, then waiting out the dispute window and
+/// making ONE further call whose finality sweep observes the entire
+/// run as newly Final at once.
+#[test]
+fn budget_reward_keeper_grouping_across_a_full_backfill_window_several_keepers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let governor = Address::generate(&env);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+
+    const KEEPER_COUNT: usize = 5;
+    let keepers: std::vec::Vec<Address> =
+        (0..KEEPER_COUNT).map(|_| Address::generate(&env)).collect();
+
+    // `lookback - 1` epochs, posted in a backfill (every post at the
+    // SAME fixed `now`, each posting an older epoch than the
+    // contract's own notion of "current"), so NONE of them can
+    // become Final during this loop: pending_until is always
+    // `now + SIGNAL_DISPUTE_SECS`, strictly in the future relative to
+    // this same, unmoving `now`, regardless of how many of these
+    // backfill posts happen first. This is the key difference from
+    // posting them one real epoch apart (which, tried first, found a
+    // genuine timing coincidence: EPOCH_SECS * 2 lands exactly on
+    // SIGNAL_DISPUTE_SECS at the defaults, so epochs kept crossing
+    // into Final mid-loop instead of staying Pending for this test's
+    // own final, single sweep).
+    let lookback = crate::FINALITY_LOOKBACK_EPOCHS as u64;
+    let backfill_count = lookback - 1;
+    let now = backfill_count * 3_600 + 3_600;
+    env.ledger().set_timestamp(now);
+    for epoch in 0..backfill_count {
+        let keeper = &keepers[epoch as usize % KEEPER_COUNT];
+        client.post_signals(keeper, &asset, &signal_set(&env, epoch, 9_900_000));
+    }
+
+    // One more post, far enough past the window's own dispute delay
+    // that the entire backfilled run above crosses into Final during
+    // THIS call's own finality sweep. The test harness's own default
+    // CPU/memory budget (100M instructions, 40MB) is well below the
+    // real network's tx_max_instructions (400M) asserted below, and
+    // this one call — finalizing 72 epochs AND fanning out 5
+    // cross-contract reward_keeper calls — is heavy enough to hit
+    // that harness default before ever reaching the real limit this
+    // test exists to check against. Lift it so the call measures
+    // against the real ceiling instead of panicking on the harness's
+    // conservative one.
+    env.cost_estimate().budget().reset_unlimited();
+    let final_epoch = backfill_count;
+    env.ledger()
+        .set_timestamp((final_epoch + 1) * 3_600 + crate::SIGNAL_DISPUTE_SECS);
+    client.post_signals(
+        &keepers[0],
+        &asset,
+        &signal_set(&env, final_epoch, 9_900_000),
+    );
+
+    let estimate = env.cost_estimate();
+    print_resources(
+        "post_signals, full backfill window (73 epochs) crossing into Final in one call, 5 keepers",
+        &estimate,
+    );
+
+    // Sanity check this test actually measures what it claims: all 5
+    // keepers must have been rewarded by this one call (one
+    // reward_keeper call per distinct poster, grouped), not 0 and not
+    // partially.
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &staking);
+    for keeper in &keepers {
+        assert!(
+            staking_client.reward_keeper_epochs(keeper) > 0,
+            "every one of the 5 rotating keepers must have been rewarded by this call"
+        );
+    }
+    assert_eq!(
+        staking_client.call_count(&soroban_sdk::Symbol::new(&env, "reward_keeper")),
+        KEEPER_COUNT as u32,
+        "exactly one reward_keeper call per distinct poster, not one per epoch"
+    );
+
+    let resources = estimate.resources();
+    assert!(
+        resources.instructions < 400_000_000,
+        "must stay comfortably under tx_max_instructions even with every keeper in the \
+         window rewarded in one call; got {}",
+        resources.instructions
+    );
+    assert!(
+        resources.write_bytes < 132_096,
+        "must stay comfortably under tx_max_write_bytes; got {}",
+        resources.write_bytes
+    );
+}

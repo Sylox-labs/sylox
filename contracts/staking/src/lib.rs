@@ -5,29 +5,39 @@
 //! instruction from RiskOracle and EventRegistry. technical-doc.md
 //! Section 7, 12.3, ADR-004.
 //!
-//! Scope (feat/staking): `Treasury`, `EventRegistry`, `MarketFactory`,
-//! `Series` and `Governor` are not implemented here. Where this
-//! contract needs them, it uses the address passed at `initialize`
-//! (checked via `require_auth()` on calls FROM them) and mocks in
-//! tests stand in for calls made ON them (`EventRegistry`'s bond
-//! calls). `reward_keeper`/`fund_rewards`/`claim_rewards` hold reward
-//! balances in this contract directly rather than routing them
-//! through `Treasury.accrue_reward` (Section 7.5), a stand-in for
-//! until `Treasury` exists; see the PR's "Spec deviations" section.
+//! Scope (feat/treasury): `EventRegistry`, `MarketFactory`, `Series`
+//! and `Governor` are not implemented here. Where this contract needs
+//! them, it uses the address passed at `initialize` (checked via
+//! `require_auth()` on calls FROM them) and mocks in tests stand in
+//! for calls made ON them (`EventRegistry`'s bond calls).
+//!
+//! Lead decision (feat/treasury, task brief): one home for each kind
+//! of money. This contract now holds ONLY participant funds: keeper
+//! bonds, reporter stakes, locked dispute bonds, and `Claimable`
+//! balances owed to a participant (refunds, winnings). Every protocol
+//! fund (fees, slashed funds, keeper and reporter rewards) lives in
+//! `Treasury` instead (Section 12.7), called through `clients.rs`.
+//! feat/staking's own local reward pool (`RewardPool`/
+//! `AccruedReward`/`fund_rewards`/`claim_rewards`) was a stand-in for
+//! until `Treasury` existed; it is removed in this PR, now that it
+//! does.
 //!
 //! Accounting invariants (task brief), tested in `test::property`
 //! and noted again at each function below that could threaten them:
 //!
-//! S1. USDC balance of this contract >= total keeper bonds + total
-//!     reporter stake + total locked bonds + unclaimed `claimable` +
-//!     the unallocated `RewardPool` balance. Every function that
+//! S1. USDC balance of this contract EQUALS total keeper bonds +
+//!     total reporter stake (including stake in cooldown) + total
+//!     locked bonds + unclaimed `claimable` balances, apart from
+//!     direct donations (tightened from `>=` to exact equality in
+//!     feat/treasury, now that every protocol-fund credit has moved
+//!     out to `Treasury`: nothing left in this contract's own
+//!     tracked liabilities is anything OTHER than a participant's
+//!     own funds, so there is no remaining reason for the real
+//!     balance to run ahead of what is tracked). Every function that
 //!     moves USDC (`stake`, `unstake`, `withdraw_keeper_bond`,
 //!     `lock_bond`, `release_bond`/`forfeit_bond`'s `claimable`
-//!     credit, `slash`, `fund_rewards`, `settle_probes`'s reward
-//!     accrual, `claim`/`claim_rewards`) keeps this contract's own
-//!     real balance and its tracked liabilities moving together,
-//!     never letting a liability grow without the matching transfer
-//!     in, or a transfer out exceed what was tracked.
+//!     credit, `slash`, `claim`) keeps this contract's own real
+//!     balance and its tracked liabilities moving together.
 //! S2. A bond (`storage::BondRecord`, keyed by `BondKey`) is either
 //!     Locked (present in storage), Released or Forfeited (absent,
 //!     its value moved to `claimable`); `lock_bond` rejects a key
@@ -36,11 +46,12 @@
 //!     anything, so the same key can satisfy at most one of them.
 //! S3. No function here moves a participant's stake or bond to any
 //!     address other than that participant itself (`unstake`,
-//!     `withdraw_keeper_bond`, `claim`, `claim_rewards`), a named
-//!     dispute winner (`forfeit_bond`'s `winner`, `slash`'s
-//!     `winner`), or `config.treasury` (the other half of every
-//!     `forfeit_bond`/`slash` split, and the whole amount when no
-//!     winner is named). No function here takes an arbitrary
+//!     `withdraw_keeper_bond`, `claim`), or a named dispute winner
+//!     (`forfeit_bond`'s `winner`, `slash`'s `winner`). The treasury
+//!     half of a `forfeit_bond`/`slash` split now leaves via
+//!     `Treasury.deposit` (feat/treasury), never credited as
+//!     `Claimable` inside this contract; see
+//!     `deposit_treasury_share`. No function here takes an arbitrary
 //!     destination address as a parameter.
 //! S4. `aggregate` never writes: it and the pure `aggregation`
 //!     module it calls take only already-read data and return a
@@ -48,14 +59,16 @@
 //!     anywhere in that path.
 
 mod aggregation;
+mod clients;
 mod error;
 mod events;
 mod params;
 mod storage;
 
-use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, Symbol, Vec};
-use sylox_types::{BondKey, EndpointStatus, KeeperInfo, ProbeReport, ReporterInfo};
+use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, IntoVal, Symbol, Vec};
+use sylox_types::{BondKey, EndpointStatus, KeeperInfo, ProbeReport, ReporterInfo, TreasuryBucket};
 
+use clients::TreasuryClient;
 use error::Error;
 use storage::{BondRecord, StoredProbe};
 
@@ -578,11 +591,22 @@ impl Staking {
             let matched = stored.report.status == aggregate;
             if matched {
                 if majority_size > 0 && per_reporter_reward > 0 {
-                    Self::accrue_reward_capped(&env, &reporter, per_reporter_reward);
+                    // feat/treasury: accrues from Treasury's
+                    // ReporterRewards bucket, not a local pool.
+                    // Treasury.accrue_reward itself caps the accrual
+                    // at what the bucket holds and emits
+                    // RewardShortfall if it could not cover the full
+                    // request (Section 12.7, T2); Staking does not
+                    // duplicate that capping or that event.
+                    TreasuryClient::new(&env, &config.treasury).accrue_reward(
+                        &reporter,
+                        &TreasuryBucket::ReporterRewards,
+                        &per_reporter_reward,
+                    );
                 }
                 rewarded += 1;
             } else if majority_size >= params::FAULT_MAJORITY_THRESHOLD {
-                Self::record_fault(&env, &reporter, now, &config.treasury);
+                Self::record_fault(&env, &config, &reporter, now);
                 faulted += 1;
             }
         }
@@ -599,27 +623,11 @@ impl Staking {
         Ok(())
     }
 
-    /// Accrues `amount` to `reporter`'s claimable reward balance,
-    /// capped at whatever `RewardPool` currently holds (Section 7.5:
-    /// "If the bucket runs short, an accrual is capped at what it
-    /// holds; nothing is owed beyond that"). Also records the fault
-    /// side effects (suspension/slash) are handled separately by
-    /// `record_fault`.
-    fn accrue_reward_capped(env: &Env, reporter: &Address, amount: i128) {
-        let pool = storage::get_reward_pool(env);
-        let granted = if amount > pool { pool } else { amount };
-        if granted <= 0 {
-            return;
-        }
-        storage::set_reward_pool(env, pool - granted);
-        storage::add_accrued_reward(env, reporter, granted);
-    }
-
     /// Records one fault for `reporter` at `now`, pruning fault times
     /// outside `FAULT_WINDOW_SECS` first, then slashes and suspends if
     /// the pruned, incremented count exceeds `REPORTER_MAX_FAULTS`
     /// (Section 7.5).
-    fn record_fault(env: &Env, reporter: &Address, now: u64, treasury: &Address) {
+    fn record_fault(env: &Env, config: &Config, reporter: &Address, now: u64) {
         let Some(mut info) = storage::get_reporter(env, reporter) else {
             return;
         };
@@ -651,16 +659,14 @@ impl Staking {
             // No bonded counterparty for a fault slash (Section 7.5
             // gives the split as 50/50 winner/Treasury, but a fault is
             // not a dispute with a winner): the whole amount goes to
-            // the Treasury address, mirroring the "no bonded
-            // counterparty... 100% goes to the Treasury" rule Section
-            // 7.8 states for the analogous case on bond forfeits.
-            // Review fix (found alongside S5): this credit was
-            // previously missing entirely (`let _ = to_treasury;`
-            // discarded it) -- the slashed stake was deducted but
-            // never reached anyone, an S1-adjacent bug of its own
-            // (not an overpay, but a silent loss from the tracked
-            // liabilities side).
-            storage::add_claimable(env, treasury, slash_amount);
+            // the Treasury contract's Slashed bucket, mirroring the
+            // "no bonded counterparty... 100% goes to the Treasury"
+            // rule Section 7.8 states for the analogous case on bond
+            // forfeits. feat/treasury: a real Treasury.deposit call,
+            // not a local Claimable credit (one home for each kind of
+            // money: this is a protocol fund, not owed to any
+            // participant).
+            Self::deposit_treasury_share(env, config, slash_amount);
             events::Slashed {
                 who: reporter.clone(),
                 amount: slash_amount,
@@ -757,9 +763,13 @@ impl Staking {
         Ok(())
     }
 
-    /// 50% to `winner` (if any), 50% to the treasury address (Section
-    /// 7.8). With no bonded counterparty (`winner = None`), 100% goes
-    /// to the treasury instead, per the same section.
+    /// 50% to `winner` (if any), 50% to `Treasury`'s `Slashed` bucket
+    /// (Section 7.8). With no bonded counterparty (`winner = None`),
+    /// 100% goes to `Treasury` instead, per the same section.
+    /// feat/treasury: the treasury half is a real `Treasury.deposit`
+    /// call (`deposit_treasury_share`), never a local `Claimable`
+    /// credit; only the winner's own half, if any, stays `Claimable`
+    /// here (S3: a participant's own funds).
     pub fn forfeit_bond(env: Env, key: BondKey, winner: Option<Address>) -> Result<(), Error> {
         let config = Self::require_config(&env)?;
         Self::require_bond_caller(&env, &config, &key)?;
@@ -769,9 +779,9 @@ impl Staking {
         let (to_winner, to_treasury) = split_half(record.amount);
         if let Some(winner_addr) = &winner {
             storage::add_claimable(&env, winner_addr, to_winner);
-            storage::add_claimable(&env, &config.treasury, to_treasury);
+            Self::deposit_treasury_share(&env, &config, to_treasury);
         } else {
-            storage::add_claimable(&env, &config.treasury, record.amount);
+            Self::deposit_treasury_share(&env, &config, record.amount);
         }
         if let Some(keeper) = &record.subject {
             Self::decrement_open_disputes(&env, keeper);
@@ -862,9 +872,9 @@ impl Staking {
         let (to_winner, to_treasury) = split_half(actual);
         if let Some(winner_addr) = &winner {
             storage::add_claimable(&env, winner_addr, to_winner);
-            storage::add_claimable(&env, &config.treasury, to_treasury);
+            Self::deposit_treasury_share(&env, &config, to_treasury);
         } else {
-            storage::add_claimable(&env, &config.treasury, actual);
+            Self::deposit_treasury_share(&env, &config, actual);
         }
 
         let to_treasury_final = if winner.is_some() {
@@ -885,84 +895,46 @@ impl Staking {
         Ok(())
     }
 
-    /// technical-doc.md Section 12.3: auth `RiskOracle`. Declared in
-    /// the interface `RiskOracle` depends on but not currently called
-    /// from any `RiskOracle` call site (Section 12.3's own note on
-    /// this); implemented here as a flat accrual from the same local
-    /// reward pool `fund_rewards`/`settle_probes` share, mirroring the
-    /// reporter reward design, since leaving half of an interface this
-    /// build must implement exactly unimplemented would be a bigger
-    /// inconsistency than a stand-in amount. `keeper_reward` (Section
-    /// 23, 0.50 USDC per accepted epoch) is the amount used.
-    pub fn reward_keeper(env: Env, keeper: Address) -> Result<(), Error> {
+    /// technical-doc.md Section 12.3, issue #11 fix (feat/treasury).
+    /// Auth: `RiskOracle`. Accrues `keeper_reward * epochs` from
+    /// `Treasury`'s `KeeperRewards` bucket via `Treasury.accrue_reward`,
+    /// only if `keeper` is currently active (added, bonded, not
+    /// removed) and not suspended; otherwise a no-op returning `Ok(0)`,
+    /// not an error, since `RiskOracle`'s own caller (the finality
+    /// scan, grouping newly Final epochs by poster) must not have its
+    /// whole call fail just because one keeper among several became
+    /// ineligible between posting and this call. `Treasury.accrue_reward`
+    /// itself caps the accrual at what the bucket holds and emits
+    /// `RewardShortfall` if it falls short (Section 12.7, "never accrue
+    /// unfunded rewards").
+    pub fn reward_keeper(env: Env, keeper: Address, epochs: u32) -> Result<i128, Error> {
         let config = Self::require_config(&env)?;
         Self::require_oracle_caller(&env, &config)?;
-        if storage::get_keeper(&env, &keeper).is_none() {
+        let Some(info) = storage::get_keeper(&env, &keeper) else {
             return Err(Error::NotKeeper);
+        };
+        if info.suspended || info.removed_at.is_some() || info.bond < params::KEEPER_BOND {
+            return Ok(0);
         }
-        Self::accrue_reward_capped(&env, &keeper, params::KEEPER_REWARD_PER_ACCEPTED_EPOCH);
-        Ok(())
-    }
-
-    // -- rewards (new, feat/staking) --
-
-    /// Anyone may call this now (the task's own scope decision): adds
-    /// `amount` of USDC to the unallocated reward pool `settle_probes`
-    /// and `reward_keeper` accrue from, pulled from `from`. A stand in
-    /// for `Treasury.accrue_reward` (Section 7.5, ADR-004) until
-    /// `Treasury` exists; see the module doc comment.
-    pub fn fund_rewards(env: Env, from: Address, amount: i128) -> Result<(), Error> {
-        from.require_auth();
-        if amount <= 0 {
-            return Err(Error::StakeTooLow);
+        if epochs == 0 {
+            return Ok(0);
         }
-        let config = Self::require_config(&env)?;
-        let usdc = token::TokenClient::new(&env, &config.usdc);
-        usdc.transfer(
-            &from,
-            soroban_sdk::MuxedAddress::from(env.current_contract_address()),
-            &amount,
-        );
-        let pool_after = storage::get_reward_pool(&env)
-            .checked_add(amount)
+        let amount = params::KEEPER_REWARD_PER_ACCEPTED_EPOCH
+            .checked_mul(epochs as i128)
             .ok_or(Error::MathOverflow)?;
-        storage::set_reward_pool(&env, pool_after);
-        events::RewardsFunded {
-            from,
-            amount,
-            pool_after,
-        }
-        .publish(&env);
-        Ok(())
-    }
-
-    /// Pays out `reporter`'s accrued reward balance.
-    pub fn claim_rewards(env: Env, reporter: Address) -> Result<i128, Error> {
-        reporter.require_auth();
-        Self::require_config(&env)?;
-        let amount = storage::get_accrued_reward(&env, &reporter);
-        if amount <= 0 {
-            return Err(Error::NothingToClaim);
-        }
-        storage::clear_accrued_reward(&env, &reporter);
-        let config = Self::require_config(&env)?;
-        let usdc = token::TokenClient::new(&env, &config.usdc);
-        usdc.transfer(
-            &env.current_contract_address(),
-            soroban_sdk::MuxedAddress::from(reporter.clone()),
+        let accrued = TreasuryClient::new(&env, &config.treasury).accrue_reward(
+            &keeper,
+            &TreasuryBucket::KeeperRewards,
             &amount,
         );
-        events::StakingRewardClaimed {
-            who: reporter,
-            amount,
-        }
-        .publish(&env);
-        Ok(amount)
+        Ok(accrued)
     }
 
     /// technical-doc.md Section 7.8, 12.3: pays refunds and winnings
-    /// from bond settlement. Distinct from `claim_rewards` (reporter
-    /// probe rewards): different balance, different funding source.
+    /// from bond settlement. Probe and keeper rewards are claimed
+    /// from `Treasury.claim_reward` instead (feat/treasury): a
+    /// different balance, a different funding source, and no longer
+    /// this contract's concern now that `Treasury` exists.
     pub fn claim(env: Env, who: Address) -> Result<i128, Error> {
         who.require_auth();
         let config = Self::require_config(&env)?;
@@ -1006,14 +978,6 @@ impl Staking {
 
     pub fn claimable(env: Env, who: Address) -> i128 {
         storage::get_claimable(&env, &who)
-    }
-
-    pub fn accrued_reward(env: Env, who: Address) -> i128 {
-        storage::get_accrued_reward(&env, &who)
-    }
-
-    pub fn reward_pool(env: Env) -> i128 {
-        storage::get_reward_pool(&env)
     }
 
     /// Returns every still present probe for (asset, epoch), decoded
@@ -1109,6 +1073,50 @@ impl Staking {
             .instance()
             .get(&CONFIG_KEY)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// feat/treasury: deposits `amount` of this contract's own USDC
+    /// into `Treasury`'s `Slashed` bucket, the treasury half of a
+    /// `slash`/`forfeit_bond` split (lead decision: one home for each
+    /// kind of money, protocol funds live only in `Treasury`).
+    /// `Treasury.deposit`'s own body calls `from.require_auth()`
+    /// where `from` is this contract's address, then transfers via
+    /// the USDC SAC, which itself calls `from.require_auth()` again,
+    /// a SECOND hop past this contract's own direct call into
+    /// `Treasury.deposit` (the first hop is automatically authorized;
+    /// Soroban auto-authorizes only a contract's own DIRECT calls,
+    /// never a call two hops down). `authorize_as_current_contract`
+    /// pre-authorizes that second hop (the SAC's `transfer`) on this
+    /// contract's behalf, matching the pattern technical-doc.md
+    /// Section 12.7 describes for `Series.buy_cover`'s fee deposit.
+    fn deposit_treasury_share(env: &Env, config: &Config, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let here = env.current_contract_address();
+        env.authorize_as_current_contract(soroban_sdk::vec![
+            env,
+            soroban_sdk::auth::InvokerContractAuthEntry::Contract(
+                soroban_sdk::auth::SubContractInvocation {
+                    context: soroban_sdk::auth::ContractContext {
+                        contract: config.usdc.clone(),
+                        fn_name: Symbol::new(env, "transfer"),
+                        args: soroban_sdk::vec![
+                            env,
+                            here.into_val(env),
+                            config.treasury.clone().into_val(env),
+                            amount.into_val(env),
+                        ],
+                    },
+                    sub_invocations: soroban_sdk::vec![env],
+                }
+            )
+        ]);
+        TreasuryClient::new(env, &config.treasury).deposit(
+            &here,
+            &TreasuryBucket::Slashed,
+            &amount,
+        );
     }
 }
 

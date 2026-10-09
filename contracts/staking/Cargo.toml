@@ -16,6 +16,7 @@ sylox-types = { workspace = true }
 [dev-dependencies]
 proptest = "1.11.0"
 risk-oracle = { path = "../risk-oracle", features = ["testutils"] }
+treasury = { path = "../treasury", features = ["testutils"] }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 
 [features]

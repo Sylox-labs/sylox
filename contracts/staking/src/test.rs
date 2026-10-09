@@ -1,18 +1,23 @@
 //! Staking test suite. technical-doc.md Section 7, 12.3; the task
-//! brief's TESTS section; and the four lead-decision rounds' own test
+//! brief's TESTS section; and the lead-decision rounds' own test
 //! lists (settlement-expiry safety, removed-reporter/keeper handling,
-//! keeper-dispute linkage, parameter derivation).
+//! keeper-dispute linkage, parameter derivation, Treasury split).
 //!
-//! S1-S4 (accounting invariants, task brief):
-//! S1. USDC balance of Staking >= total keeper bonds + total reporter
-//!     stake + total locked bonds + unclaimed rewards + unallocated
-//!     reward balance. Tested by `property::s1_s2_s3_never_break`.
+//! S1-S4 (accounting invariants, task brief, tightened in
+//! feat/treasury now that every protocol fund lives in `Treasury`):
+//! S1. USDC balance of Staking EQUALS total keeper bonds + total
+//!     reporter stake (including stake in cooldown) + total locked
+//!     bonds + unclaimed `claimable` balances, apart from direct
+//!     donations. Tested by `property::s1_s2_s3_never_break` and
+//!     `staking_balance_equals_tracked_liabilities_exactly`.
 //! S2. A bond is either Locked, Released or Forfeited, and moves at
 //!     most once. Tested by `release_bond_and_forfeit_bond_on_the_same_key_decrements_once`
 //!     and `property::s1_s2_s3_never_break`.
 //! S3. No function moves a participant's stake or bond to anyone
-//!     other than that participant, a dispute winner, or the
-//!     treasury. Tested by `property::s1_s2_s3_never_break`.
+//!     other than that participant or a dispute winner (the treasury
+//!     half of a slash/forfeit now leaves via a real `Treasury.deposit`
+//!     call, never a local `Claimable` credit). Tested by
+//!     `property::s1_s2_s3_never_break`.
 //! S4. aggregate never writes. Tested by
 //!     `aggregate_never_writes_to_storage`.
 
@@ -24,7 +29,7 @@ mod property;
 
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{token, Address, BytesN, Env, Symbol};
-use sylox_types::{BondKey, EndpointStatus, ProbeReport};
+use sylox_types::{BondKey, EndpointStatus, ProbeReport, TreasuryBucket};
 
 use crate::{params, Error, Staking, StakingClient};
 
@@ -37,6 +42,7 @@ struct Fixture<'a> {
     oracle: Address,
     registry: Address,
     treasury: Address,
+    treasury_client: treasury::TreasuryClient<'a>,
     usdc: Address,
     usdc_admin_client: token::StellarAssetClient<'a>,
     usdc_client: token::TokenClient<'a>,
@@ -45,7 +51,10 @@ struct Fixture<'a> {
 /// A real Stellar Asset Contract for USDC (the task's own requirement:
 /// "Use a real Stellar Asset Contract for USDC in tests
 /// (register_stellar_asset_contract_v2), not a mock token"), not a
-/// mock token contract.
+/// mock token contract. A real `Treasury` contract, not a mock,
+/// since feat/treasury's whole point is that `Staking` now calls the
+/// genuine `Treasury.deposit`/`accrue_reward`, and this suite's own
+/// slash/forfeit/reward tests need to see those calls actually land.
 fn setup(env: &Env) -> Fixture<'_> {
     // Not plain mock_all_auths(): test helpers like lock_bond's caller
     // (the "oracle") authorizing a transfer FROM a third address (the
@@ -60,7 +69,6 @@ fn setup(env: &Env) -> Fixture<'_> {
     let governor = Address::generate(env);
     let oracle = Address::generate(env);
     let registry = Address::generate(env);
-    let treasury = Address::generate(env);
 
     let sac_admin = Address::generate(env);
     let sac = env.register_stellar_asset_contract_v2(sac_admin);
@@ -70,7 +78,12 @@ fn setup(env: &Env) -> Fixture<'_> {
 
     let contract_id = env.register(Staking, ());
     let client = StakingClient::new(env, &contract_id);
-    client.initialize(&governor, &oracle, &registry, &treasury, &usdc);
+
+    let treasury_id = env.register(treasury::Treasury, ());
+    let treasury_client = treasury::TreasuryClient::new(env, &treasury_id);
+    treasury_client.initialize(&governor, &contract_id, &usdc);
+
+    client.initialize(&governor, &oracle, &registry, &treasury_id, &usdc);
 
     Fixture {
         client,
@@ -78,7 +91,8 @@ fn setup(env: &Env) -> Fixture<'_> {
         governor,
         oracle,
         registry,
-        treasury,
+        treasury: treasury_id,
+        treasury_client,
         usdc,
         usdc_admin_client,
         usdc_client,
@@ -86,9 +100,19 @@ fn setup(env: &Env) -> Fixture<'_> {
 }
 
 /// Mints `amount` of the fixture's USDC to `who` and returns it so a
-/// test can immediately `stake`/`fund_rewards`/etc.
+/// test can immediately `stake`/etc.
 fn fund(fx: &Fixture, who: &Address, amount: i128) {
     fx.usdc_admin_client.mint(who, &amount);
+}
+
+/// Funds `Treasury`'s `bucket` with `amount`, via a genuine
+/// `Treasury.deposit` call from a freshly minted address, so reward
+/// tests (`settle_probes`, `reward_keeper`) have a real, non-empty
+/// bucket to accrue from.
+fn fund_treasury_bucket(env: &Env, fx: &Fixture, bucket: TreasuryBucket, amount: i128) {
+    let funder = Address::generate(env);
+    fund(fx, &funder, amount);
+    fx.treasury_client.deposit(&funder, &bucket, &amount);
 }
 
 fn add_and_fund_keeper(env: &Env, fx: &Fixture, amount: i128) -> Address {
@@ -841,10 +865,12 @@ fn settle_probes_funds_rewards_split_equally_among_matching_reporters() {
     let env = Env::default();
     let fx = setup(&env);
     let asset = Address::generate(&env);
-    let funder = Address::generate(&env);
-    fund(&fx, &funder, params::REPORTER_REWARD_PER_EPOCH);
-    fx.client
-        .fund_rewards(&funder, &params::REPORTER_REWARD_PER_EPOCH);
+    fund_treasury_bucket(
+        &env,
+        &fx,
+        TreasuryBucket::ReporterRewards,
+        params::REPORTER_REWARD_PER_EPOCH,
+    );
 
     let [r1, r2, r3] = submit_unanimous(&env, &fx, &asset, 0, EndpointStatus::Up);
     env.ledger().set_timestamp(settlement_opens(0));
@@ -852,7 +878,7 @@ fn settle_probes_funds_rewards_split_equally_among_matching_reporters() {
 
     let share = params::REPORTER_REWARD_PER_EPOCH / 3;
     for r in [&r1, &r2, &r3] {
-        assert_eq!(fx.client.accrued_reward(r), share);
+        assert_eq!(fx.treasury_client.accrued(r), share);
     }
 }
 
@@ -861,15 +887,18 @@ fn settle_probes_reward_accrual_never_exceeds_the_funded_balance() {
     let env = Env::default();
     let fx = setup(&env);
     let asset = Address::generate(&env);
-    // No fund_rewards call at all: the pool is empty.
+    // No fund_treasury_bucket call at all: ReporterRewards is empty.
     let [r1, r2, r3] = submit_unanimous(&env, &fx, &asset, 0, EndpointStatus::Up);
     env.ledger().set_timestamp(settlement_opens(0));
     fx.client.settle_probes(&asset, &0);
 
     for r in [&r1, &r2, &r3] {
-        assert_eq!(fx.client.accrued_reward(r), 0);
+        assert_eq!(fx.treasury_client.accrued(r), 0);
     }
-    assert_eq!(fx.client.reward_pool(), 0);
+    assert_eq!(
+        fx.treasury_client.balance(&TreasuryBucket::ReporterRewards),
+        0
+    );
 }
 
 #[test]
@@ -956,7 +985,10 @@ fn an_epoch_nobody_settles_before_probe_ttl_expiry_leaves_state_unchanged() {
     // behavior, not a panic or an inconsistent write.
     let result = fx.client.try_settle_probes(&asset, &0);
     assert_eq!(result, Err(Ok(Error::SettlementWindowExpired)));
-    assert_eq!(fx.client.reward_pool(), 0);
+    assert_eq!(
+        fx.treasury_client.balance(&TreasuryBucket::ReporterRewards),
+        0
+    );
 }
 
 #[test]
@@ -1029,10 +1061,12 @@ fn removed_reporter_who_matched_the_majority_can_still_claim_rewards() {
     let env = Env::default();
     let fx = setup(&env);
     let asset = Address::generate(&env);
-    let funder = Address::generate(&env);
-    fund(&fx, &funder, params::REPORTER_REWARD_PER_EPOCH);
-    fx.client
-        .fund_rewards(&funder, &params::REPORTER_REWARD_PER_EPOCH);
+    fund_treasury_bucket(
+        &env,
+        &fx,
+        TreasuryBucket::ReporterRewards,
+        params::REPORTER_REWARD_PER_EPOCH,
+    );
 
     let [r1, r2, r3] = submit_unanimous(&env, &fx, &asset, 0, EndpointStatus::Up);
     fx.client.remove_reporter(&r1);
@@ -1040,13 +1074,75 @@ fn removed_reporter_who_matched_the_majority_can_still_claim_rewards() {
     env.ledger().set_timestamp(settlement_opens(0));
     fx.client.settle_probes(&asset, &0);
 
-    let accrued_before_claim = fx.client.accrued_reward(&r1);
+    let accrued_before_claim = fx.treasury_client.accrued(&r1);
     assert!(accrued_before_claim > 0);
-    let claimed = fx.client.claim_rewards(&r1);
+    let claimed = fx.treasury_client.claim_reward(&r1);
     assert_eq!(claimed, accrued_before_claim);
-    assert_eq!(fx.client.accrued_reward(&r1), 0);
+    assert_eq!(fx.treasury_client.accrued(&r1), 0);
     assert_eq!(fx.usdc_client.balance(&r1), claimed);
     let _ = (r2, r3);
+}
+
+// -- S1 (feat/treasury): Staking's balance equals every tracked
+// liability, exactly, not merely >= -- across a mixed scenario
+// touching every kind of liability at once (task brief, Part 2 item
+// 4) --
+
+#[test]
+fn staking_balance_equals_tracked_liabilities_exactly() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let disputer = Address::generate(&env);
+    fund(&fx, &disputer, 10_000_000_000);
+
+    // Keeper bond.
+    let keeper = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    // Reporter stake, including a slice voluntarily put into
+    // unstake cooldown (still locked and counted, Section 7.7/
+    // ADR-011: stake in cooldown stays slashable and tracked until
+    // actually withdrawn).
+    let reporter = add_and_fund_reporter(&env, &fx, &region(&env, "eu"), params::REPORTER_STAKE);
+    fx.client
+        .unstake_request(&reporter, &params::REPORTER_STAKE);
+    // A locked signal dispute bond, naming the keeper as subject.
+    let key = BondKey::SignalDispute(asset, 0);
+    fx.client
+        .lock_bond(&key, &disputer, &1_000_000_000, &Some(keeper.clone()));
+    // A claimable balance (release the bond back to the disputer).
+    fx.client.release_bond(&key);
+
+    let tracked_liabilities = fx.client.keeper(&keeper).unwrap().bond
+        + fx.client.reporter(&reporter).unwrap().stake
+        + fx.client.bond(&key).map(|(_, amt)| amt).unwrap_or(0)
+        + fx.client.claimable(&disputer);
+    let balance = fx.usdc_client.balance(&fx.contract_id);
+    assert_eq!(
+        balance, tracked_liabilities,
+        "S1 violated: Staking balance {} != tracked liabilities {}",
+        balance, tracked_liabilities
+    );
+
+    // Now slash the keeper (a protocol fund leaves for Treasury) and
+    // claim the disputer's refund (a participant fund leaves to its
+    // owner); the equality must still hold afterward.
+    fx.client.slash(
+        &keeper,
+        &1_000_000_000,
+        &Some(disputer.clone()),
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
+    fx.client.claim(&disputer);
+
+    let tracked_liabilities = fx.client.keeper(&keeper).unwrap().bond
+        + fx.client.reporter(&reporter).unwrap().stake
+        + fx.client.claimable(&disputer);
+    let balance = fx.usdc_client.balance(&fx.contract_id);
+    assert_eq!(
+        balance, tracked_liabilities,
+        "S1 violated after slash+claim: Staking balance {} != tracked liabilities {}",
+        balance, tracked_liabilities
+    );
 }
 
 // -- lock_bond / release_bond / forfeit_bond --
@@ -1202,7 +1298,10 @@ fn forfeit_bond_splits_50_50_between_winner_and_treasury() {
 
     fx.client.forfeit_bond(&key, &Some(winner.clone()));
     assert_eq!(fx.client.claimable(&winner), 500_000_000);
-    assert_eq!(fx.client.claimable(&fx.treasury), 500_000_000);
+    assert_eq!(
+        fx.treasury_client.balance(&TreasuryBucket::Slashed),
+        500_000_000
+    );
 }
 
 #[test]
@@ -1215,7 +1314,10 @@ fn forfeit_bond_with_no_winner_sends_the_full_amount_to_the_treasury() {
     fx.client.lock_bond(&key, &proposer, &1_000_000_000, &None);
 
     fx.client.forfeit_bond(&key, &None);
-    assert_eq!(fx.client.claimable(&fx.treasury), 1_000_000_000);
+    assert_eq!(
+        fx.treasury_client.balance(&TreasuryBucket::Slashed),
+        1_000_000_000
+    );
 }
 
 #[test]
@@ -1278,7 +1380,10 @@ fn slash_a_keeper_reduces_the_bond_and_splits_50_50() {
         params::KEEPER_BOND - amount
     );
     assert_eq!(fx.client.claimable(&disputer), amount / 2);
-    assert_eq!(fx.client.claimable(&fx.treasury), amount - amount / 2);
+    assert_eq!(
+        fx.treasury_client.balance(&TreasuryBucket::Slashed),
+        amount - amount / 2
+    );
 }
 
 // -- S5: slash must never pay out more than it actually deducts --
@@ -1304,20 +1409,23 @@ fn slash_a_keeper_below_the_amount_pays_out_only_what_was_actually_held() {
     assert_eq!(fx.client.keeper(&keeper).unwrap().bond, 0);
     let actual = params::KEEPER_BOND;
     assert_eq!(fx.client.claimable(&disputer), actual / 2);
-    assert_eq!(fx.client.claimable(&fx.treasury), actual - actual / 2);
+    assert_eq!(
+        fx.treasury_client.balance(&TreasuryBucket::Slashed),
+        actual - actual / 2
+    );
 
-    // S1: the contract's own USDC balance must still cover every
-    // claimable balance it just created. If slash had paid out the
-    // full `requested` amount instead of `actual`, this would fail:
-    // claimable(disputer) + claimable(treasury) would exceed what the
-    // keeper ever deposited.
+    // S1: the contract's own USDC balance must still exactly cover
+    // every claimable balance it still tracks (the treasury half has
+    // genuinely left, via a real Treasury.deposit call). If slash had
+    // paid out the full `requested` amount instead of `actual`, this
+    // would fail: claimable(disputer) would exceed what the keeper
+    // ever deposited.
     let balance = fx.usdc_client.balance(&fx.contract_id);
-    let liabilities = fx.client.claimable(&disputer) + fx.client.claimable(&fx.treasury);
-    assert!(
-        balance >= liabilities,
-        "S1 violated: balance {} < liabilities {}",
-        balance,
-        liabilities
+    let liabilities = fx.client.claimable(&disputer);
+    assert_eq!(
+        balance, liabilities,
+        "S1 violated: balance {} != liabilities {}",
+        balance, liabilities
     );
 }
 
@@ -1336,16 +1444,14 @@ fn slash_a_reporter_below_the_amount_pays_out_only_what_was_actually_held() {
     );
 
     assert_eq!(fx.client.reporter(&reporter).unwrap().stake, 0);
-    assert_eq!(fx.client.claimable(&fx.treasury), params::REPORTER_STAKE);
-
-    let balance = fx.usdc_client.balance(&fx.contract_id);
-    let liabilities = fx.client.claimable(&fx.treasury);
-    assert!(
-        balance >= liabilities,
-        "S1 violated: balance {} < liabilities {}",
-        balance,
-        liabilities
+    assert_eq!(
+        fx.treasury_client.balance(&TreasuryBucket::Slashed),
+        params::REPORTER_STAKE
     );
+
+    // S1: nothing is left claimable inside Staking for this slash (no
+    // winner was named), so Staking's own balance should be back to 0.
+    assert_eq!(fx.usdc_client.balance(&fx.contract_id), 0);
 }
 
 #[test]
@@ -1377,13 +1483,13 @@ fn two_slashes_in_a_row_exceeding_the_bond_in_total_never_overpay() {
 
     let total_actual = params::KEEPER_BOND;
     let balance = fx.usdc_client.balance(&fx.contract_id);
-    let liabilities = fx.client.claimable(&disputer) + fx.client.claimable(&fx.treasury);
-    assert_eq!(liabilities, total_actual);
-    assert!(
-        balance >= liabilities,
-        "S1 violated: balance {} < liabilities {}",
-        balance,
-        liabilities
+    let liabilities = fx.client.claimable(&disputer);
+    let to_treasury = fx.treasury_client.balance(&TreasuryBucket::Slashed);
+    assert_eq!(liabilities + to_treasury, total_actual);
+    assert_eq!(
+        balance, liabilities,
+        "S1 violated: balance {} != liabilities {}",
+        balance, liabilities
     );
 }
 
@@ -1405,7 +1511,7 @@ fn slash_a_reporter_with_no_winner_sends_the_full_amount_to_the_treasury() {
         fx.client.reporter(&reporter).unwrap().stake,
         params::REPORTER_STAKE - amount
     );
-    assert_eq!(fx.client.claimable(&fx.treasury), amount);
+    assert_eq!(fx.treasury_client.balance(&TreasuryBucket::Slashed), amount);
 }
 
 #[test]
@@ -1457,22 +1563,25 @@ fn slash_does_not_count_a_fault_outside_the_fault_window() {
     assert!(!fx.client.keeper(&keeper).unwrap().suspended);
 }
 
-// -- reward_keeper / fund_rewards / claim_rewards / claim --
+// -- reward_keeper (issue #11 fix, feat/treasury) / claim --
 
 #[test]
-fn reward_keeper_requires_oracle_auth_and_accrues_the_flat_amount() {
+fn reward_keeper_requires_oracle_auth_and_accrues_keeper_reward_times_epochs() {
     let env = Env::default();
     let fx = setup(&env);
     let keeper = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
-    let funder = Address::generate(&env);
-    fund(&fx, &funder, params::KEEPER_REWARD_PER_ACCEPTED_EPOCH);
-    fx.client
-        .fund_rewards(&funder, &params::KEEPER_REWARD_PER_ACCEPTED_EPOCH);
+    fund_treasury_bucket(
+        &env,
+        &fx,
+        TreasuryBucket::KeeperRewards,
+        params::KEEPER_REWARD_PER_ACCEPTED_EPOCH * 3,
+    );
 
-    fx.client.reward_keeper(&keeper);
+    let accrued = fx.client.reward_keeper(&keeper, &3);
+    assert_eq!(accrued, params::KEEPER_REWARD_PER_ACCEPTED_EPOCH * 3);
     assert_eq!(
-        fx.client.accrued_reward(&keeper),
-        params::KEEPER_REWARD_PER_ACCEPTED_EPOCH
+        fx.treasury_client.accrued(&keeper),
+        params::KEEPER_REWARD_PER_ACCEPTED_EPOCH * 3
     );
 }
 
@@ -1480,36 +1589,78 @@ fn reward_keeper_requires_oracle_auth_and_accrues_the_flat_amount() {
 fn reward_keeper_rejects_an_unregistered_keeper() {
     let env = Env::default();
     let fx = setup(&env);
-    let result = fx.client.try_reward_keeper(&Address::generate(&env));
+    let result = fx.client.try_reward_keeper(&Address::generate(&env), &1);
     assert_eq!(result, Err(Ok(Error::NotKeeper)));
 }
 
 #[test]
-fn fund_rewards_rejects_a_non_positive_amount() {
+fn reward_keeper_is_a_no_op_for_a_suspended_keeper() {
     let env = Env::default();
     let fx = setup(&env);
-    let funder = Address::generate(&env);
-    let result = fx.client.try_fund_rewards(&funder, &0);
-    assert_eq!(result, Err(Ok(Error::StakeTooLow)));
+    let keeper = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    let disputer = Address::generate(&env);
+    for i in 0..(params::KEEPER_MAX_FAULTS + 1) {
+        env.ledger().set_timestamp(i as u64 * 10);
+        fx.client.slash(
+            &keeper,
+            &1_000_000,
+            &Some(disputer.clone()),
+            &BytesN::from_array(&env, &[0u8; 32]),
+        );
+    }
+    assert!(fx.client.keeper(&keeper).unwrap().suspended);
+
+    fund_treasury_bucket(
+        &env,
+        &fx,
+        TreasuryBucket::KeeperRewards,
+        params::KEEPER_REWARD_PER_ACCEPTED_EPOCH,
+    );
+    let accrued = fx.client.reward_keeper(&keeper, &1);
+    assert_eq!(accrued, 0);
+    assert_eq!(fx.treasury_client.accrued(&keeper), 0);
 }
 
 #[test]
-fn fund_rewards_is_callable_by_anyone_and_adds_to_the_pool() {
+fn reward_keeper_is_a_no_op_for_a_removed_keeper() {
     let env = Env::default();
     let fx = setup(&env);
-    let anyone = Address::generate(&env);
-    fund(&fx, &anyone, 5_000_000_000);
-    fx.client.fund_rewards(&anyone, &5_000_000_000);
-    assert_eq!(fx.client.reward_pool(), 5_000_000_000);
+    let keeper = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    fx.client.remove_keeper(&keeper);
+    fund_treasury_bucket(
+        &env,
+        &fx,
+        TreasuryBucket::KeeperRewards,
+        params::KEEPER_REWARD_PER_ACCEPTED_EPOCH,
+    );
+    let accrued = fx.client.reward_keeper(&keeper, &1);
+    assert_eq!(accrued, 0);
 }
 
 #[test]
-fn claim_rewards_rejects_when_nothing_is_accrued() {
+fn reward_keeper_unfunded_bucket_accrues_only_what_is_there() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let keeper = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    // Fund less than keeper_reward * epochs would need.
+    let partial = params::KEEPER_REWARD_PER_ACCEPTED_EPOCH;
+    fund_treasury_bucket(&env, &fx, TreasuryBucket::KeeperRewards, partial);
+
+    let accrued = fx.client.reward_keeper(&keeper, &3);
+    assert_eq!(accrued, partial);
+    assert_eq!(
+        fx.treasury_client.balance(&TreasuryBucket::KeeperRewards),
+        0
+    );
+}
+
+#[test]
+fn claim_reward_on_treasury_rejects_when_nothing_is_accrued() {
     let env = Env::default();
     let fx = setup(&env);
     let reporter = add_and_fund_reporter(&env, &fx, &region(&env, "eu"), params::REPORTER_STAKE);
-    let result = fx.client.try_claim_rewards(&reporter);
-    assert_eq!(result, Err(Ok(Error::NothingToClaim)));
+    let result = fx.treasury_client.try_claim_reward(&reporter);
+    assert_eq!(result, Err(Ok(treasury::Error::NothingToClaim)));
 }
 
 #[test]

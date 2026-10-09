@@ -23,7 +23,7 @@ pub trait Staking {
     fn release_bond(env: Env, key: BondKey);
     fn forfeit_bond(env: Env, key: BondKey, winner: Option<Address>);
     fn slash(env: Env, who: Address, amount: i128, winner: Option<Address>, reason: BytesN<32>);
-    fn reward_keeper(env: Env, keeper: Address);
+    fn reward_keeper(env: Env, keeper: Address, epochs: u32) -> i128;
 }
 
 /// technical-doc.md Section 3.3. One per Soroban AMM, listed per asset in

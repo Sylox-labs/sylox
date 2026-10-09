@@ -84,15 +84,49 @@ impl MockStaking {
         let _ = (who, amount, winner, reason);
     }
 
-    pub fn reward_keeper(env: Env, keeper: Address) {
+    pub fn reward_keeper(env: Env, keeper: Address, epochs: u32) -> i128 {
         record_call(&env, "reward_keeper");
-        let _ = keeper;
+        // Accumulated across every call for this keeper (a real
+        // epoch, once rewarded, is never rewarded again, so a
+        // genuinely correct caller's calls for the same keeper only
+        // ever add up, never overlap): lets a test assert the total
+        // epochs ever credited to a keeper across a whole scenario,
+        // not just one call. `last_call_epochs` separately tracks
+        // the MOST RECENT call's own argument, for a test that wants
+        // to check one specific call never claimed more than one
+        // epoch's worth of credit per keeper.
+        let total = Self::reward_keeper_epochs(env.clone(), keeper.clone()) + epochs;
+        env.storage()
+            .temporary()
+            .set(&StakingKey::RewardKeeperEpochs(keeper.clone()), &total);
+        env.storage()
+            .temporary()
+            .set(&StakingKey::LastRewardKeeperCall(keeper), &epochs);
+        epochs as i128
     }
 
     pub fn call_count(env: Env, name: Symbol) -> u32 {
         env.storage()
             .temporary()
             .get(&StakingKey::CallCount(name))
+            .unwrap_or(0)
+    }
+
+    /// Total epochs ever credited to `keeper` via `reward_keeper`,
+    /// across every call so far.
+    pub fn reward_keeper_epochs(env: Env, keeper: Address) -> u32 {
+        env.storage()
+            .temporary()
+            .get(&StakingKey::RewardKeeperEpochs(keeper))
+            .unwrap_or(0)
+    }
+
+    /// The `epochs` argument `reward_keeper` was called with the most
+    /// recent time it was called for `keeper` (0 if never called).
+    pub fn last_reward_keeper_call_epochs(env: Env, keeper: Address) -> u32 {
+        env.storage()
+            .temporary()
+            .get(&StakingKey::LastRewardKeeperCall(keeper))
             .unwrap_or(0)
     }
 }
@@ -115,6 +149,8 @@ enum StakingKey {
     Active(Address),
     Aggregate(Address, u64),
     CallCount(Symbol),
+    RewardKeeperEpochs(Address),
+    LastRewardKeeperCall(Address),
 }
 
 /// Mock `PriceAdapter`: returns whatever was last set with `set_price`
