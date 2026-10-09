@@ -34,16 +34,21 @@ invoke_view() {
 }
 
 # -- Reads --
+#
+# Every check below is a real call against the live contract, not a
+# check that its id merely looks like a contract id: a dead or wrong
+# address fails the call itself (confirmed against a syntactically
+# valid but non-existent address: "contract not found", exit 1), so
+# there's no separate liveness check needed on top of the value
+# checks already here. TUSD has no other call anywhere in this
+# script, so it gets one of its own.
 
-for pair in "RiskOracle:$RO_ID" "Staking:$ST_ID" "Treasury:$TR_ID" "EventRegistry:$ER_ID" "TUSD:$TUSD_ID"; do
-  label="${pair%%:*}"
-  id="${pair#*:}"
-  if [[ "$id" =~ ^C[A-Z0-9]{55}$ ]]; then
-    pass "$label contract id looks well-formed ($id)"
-  else
-    fail "$label contract id malformed: $id"
-  fi
-done
+out="$("$STELLAR_BIN" contract invoke --id "$TUSD_ID" --source-account "$ADMIN_ADDR" --network testnet --send=no -- decimals 2>&1)"
+if [[ "$out" == "7" ]]; then
+  pass "TUSD responds (decimals() == 7)"
+else
+  fail "TUSD.decimals() failed or returned an unexpected value, contract may be dead or misaddressed: $out"
+fi
 
 out="$(invoke_view "$ST_ID" is_active_keeper --keeper "$KEEPER_ADDR")"
 if [[ "$out" == "true" ]]; then
@@ -68,10 +73,10 @@ else
 fi
 
 out="$(invoke_view "$RO_ID" newest_epoch --asset "$ASSET_ID")"
-if [[ "$out" != "null" && -n "$out" ]]; then
+if [[ "$out" =~ ^[0-9]+$ ]]; then
   pass "RiskOracle.newest_epoch(asset) is Some ($out)"
 else
-  fail "RiskOracle.newest_epoch(asset) is $out, expected Some; run deploy/post-demo-signals.sh testnet first"
+  fail "RiskOracle.newest_epoch(asset) is not a number ($out), expected Some; run deploy/post-demo-signals.sh testnet first or check the contract is live"
 fi
 
 out="$(invoke_view "$ER_ID" current_version --asset "$ASSET_ID" --kind '"Depeg"')"
@@ -118,7 +123,7 @@ freshest_closed=$(( NOW / EPOCH_SECS - 1 ))
 
 FRESH_EPOCH=""
 EXPECT_NEWEST=0
-if [[ "$current_newest" == "null" || -z "$current_newest" || "$current_newest" -lt "$freshest_closed" ]]; then
+if [[ ! "$current_newest" =~ ^[0-9]+$ || "$current_newest" -lt "$freshest_closed" ]]; then
   FRESH_EPOCH="$freshest_closed"
   EXPECT_NEWEST=1
 else
