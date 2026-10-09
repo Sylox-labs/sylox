@@ -1106,6 +1106,136 @@ fn update_asset_rejects_reference_asset() {
     assert_eq!(result, Err(Ok(Error::ReferenceNotSupported)));
 }
 
+// -- reward_keeper on the finality scan (issue #11 fix, feat/treasury) --
+
+#[test]
+fn one_keeper_is_rewarded_exactly_once_per_newly_final_epoch() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper = Address::generate(&env);
+
+    env.ledger().set_timestamp(time_at_epoch(0));
+    fx.client
+        .post_signals(&keeper, &asset, &signal_set(&env, 0, 9_900_000));
+
+    // Finality for epoch 0 is still pending (SIGNAL_DISPUTE_SECS has
+    // not elapsed); the scan that already ran inside post_signals
+    // found nothing new to reward yet.
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper), 0);
+
+    // Advance past the dispute window and touch the asset again
+    // (finalize_endpoint is the permissionless sweep trigger): epoch
+    // 0 is now observed Final for the first time, and the keeper who
+    // posted it is rewarded for exactly 1 epoch.
+    env.ledger()
+        .set_timestamp(time_at_epoch(0) + crate::SIGNAL_DISPUTE_SECS + 1);
+    fx.client.finalize_endpoint(&asset, &0);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper), 1);
+
+    // A second sweep (any later state-changing call) must not reward
+    // the same already-announced epoch again: the mock records only
+    // the most recent call's own epochs argument, so if reward_keeper
+    // were called again for this keeper with a nonzero count, this
+    // would still read 1, not 2; call_count being unchanged below is
+    // the stronger, unambiguous check that reward_keeper was not
+    // invoked a second time at all.
+    let calls_before = staking_client.call_count(&soroban_sdk::Symbol::new(&env, "reward_keeper"));
+    fx.client.finalize_endpoint(&asset, &0);
+    let calls_after = staking_client.call_count(&soroban_sdk::Symbol::new(&env, "reward_keeper"));
+    assert_eq!(calls_before, calls_after);
+}
+
+#[test]
+fn two_keepers_posting_different_epochs_are_each_rewarded_their_own_count_in_one_sweep() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper_a = Address::generate(&env);
+    let keeper_b = Address::generate(&env);
+
+    // keeper_a posts epochs 0 and 1; keeper_b posts epoch 2, all
+    // close enough together that none of the three individually
+    // crosses into Final (SIGNAL_DISPUTE_SECS past its own post
+    // time) until the single later finalize_endpoint call below,
+    // which observes all three as newly Final in one sweep. Posting
+    // epoch 2 only 2 * EPOCH_SECS after epoch 0 (not at its exact
+    // pending_until boundary) keeps this test from depending on
+    // whichever post happens to land exactly when an earlier
+    // epoch's own window closes.
+    env.ledger().set_timestamp(time_at_epoch(0));
+    fx.client
+        .post_signals(&keeper_a, &asset, &signal_set(&env, 0, 9_900_000));
+    env.ledger().set_timestamp(time_at_epoch(1));
+    fx.client
+        .post_signals(&keeper_a, &asset, &signal_set(&env, 1, 9_900_000));
+    env.ledger().set_timestamp(time_at_epoch(2));
+    fx.client
+        .post_signals(&keeper_b, &asset, &signal_set(&env, 2, 9_900_000));
+
+    let calls_before_sweep =
+        staking_client_for(&env, &fx).call_count(&soroban_sdk::Symbol::new(&env, "reward_keeper"));
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(2) + crate::SIGNAL_DISPUTE_SECS + 1);
+    fx.client.finalize_endpoint(&asset, &2);
+
+    let staking_client = staking_client_for(&env, &fx);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper_a), 2);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper_b), 1);
+    // Exactly one reward_keeper call per distinct poster in this one
+    // sweep (2 posters), never one call per epoch (which would have
+    // been 3): checked as a delta across just this sweep, since
+    // earlier posts may themselves have already triggered a reward
+    // if an epoch happened to cross into Final mid-sequence.
+    let calls_after_sweep =
+        staking_client.call_count(&soroban_sdk::Symbol::new(&env, "reward_keeper"));
+    assert_eq!(calls_after_sweep - calls_before_sweep, 2);
+}
+
+fn staking_client_for<'a>(env: &'a Env, fx: &Fixture<'a>) -> crate::mocks::MockStakingClient<'a> {
+    crate::mocks::MockStakingClient::new(env, &fx.staking)
+}
+
+#[test]
+fn an_overturned_epoch_is_never_rewarded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let governor_client = crate::mocks::MockGovernorClient::new(&env, &governor);
+    let committee = Address::generate(&env);
+    governor_client.set_committee(&committee);
+
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+
+    let keeper = Address::generate(&env);
+    env.ledger().set_timestamp(time_at_epoch(0));
+    client.post_signals(&keeper, &asset, &signal_set(&env, 0, 9_900_000));
+
+    let disputer = Address::generate(&env);
+    client.dispute_signals(&disputer, &asset, &0, &BytesN::from_array(&env, &[9u8; 32]));
+    // Disputer wins: the slot is Overturned, never Final.
+    client.resolve_signal_dispute(&asset, &0, &false, &BytesN::from_array(&env, &[0u8; 32]));
+
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &staking);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper), 0);
+
+    // Even well past the point epoch 0 would have become Final had it
+    // stood, no later sweep ever rewards the keeper for it: the slot
+    // is Overturned, not Final, so it can never appear in a finality
+    // scan's newly_announced set.
+    env.ledger()
+        .set_timestamp(time_at_epoch(0) + crate::SIGNAL_DISPUTE_SECS + 10_000);
+    client.finalize_endpoint(&asset, &0);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper), 0);
+}
+
 // -- dispute_signals / resolve_signal_dispute --
 
 #[test]

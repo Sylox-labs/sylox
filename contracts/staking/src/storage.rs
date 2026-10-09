@@ -60,22 +60,14 @@ pub enum DataKey {
     /// re-processing. Same TTL treatment as `Probe`.
     ProbesSettled(Address, u64),
     Bond(BondKey),
-    /// Refunds and winnings awaiting `claim` (Section 7.8). Kept
-    /// separate from `AccruedReward` since bond settlement and reward
-    /// accrual are different flows with different funding sources
-    /// (locked bonds vs. the reward pool).
+    /// Refunds and winnings owed to a PARTICIPANT (the bond's owner,
+    /// or a dispute/slash winner) awaiting `claim` (Section 7.8).
+    /// feat/treasury: the treasury's own share of a forfeit or slash
+    /// is deposited straight into `Treasury`'s `Slashed` bucket
+    /// instead (see `lib.rs`'s `deposit_treasury_share`), never
+    /// credited here; this key now holds only participant funds,
+    /// per the lead decision "one home for each kind of money".
     Claimable(Address),
-    /// Rewards accrued to a reporter across every settled epoch,
-    /// awaiting `claim_rewards`.
-    AccruedReward(Address),
-    /// Unallocated USDC available for `settle_epoch` to accrue from,
-    /// funded by `fund_rewards`. Review decision (feat/staking): a
-    /// `Staking` local stand in for what Section 7.5/ADR-004 describe
-    /// as `Treasury.accrue_reward` against the `ReporterRewards`
-    /// bucket; `Treasury` is not built yet, so `Staking` holds this
-    /// balance itself until a later round routes it through
-    /// `Treasury` instead, per the task's explicit scope decision.
-    RewardPool,
 }
 
 pub fn get_keeper(env: &Env, keeper: &Address) -> Option<KeeperInfo> {
@@ -229,35 +221,4 @@ pub fn clear_claimable(env: &Env, who: &Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::Claimable(who.clone()));
-}
-
-pub fn get_accrued_reward(env: &Env, who: &Address) -> i128 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::AccruedReward(who.clone()))
-        .unwrap_or(0)
-}
-
-pub fn add_accrued_reward(env: &Env, who: &Address, amount: i128) {
-    let current = get_accrued_reward(env, who);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AccruedReward(who.clone()), &(current + amount));
-}
-
-pub fn clear_accrued_reward(env: &Env, who: &Address) {
-    env.storage()
-        .persistent()
-        .remove(&DataKey::AccruedReward(who.clone()));
-}
-
-pub fn get_reward_pool(env: &Env) -> i128 {
-    env.storage()
-        .instance()
-        .get(&DataKey::RewardPool)
-        .unwrap_or(0)
-}
-
-pub fn set_reward_pool(env: &Env, amount: i128) {
-    env.storage().instance().set(&DataKey::RewardPool, &amount);
 }

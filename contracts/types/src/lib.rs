@@ -6,6 +6,7 @@
 pub mod assets;
 pub mod events;
 pub mod governance;
+pub mod network_limits;
 pub mod score;
 pub mod series;
 pub mod staking;

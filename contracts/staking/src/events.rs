@@ -9,14 +9,20 @@
 //! `staked`/`unstaked`/`probe_submitted`/`probes_settled`/`bond_locked`/
 //! `bond_released`/`bond_forfeited`/`slashed`/`claimed` are the 9
 //! events technical-doc.md Section 13 already specifies for `Staking`.
-//! `rewards_funded`, `staking_reward_claimed`, `keeper_removed`,
-//! `reporter_removed` and `keeper_bond_withdrawn` are new, for
-//! functions this build adds beyond Section 12.3's literal list
-//! (`fund_rewards`/`claim_rewards`, and the removal/exit-delay flow);
-//! see the PR's "Spec deviations" section for the Section 13 amendment
-//! this motivates in the next spec update. `staking_reward_claimed`
-//! (not `reward_claimed`) to avoid colliding with `Treasury`'s own
-//! future `reward_claimed` event once reward accrual moves there.
+//! `keeper_removed`, `reporter_removed` and `keeper_bond_withdrawn` are
+//! new, for functions this build adds beyond Section 12.3's literal
+//! list (the removal/exit-delay flow); see the PR's "Spec deviations"
+//! section for the Section 13 amendment this motivates in the next
+//! spec update.
+//!
+//! feat/treasury: `rewards_funded` and `staking_reward_claimed`
+//! (feat/staking's own stand-in events, for the local reward pool
+//! this contract no longer holds) are removed. `probes_settled` and
+//! `slashed`/`bond_forfeited`'s `to_treasury` field are unchanged:
+//! they still report how much a settlement rewarded or a slash/
+//! forfeit sent toward the treasury, now via a real
+//! `Treasury.deposit` call (which emits its own `Deposited` event on
+//! `Treasury`'s side) rather than a local `Claimable` credit.
 
 use soroban_sdk::{contractevent, Address, BytesN};
 use sylox_types::{BondKey, EndpointStatus};
@@ -114,25 +120,6 @@ pub struct Slashed {
 #[contractevent(topics = ["sylox", "claimed"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Claimed {
-    #[topic]
-    pub who: Address,
-    pub amount: i128,
-}
-
-/// New, feat/staking.
-#[contractevent(topics = ["sylox", "rewards_funded"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RewardsFunded {
-    #[topic]
-    pub from: Address,
-    pub amount: i128,
-    pub pool_after: i128,
-}
-
-/// New, feat/staking.
-#[contractevent(topics = ["sylox", "staking_reward_claimed"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StakingRewardClaimed {
     #[topic]
     pub who: Address,
     pub amount: i128,

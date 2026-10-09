@@ -222,7 +222,9 @@ impl RiskOracle {
         // backfill window for any OLDER epoch that has quietly
         // crossed finality since the last state changing call touched
         // it ("on backfill" in review item C1's wording).
-        if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+        if let Some(newest_final) =
+            try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
+        {
             recompute_score(&env, &asset, newest_final)?;
         }
         check_stale_internal(&env, &asset)?;
@@ -333,7 +335,8 @@ impl RiskOracle {
                 }
                 .publish(&env);
             }
-            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS)
+            if let Some(newest_final) =
+                try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
             {
                 recompute_score(&env, &asset, newest_final)?;
             }
@@ -358,7 +361,8 @@ impl RiskOracle {
             // epoch, now Empty, without stopping), but a resolution
             // can still be the event that unblocks something later
             // that was waiting on this one, so sweep here too.
-            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS)
+            if let Some(newest_final) =
+                try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
             {
                 recompute_score(&env, &asset, newest_final)?;
             }
@@ -416,7 +420,9 @@ impl RiskOracle {
             }
             .publish(&env);
         }
-        if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+        if let Some(newest_final) =
+            try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
+        {
             recompute_score(&env, &asset, newest_final)?;
         }
         storage::clear_dispute(&env, &asset, epoch);
@@ -472,7 +478,9 @@ impl RiskOracle {
         // have closed, Section 7.4), so it is also where review item C1
         // and C5's lazy finality sweep gets a chance to run even if no
         // new SignalSet is ever posted for a later epoch on this asset.
-        if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+        if let Some(newest_final) =
+            try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
+        {
             recompute_score(&env, &asset, newest_final)?;
         }
         check_stale_internal(&env, &asset)?;
@@ -976,13 +984,34 @@ fn check_amm_cross_check(env: &Env, cfg: &AssetConfig, s: &SignalSet) -> Result<
 /// bound without depending on the module-level constant.
 ///
 /// Returns the newest epoch now known Final, if any.
-fn try_advance_finality(env: &Env, asset: &Address, max_lookback: u32) -> Option<u64> {
+fn try_advance_finality(
+    env: &Env,
+    config: &Config,
+    asset: &Address,
+    max_lookback: u32,
+) -> Option<u64> {
     let now = env.ledger().timestamp();
     let Some(newest_posted) = storage::get_newest_epoch_pub(env, asset) else {
         return storage::get_newest_final(env, asset);
     };
     let (newest_final, newly_announced) =
         storage::advance_finality(env, asset, now, newest_posted, max_lookback);
+
+    // Issue #11 fix (feat/treasury): reward the posting keeper of
+    // every epoch newly observed Final here, the same place
+    // `signals_final` is emitted. Grouped by poster so a single
+    // reward_keeper call covers every epoch this one scan found for
+    // that keeper, never one call per epoch. An epoch already
+    // announced Final before this call (not in `newly_announced`)
+    // never rewards again: `newly_announced` is, by construction
+    // (`storage::advance_finality`'s own `final_announced` flag
+    // check), exactly the set of epochs crossing into Final for the
+    // first time on this call. An overturned epoch never reaches
+    // Final at all (its slot state is `Overturned`, not `Final`), so
+    // it can never appear in `newly_announced` and is never rewarded.
+    if !newly_announced.is_empty() {
+        reward_posters_for_newly_final_epochs(env, config, asset, &newly_announced);
+    }
 
     for epoch in newly_announced.iter() {
         events::SignalsFinal {
@@ -1011,6 +1040,39 @@ fn try_advance_finality(env: &Env, asset: &Address, max_lookback: u32) -> Option
         }
     }
     advanced
+}
+
+/// Issue #11 fix (feat/treasury): groups `newly_announced` by the
+/// epoch's own poster (read from `Signals(asset, epoch)`, the only
+/// place that field lives; `RingSlot` itself carries no poster) and
+/// calls `Staking.reward_keeper(poster, count)` exactly once per
+/// distinct poster, with `count` the number of newly Final epochs
+/// that poster posted in this one scan. `Map` is small and bounded
+/// by `max_lookback` (at most `RING_SLOTS`), the same bound every
+/// other part of the finality scan already carries, so this never
+/// grows unbounded. A missing `Signals` entry (should not happen for
+/// a genuinely Final epoch, since only a resolved, overturned
+/// dispute ever removes one, and an overturned epoch's slot is never
+/// Final) is skipped rather than panicking, since this reward step
+/// must never be the reason a finality scan itself fails.
+fn reward_posters_for_newly_final_epochs(
+    env: &Env,
+    config: &Config,
+    asset: &Address,
+    newly_announced: &Vec<u64>,
+) {
+    let mut counts: Map<Address, u32> = Map::new(env);
+    for epoch in newly_announced.iter() {
+        let Some(signals) = storage::get_signals(env, asset, epoch) else {
+            continue;
+        };
+        let count = counts.get(signals.poster.clone()).unwrap_or(0);
+        counts.set(signals.poster, count + 1);
+    }
+    let staking = StakingClient::new(env, &config.staking);
+    for (poster, count) in counts.iter() {
+        staking.reward_keeper(&poster, &count);
+    }
 }
 
 /// Review item C1: the one place a `RiskScore` is actually computed and
