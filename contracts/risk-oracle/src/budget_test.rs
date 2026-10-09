@@ -13,6 +13,10 @@ use soroban_sdk::{
     Address, BytesN, Env,
 };
 use std::println;
+use sylox_types::network_limits::{
+    TX_MAX_INSTRUCTIONS, TX_MAX_READ_LEDGER_ENTRIES, TX_MAX_WRITE_BYTES,
+    TX_MAX_WRITE_LEDGER_ENTRIES,
+};
 use sylox_types::{AssetConfig, EndpointStatus, IssuerActions, Reference, SignalSet};
 
 use crate::mocks::MockStaking;
@@ -272,8 +276,9 @@ fn budget_finality_backward_scan_across_a_full_backfill_window() {
 
     let resources = estimate.resources();
     assert!(
-        resources.instructions < 400_000_000,
-        "must stay comfortably under tx_max_instructions even at this scan's worst case; got {}",
+        (resources.instructions as u64) < TX_MAX_INSTRUCTIONS / 2,
+        "must stay under 50% of tx_max_instructions ({TX_MAX_INSTRUCTIONS}) even at \
+         this scan's worst case; got {}",
         resources.instructions
     );
 }
@@ -290,6 +295,17 @@ fn budget_finality_backward_scan_across_a_full_backfill_window() {
 /// `budget_finality_backward_scan_across_a_full_backfill_window`
 /// measures.
 ///
+/// This version uses `MockStaking`, whose own `reward_keeper` is a
+/// cheap storage write with no further cross-contract call: it
+/// UNDERSTATES the real cost, since production's `Staking.reward_keeper`
+/// itself calls `Treasury.accrue_reward`, a second hop this mock never
+/// makes. `budget_reward_keeper_grouping_with_real_staking_and_treasury`
+/// in `staking`'s own integration test module measures the real,
+/// 3-contract version of this same scenario; both numbers are reported
+/// together in the PR description. This mock version stays, as a
+/// cheap, RiskOracle-only lower bound that isolates the finality scan
+/// and grouping cost from the reward-payout cost the other test adds.
+///
 /// Builds this by posting `FINALITY_LOOKBACK_EPOCHS` consecutive
 /// epochs in quick succession (each one still Pending, none yet
 /// observed Final: every post lands well inside the previous
@@ -298,7 +314,7 @@ fn budget_finality_backward_scan_across_a_full_backfill_window() {
 /// making ONE further call whose finality sweep observes the entire
 /// run as newly Final at once.
 #[test]
-fn budget_reward_keeper_grouping_across_a_full_backfill_window_several_keepers() {
+fn budget_reward_keeper_grouping_across_a_full_backfill_window_several_keepers_mock_staking() {
     let env = Env::default();
     env.mock_all_auths();
     let staking = env.register(MockStaking, ());
@@ -339,14 +355,16 @@ fn budget_reward_keeper_grouping_across_a_full_backfill_window_several_keepers()
     // One more post, far enough past the window's own dispute delay
     // that the entire backfilled run above crosses into Final during
     // THIS call's own finality sweep. The test harness's own default
-    // CPU/memory budget (100M instructions, 40MB) is well below the
-    // real network's tx_max_instructions (400M) asserted below, and
-    // this one call — finalizing 72 epochs AND fanning out 5
-    // cross-contract reward_keeper calls — is heavy enough to hit
-    // that harness default before ever reaching the real limit this
-    // test exists to check against. Lift it so the call measures
-    // against the real ceiling instead of panicking on the harness's
-    // conservative one.
+    // CPU/memory budget (100M instructions, 40MB) is NOT reset between
+    // calls the way a real network resets it per transaction: it is
+    // one running total across every call this whole test makes, so
+    // the 72 setup posts above already spent most of it before this
+    // measured call even starts (confirmed: the measured call alone,
+    // ~8.6M instructions, could never exceed 100M on its own). Lift
+    // the budget here, right before the measured call, so the setup
+    // loop's own already-spent cost cannot cut into the headroom this
+    // test needs to measure the call that actually matters against
+    // the real network ceiling.
     env.cost_estimate().budget().reset_unlimited();
     let final_epoch = backfill_count;
     env.ledger()
@@ -359,7 +377,9 @@ fn budget_reward_keeper_grouping_across_a_full_backfill_window_several_keepers()
 
     let estimate = env.cost_estimate();
     print_resources(
-        "post_signals, full backfill window (73 epochs) crossing into Final in one call, 5 keepers",
+        "post_signals, full backfill window (73 epochs) crossing into Final in one call, \
+         5 keepers, MockStaking (understates the real cost; see the real-contracts version \
+         in staking's own integration test module)",
         &estimate,
     );
 
@@ -382,14 +402,24 @@ fn budget_reward_keeper_grouping_across_a_full_backfill_window_several_keepers()
 
     let resources = estimate.resources();
     assert!(
-        resources.instructions < 400_000_000,
-        "must stay comfortably under tx_max_instructions even with every keeper in the \
-         window rewarded in one call; got {}",
+        (resources.instructions as u64) < TX_MAX_INSTRUCTIONS / 2,
+        "must stay under 50% of tx_max_instructions ({TX_MAX_INSTRUCTIONS}) even with \
+         every keeper in the window rewarded in one call; got {}",
         resources.instructions
     );
     assert!(
-        resources.write_bytes < 132_096,
-        "must stay comfortably under tx_max_write_bytes; got {}",
+        (resources.write_bytes as u64) < TX_MAX_WRITE_BYTES / 2,
+        "must stay under 50% of tx_max_write_bytes ({TX_MAX_WRITE_BYTES}); got {}",
         resources.write_bytes
+    );
+    assert!(
+        (resources.disk_read_entries as u64) < TX_MAX_READ_LEDGER_ENTRIES as u64 / 2,
+        "must stay under 50% of tx_max_disk_read_entries ({TX_MAX_READ_LEDGER_ENTRIES}); got {}",
+        resources.disk_read_entries
+    );
+    assert!(
+        (resources.write_entries as u64) < TX_MAX_WRITE_LEDGER_ENTRIES as u64 / 2,
+        "must stay under 50% of tx_max_write_ledger_entries ({TX_MAX_WRITE_LEDGER_ENTRIES}); got {}",
+        resources.write_entries
     );
 }

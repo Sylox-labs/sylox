@@ -10,9 +10,15 @@
 //! Real SAC USDC throughout (`register_stellar_asset_contract_v2`,
 //! same as every other test in this module; no mock token).
 
+extern crate std;
+
 use risk_oracle::{RiskOracle, RiskOracleClient};
-use soroban_sdk::testutils::{Address as _, Ledger as _};
+use soroban_sdk::testutils::{cost_estimate::CostEstimate, Address as _, Ledger as _};
 use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, Symbol};
+use sylox_types::network_limits::{
+    TX_MAX_INSTRUCTIONS, TX_MAX_READ_LEDGER_ENTRIES, TX_MAX_WRITE_BYTES,
+    TX_MAX_WRITE_LEDGER_ENTRIES,
+};
 use sylox_types::{
     AssetConfig, BondKey, EndpointStatus, IssuerActions, IssuerFlags, ProbeReport, Reference,
     SignalSet, TreasuryBucket,
@@ -340,6 +346,141 @@ fn fund_bucket(fx: &TreasuryIntegrationFixture, env: &Env, bucket: TreasuryBucke
     let funder = Address::generate(env);
     fx.usdc_admin_client.mint(&funder, &amount);
     fx.treasury.deposit(&funder, &bucket, &amount);
+}
+
+/// Mirrors `RiskOracle`'s own private `FINALITY_LOOKBACK_EPOCHS` (not
+/// exported): `WINDOW_SECS / EPOCH_SECS + 1` at the defaults (73).
+/// Same reasoning as `crate_signal_dispute_ruling_secs` and
+/// `crate_keeper_slash` above.
+fn crate_finality_lookback_epochs() -> u64 {
+    73
+}
+
+/// PR #13 review, item 1: the PR's own `risk-oracle` budget test for
+/// this same worst case
+/// (`budget_reward_keeper_grouping_across_a_full_backfill_window_several_keepers_mock_staking`)
+/// uses `MockStaking`, whose `reward_keeper` is a cheap storage write
+/// with no further cross-contract call. Production's real
+/// `Staking.reward_keeper` itself calls `Treasury.accrue_reward`, a
+/// second hop the mock never makes, so that test's own number
+/// UNDERSTATES the real cost. This test measures the same scenario
+/// (a full backfill window, `FINALITY_LOOKBACK_EPOCHS` epochs, 73 at
+/// the defaults, becoming Final in one call, 5 rotating keepers) with
+/// the REAL `RiskOracle`, REAL `Staking`, and REAL `Treasury` wired
+/// together, against a real USDC SAC, so the two numbers can be
+/// reported side by side in the PR description.
+#[test]
+fn budget_reward_keeper_grouping_with_real_staking_and_treasury() {
+    let env = Env::default();
+    let fx = setup_with_treasury(&env);
+
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle.add_asset(&asset_config(&env, &asset, &issuer));
+
+    const KEEPER_COUNT: usize = 5;
+    let keepers: std::vec::Vec<Address> =
+        (0..KEEPER_COUNT).map(|_| Address::generate(&env)).collect();
+    for keeper in &keepers {
+        fx.staking.add_keeper(keeper);
+        fx.usdc_admin_client.mint(keeper, &params::KEEPER_BOND);
+        fx.staking.stake(keeper, &params::KEEPER_BOND);
+    }
+
+    // Funded generously: worst case is every one of the
+    // backfill_count epochs below paying out
+    // KEEPER_REWARD_PER_ACCEPTED_EPOCH once.
+    let lookback = crate_finality_lookback_epochs();
+    let backfill_count = lookback - 1;
+    fund_bucket(
+        &fx,
+        &env,
+        TreasuryBucket::KeeperRewards,
+        params::KEEPER_REWARD_PER_ACCEPTED_EPOCH * backfill_count as i128,
+    );
+
+    // Same backfill construction as the mock-staking version: every
+    // post lands at the SAME fixed `now`, each posting an older
+    // epoch than RiskOracle's own notion of "current", so none of
+    // them can become Final during this loop.
+    let now = backfill_count * params::EPOCH_SECS + params::EPOCH_SECS;
+    env.ledger().set_timestamp(now);
+    for epoch in 0..backfill_count {
+        let keeper = &keepers[epoch as usize % KEEPER_COUNT];
+        fx.oracle
+            .post_signals(keeper, &asset, &signal_set(&env, epoch, keeper));
+    }
+
+    // Same cumulative-harness-budget reasoning as the mock-staking
+    // version's own comment: the backfill loop above already spent
+    // most of the shared 100M instruction default before this
+    // measured call starts, so it is lifted here, right before the
+    // one call actually being measured.
+    env.cost_estimate().budget().reset_unlimited();
+    let final_epoch = backfill_count;
+    env.ledger()
+        .set_timestamp((final_epoch + 1) * params::EPOCH_SECS + params::SIGNAL_DISPUTE_SECS);
+    fx.oracle.post_signals(
+        &keepers[0],
+        &asset,
+        &signal_set(&env, final_epoch, &keepers[0]),
+    );
+
+    let estimate = env.cost_estimate();
+    print_resources(
+        "post_signals, full backfill window (73 epochs) crossing into Final in one call, \
+         5 keepers, REAL Staking + REAL Treasury (the real cost; see the MockStaking lower \
+         bound in risk-oracle's own budget_test.rs)",
+        &estimate,
+    );
+
+    // Sanity check this test actually measures what it claims: all 5
+    // keepers must have been rewarded (accrued in Treasury) by this
+    // one call, not 0 and not partially.
+    for keeper in &keepers {
+        assert!(
+            fx.treasury.accrued(keeper) > 0,
+            "every one of the 5 rotating keepers must have been rewarded by this call"
+        );
+    }
+
+    let resources = estimate.resources();
+    assert!(
+        (resources.instructions as u64) < TX_MAX_INSTRUCTIONS / 2,
+        "must stay under 50% of tx_max_instructions ({TX_MAX_INSTRUCTIONS}) even with \
+         every keeper in the window rewarded in one call through the real Staking and \
+         Treasury contracts; got {}",
+        resources.instructions
+    );
+    assert!(
+        (resources.write_bytes as u64) < TX_MAX_WRITE_BYTES / 2,
+        "must stay under 50% of tx_max_write_bytes ({TX_MAX_WRITE_BYTES}); got {}",
+        resources.write_bytes
+    );
+    assert!(
+        (resources.disk_read_entries as u64) < TX_MAX_READ_LEDGER_ENTRIES as u64 / 2,
+        "must stay under 50% of tx_max_disk_read_entries ({TX_MAX_READ_LEDGER_ENTRIES}); got {}",
+        resources.disk_read_entries
+    );
+    assert!(
+        (resources.write_entries as u64) < TX_MAX_WRITE_LEDGER_ENTRIES as u64 / 2,
+        "must stay under 50% of tx_max_write_ledger_entries ({TX_MAX_WRITE_LEDGER_ENTRIES}); got {}",
+        resources.write_entries
+    );
+}
+
+fn print_resources(label: &str, estimate: &CostEstimate) {
+    let resources = estimate.resources();
+    let fee = estimate.fee();
+    std::println!("--- {label} ---");
+    std::println!("  instructions:        {}", resources.instructions);
+    std::println!("  mem_bytes:           {}", resources.mem_bytes);
+    std::println!("  disk_read_entries:   {}", resources.disk_read_entries);
+    std::println!("  memory_read_entries: {}", resources.memory_read_entries);
+    std::println!("  disk_read_bytes:     {}", resources.disk_read_bytes);
+    std::println!("  write_entries:       {}", resources.write_entries);
+    std::println!("  write_bytes:         {}", resources.write_bytes);
+    std::println!("  fee.total (stroops): {}", fee.total);
 }
 
 #[test]
