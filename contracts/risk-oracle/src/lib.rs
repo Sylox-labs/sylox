@@ -537,6 +537,15 @@ impl RiskOracle {
         Ok(())
     }
 
+    /// technical-doc.md Section 12.1 (feat/event-registry design note,
+    /// review item D6): read-only, no auth. Lets `EventRegistry` assert
+    /// invariant E4 (its own active-event count agrees with this flag)
+    /// directly, rather than inferring the flag only through its one
+    /// visible effect on `band()`'s own Distress floor.
+    pub fn event_in_progress(env: Env, asset: Address) -> bool {
+        storage::get_event_in_progress(&env, &asset)
+    }
+
     /// technical-doc.md Section 12.1, 6.2. `set_formula` rejects any
     /// weight set that does not sum to 10,000.
     pub fn set_formula(

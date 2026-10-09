@@ -1870,6 +1870,19 @@ fn set_event_in_progress_requires_registry_auth() {
     );
 }
 
+#[test]
+fn event_in_progress_reads_the_flag_directly_with_no_auth() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    assert!(!fx.client.event_in_progress(&asset));
+
+    fx.client.set_event_in_progress(&asset, &true);
+    assert!(fx.client.event_in_progress(&asset));
+
+    fx.client.set_event_in_progress(&asset, &false);
+    assert!(!fx.client.event_in_progress(&asset));
+}
+
 // -- Required error coverage: Unauthorized, NotInitialized, MathOverflow --
 
 /// `Error::Unauthorized` (3) is never returned by any production call

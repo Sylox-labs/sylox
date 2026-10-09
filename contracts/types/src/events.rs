@@ -29,8 +29,18 @@ pub struct EventDefinition {
     pub max_missing_epochs: u32,
     /// Depeg: e.g. 9_800_000, only during challenge.
     pub cure_threshold: i128,
-    /// IssuerFreeze: X in the PRD.
+    /// IssuerFreeze: X in the PRD. Compared against `clawback_amount /
+    /// supply` over the 7 day window (Section 8.2).
     pub freeze_pct_bps: u32,
+    /// IssuerFreeze: new (feat/event-registry). Section 8.2's own text
+    /// ("`auth_revocations` above the threshold") names this check but
+    /// the spec, before this field, defined no threshold for it;
+    /// `freeze_pct_bps` is a basis-points ratio against `supply`,
+    /// which has no sensible meaning against a raw revocation count.
+    /// The count of authorization revocations in the 7 day window must
+    /// exceed this value for the revocation branch of the IssuerFreeze
+    /// check to pass.
+    pub auth_revocation_threshold: u32,
     /// MintWithoutBacking: Y in the PRD.
     pub mint_spike_bps: u32,
     /// WithdrawalHalt: e.g. 259_200 = 72h.
