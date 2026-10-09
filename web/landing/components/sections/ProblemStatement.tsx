@@ -68,17 +68,28 @@ export function ProblemStatement() {
         <div
           ref={videoWrapRef}
           data-reveal
-          className="relative min-h-[50vh] overflow-hidden bg-slate-black md:min-h-0"
+          // aspect-[1248/630]: the video's own native ratio. Below md, the
+          // box used to be a fixed min-h-[50vh] with a free-floating width
+          // — at phone widths that pairing is much narrower (relative to
+          // its height) than the video itself, so object-cover had to
+          // crop deep into both sides to fill it, cutting the on-screen
+          // text from both edges. Locking the box to the video's own
+          // ratio means the full frame width always fits; md: drops the
+          // ratio lock since items-stretch there matches this column's
+          // height to the text column instead.
+          className="relative aspect-[1248/630] overflow-hidden bg-slate-black md:aspect-auto"
         >
           <video
             ref={videoRef}
             // object-position left: the source clip's on-screen text is
-            // left-anchored (not centered), so an even object-cover crop
-            // (this box is narrower relative to height than the video's
-            // native ~1.98:1) eats into the left edge of the text while
+            // left-anchored (not centered). At md and up this box is
+            // wider relative to height than the video's native ~1.98:1
+            // (items-stretch matches it to the text column), so an even
+            // object-cover crop eats into the left edge of the text while
             // leaving dead space on the right. Biasing the crop left
-            // keeps the text intact and crops the excess from the right
-            // instead.
+            // keeps the text intact there; below md the aspect-ratio lock
+            // above means object-cover rarely needs to crop horizontally
+            // at all, so object-left is a no-op harmless default.
             className="absolute inset-0 h-full w-full object-cover object-left"
             src="/brand/sylox-demo.mp4"
             muted={isMuted}
