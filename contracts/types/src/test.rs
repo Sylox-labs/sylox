@@ -45,6 +45,7 @@ fn definition(env: &Env, kind: EventKind, version: u32) -> EventDefinition {
         max_missing_epochs: 6,
         cure_threshold: 9_800_000,
         freeze_pct_bps: 0,
+        auth_revocation_threshold: 0,
         mint_spike_bps: 0,
         halt_window_secs: 0,
         challenge_secs: 86_400,
@@ -69,9 +70,18 @@ fn asset_config_round_trips_with_issuer_flags_and_fx_adapter() {
     let reference = Reference::Fiat(symbol_short!("EUR"), FxRateSource::Official);
     for flags in [
         IssuerFlags::default(),
-        IssuerFlags { auth_revocable: true, clawback_enabled: false },
-        IssuerFlags { auth_revocable: false, clawback_enabled: true },
-        IssuerFlags { auth_revocable: true, clawback_enabled: true },
+        IssuerFlags {
+            auth_revocable: true,
+            clawback_enabled: false,
+        },
+        IssuerFlags {
+            auth_revocable: false,
+            clawback_enabled: true,
+        },
+        IssuerFlags {
+            auth_revocable: true,
+            clawback_enabled: true,
+        },
     ] {
         let cfg = asset_config(&env, reference.clone(), flags);
         assert_eq!(roundtrip(&env, &cfg), cfg);
@@ -105,7 +115,12 @@ fn signal_set_round_trips_with_peg_ratio_p10() {
 #[test]
 fn ring_slot_round_trips_in_every_state() {
     let env = Env::default();
-    for state in [SlotState::Empty, SlotState::Pending, SlotState::Disputed, SlotState::Final] {
+    for state in [
+        SlotState::Empty,
+        SlotState::Pending,
+        SlotState::Disputed,
+        SlotState::Final,
+    ] {
         let slot = RingSlot {
             epoch: 7,
             state,
@@ -232,7 +247,11 @@ fn queued_action_round_trips_in_every_state() {
 fn treasury_and_definition_actions_round_trip() {
     let env = Env::default();
     let actions = [
-        Action::TreasuryAllocate(TreasuryBucket::Fees, TreasuryBucket::ReporterRewards, 1_000 * SCALE),
+        Action::TreasuryAllocate(
+            TreasuryBucket::Fees,
+            TreasuryBucket::ReporterRewards,
+            1_000 * SCALE,
+        ),
         Action::TreasurySpend(TreasuryBucket::Fees, Address::generate(&env), 500 * SCALE),
         Action::RegisterDefinition(definition(&env, EventKind::IssuerFreeze, 1)),
     ];
@@ -254,5 +273,8 @@ fn bond_keys_are_distinct_per_purpose() {
         assert_eq!(roundtrip(&env, key), *key);
     }
     assert_ne!(keys[1], keys[2]);
-    assert_ne!(BondKey::SignalDispute(asset.clone(), 42), BondKey::SignalDispute(asset, 43));
+    assert_ne!(
+        BondKey::SignalDispute(asset.clone(), 42),
+        BondKey::SignalDispute(asset, 43)
+    );
 }

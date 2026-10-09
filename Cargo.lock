@@ -793,8 +793,12 @@ checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 name = "event-registry"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "risk-oracle",
  "soroban-sdk",
+ "staking",
  "sylox-types",
+ "treasury",
 ]
 
 [[package]]
@@ -1966,8 +1970,11 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "staking"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "risk-oracle",
  "soroban-sdk",
  "sylox-types",
+ "treasury",
 ]
 
 [[package]]
@@ -2150,6 +2157,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 name = "treasury"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "soroban-sdk",
  "sylox-types",
 ]

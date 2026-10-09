@@ -935,7 +935,8 @@ fn score_moves_down_after_band_down_epochs_consecutive_qualifying_epochs() {
     let mut flush = signal_set(&env, flush_epoch, sylox_types::SCALE);
     flush.liquidity_2pct = 100_000_000_000;
     flush.supply_change_bps = 0;
-    fx.client.post_signals(&Address::generate(&env), &asset, &flush);
+    fx.client
+        .post_signals(&Address::generate(&env), &asset, &flush);
 
     let result = fx.client.score(&asset);
     assert_ne!(
@@ -1105,6 +1106,136 @@ fn update_asset_rejects_reference_asset() {
     assert_eq!(result, Err(Ok(Error::ReferenceNotSupported)));
 }
 
+// -- reward_keeper on the finality scan (issue #11 fix, feat/treasury) --
+
+#[test]
+fn one_keeper_is_rewarded_exactly_once_per_newly_final_epoch() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper = Address::generate(&env);
+
+    env.ledger().set_timestamp(time_at_epoch(0));
+    fx.client
+        .post_signals(&keeper, &asset, &signal_set(&env, 0, 9_900_000));
+
+    // Finality for epoch 0 is still pending (SIGNAL_DISPUTE_SECS has
+    // not elapsed); the scan that already ran inside post_signals
+    // found nothing new to reward yet.
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper), 0);
+
+    // Advance past the dispute window and touch the asset again
+    // (finalize_endpoint is the permissionless sweep trigger): epoch
+    // 0 is now observed Final for the first time, and the keeper who
+    // posted it is rewarded for exactly 1 epoch.
+    env.ledger()
+        .set_timestamp(time_at_epoch(0) + crate::SIGNAL_DISPUTE_SECS + 1);
+    fx.client.finalize_endpoint(&asset, &0);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper), 1);
+
+    // A second sweep (any later state-changing call) must not reward
+    // the same already-announced epoch again: the mock records only
+    // the most recent call's own epochs argument, so if reward_keeper
+    // were called again for this keeper with a nonzero count, this
+    // would still read 1, not 2; call_count being unchanged below is
+    // the stronger, unambiguous check that reward_keeper was not
+    // invoked a second time at all.
+    let calls_before = staking_client.call_count(&soroban_sdk::Symbol::new(&env, "reward_keeper"));
+    fx.client.finalize_endpoint(&asset, &0);
+    let calls_after = staking_client.call_count(&soroban_sdk::Symbol::new(&env, "reward_keeper"));
+    assert_eq!(calls_before, calls_after);
+}
+
+#[test]
+fn two_keepers_posting_different_epochs_are_each_rewarded_their_own_count_in_one_sweep() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper_a = Address::generate(&env);
+    let keeper_b = Address::generate(&env);
+
+    // keeper_a posts epochs 0 and 1; keeper_b posts epoch 2, all
+    // close enough together that none of the three individually
+    // crosses into Final (SIGNAL_DISPUTE_SECS past its own post
+    // time) until the single later finalize_endpoint call below,
+    // which observes all three as newly Final in one sweep. Posting
+    // epoch 2 only 2 * EPOCH_SECS after epoch 0 (not at its exact
+    // pending_until boundary) keeps this test from depending on
+    // whichever post happens to land exactly when an earlier
+    // epoch's own window closes.
+    env.ledger().set_timestamp(time_at_epoch(0));
+    fx.client
+        .post_signals(&keeper_a, &asset, &signal_set(&env, 0, 9_900_000));
+    env.ledger().set_timestamp(time_at_epoch(1));
+    fx.client
+        .post_signals(&keeper_a, &asset, &signal_set(&env, 1, 9_900_000));
+    env.ledger().set_timestamp(time_at_epoch(2));
+    fx.client
+        .post_signals(&keeper_b, &asset, &signal_set(&env, 2, 9_900_000));
+
+    let calls_before_sweep =
+        staking_client_for(&env, &fx).call_count(&soroban_sdk::Symbol::new(&env, "reward_keeper"));
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(2) + crate::SIGNAL_DISPUTE_SECS + 1);
+    fx.client.finalize_endpoint(&asset, &2);
+
+    let staking_client = staking_client_for(&env, &fx);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper_a), 2);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper_b), 1);
+    // Exactly one reward_keeper call per distinct poster in this one
+    // sweep (2 posters), never one call per epoch (which would have
+    // been 3): checked as a delta across just this sweep, since
+    // earlier posts may themselves have already triggered a reward
+    // if an epoch happened to cross into Final mid-sequence.
+    let calls_after_sweep =
+        staking_client.call_count(&soroban_sdk::Symbol::new(&env, "reward_keeper"));
+    assert_eq!(calls_after_sweep - calls_before_sweep, 2);
+}
+
+fn staking_client_for<'a>(env: &'a Env, fx: &Fixture<'a>) -> crate::mocks::MockStakingClient<'a> {
+    crate::mocks::MockStakingClient::new(env, &fx.staking)
+}
+
+#[test]
+fn an_overturned_epoch_is_never_rewarded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let governor_client = crate::mocks::MockGovernorClient::new(&env, &governor);
+    let committee = Address::generate(&env);
+    governor_client.set_committee(&committee);
+
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+
+    let keeper = Address::generate(&env);
+    env.ledger().set_timestamp(time_at_epoch(0));
+    client.post_signals(&keeper, &asset, &signal_set(&env, 0, 9_900_000));
+
+    let disputer = Address::generate(&env);
+    client.dispute_signals(&disputer, &asset, &0, &BytesN::from_array(&env, &[9u8; 32]));
+    // Disputer wins: the slot is Overturned, never Final.
+    client.resolve_signal_dispute(&asset, &0, &false, &BytesN::from_array(&env, &[0u8; 32]));
+
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &staking);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper), 0);
+
+    // Even well past the point epoch 0 would have become Final had it
+    // stood, no later sweep ever rewards the keeper for it: the slot
+    // is Overturned, not Final, so it can never appear in a finality
+    // scan's newly_announced set.
+    env.ledger()
+        .set_timestamp(time_at_epoch(0) + crate::SIGNAL_DISPUTE_SECS + 10_000);
+    client.finalize_endpoint(&asset, &0);
+    assert_eq!(staking_client.reward_keeper_epochs(&keeper), 0);
+}
+
 // -- dispute_signals / resolve_signal_dispute --
 
 #[test]
@@ -1247,6 +1378,172 @@ fn resolve_signal_dispute_disputer_wins_reopens_the_epoch() {
     assert!(client
         .try_dispute_signals(&disputer, &asset, &5, &BytesN::from_array(&env, &[1u8; 32]))
         .is_err());
+}
+
+// -- resolve_signal_dispute_timeout (ADR-010, issue #4 fix) --
+
+/// Shared setup for the timeout tests: a real `MockGovernor` (not just
+/// a plain `Address`, which `resolve_signal_dispute_requires_committee_auth_from_governor`
+/// shows has no `committee()` to call), one asset, one posted and
+/// disputed epoch.
+#[allow(clippy::type_complexity)]
+fn setup_disputed_epoch(
+    env: &Env,
+) -> (
+    RiskOracleClient<'_>,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(env, &contract_id);
+    let registry = Address::generate(env);
+    client.initialize(&governor, &registry, &staking);
+
+    let governor_client = crate::mocks::MockGovernorClient::new(env, &governor);
+    let committee = Address::generate(env);
+    governor_client.set_committee(&committee);
+
+    let asset = Address::generate(env);
+    let issuer = Address::generate(env);
+    client.add_asset(&asset_config(env, &asset, &issuer));
+    post(env, &client, &asset, 5, 9_900_000);
+
+    let disputer = Address::generate(env);
+    client.dispute_signals(&disputer, &asset, &5, &BytesN::from_array(env, &[9u8; 32]));
+
+    (client, asset, staking, committee, disputer, contract_id)
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_rejects_before_the_ruling_deadline() {
+    let env = Env::default();
+    let (client, asset, _staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
+
+    // Still inside signal_dispute_ruling_secs (7d) from the dispute.
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS - 1);
+    let result = client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert_eq!(result, Err(Ok(Error::RulingDeadlineNotReached)));
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_succeeds_exactly_at_the_deadline() {
+    let env = Env::default();
+    let (client, asset, _staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    client.resolve_signal_dispute_timeout(&asset, &5);
+
+    let slot = find_slot_by_epoch(&client.ring(&asset), 5);
+    assert_eq!(slot.state, SlotState::Final);
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_releases_the_bond_never_slashes() {
+    let env = Env::default();
+    let (client, asset, staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    client.resolve_signal_dispute_timeout(&asset, &5);
+
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &staking);
+    assert_eq!(
+        staking_client.call_count(&soroban_sdk::Symbol::new(&env, "release_bond")),
+        1
+    );
+    assert_eq!(
+        staking_client.call_count(&soroban_sdk::Symbol::new(&env, "forfeit_bond")),
+        0
+    );
+    assert_eq!(
+        staking_client.call_count(&soroban_sdk::Symbol::new(&env, "slash")),
+        0
+    );
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_records_a_committee_miss() {
+    let env = Env::default();
+    let (client, asset, _staking, committee, _disputer, contract_id) = setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    client.resolve_signal_dispute_timeout(&asset, &5);
+
+    let misses = env.as_contract(&contract_id, || {
+        crate::storage::get_committee_misses(&env, &committee)
+    });
+    assert_eq!(misses, 1);
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_is_permissionless() {
+    let env = Env::default();
+    let (client, asset, _staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    // No require_auth set up for any particular caller beyond
+    // mock_all_auths (which setup_disputed_epoch already enabled);
+    // the call succeeding with no committee or governor auth proves
+    // this function checks no caller identity at all.
+    let result = client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_rejects_an_epoch_with_no_open_dispute() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    post(&env, &fx.client, &asset, 5, 9_900_000);
+
+    let result = fx.client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert_eq!(result, Err(Ok(Error::DisputeWindowClosed)));
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_cannot_run_twice() {
+    let env = Env::default();
+    let (client, asset, _staking, _committee, _disputer, _contract_id) = setup_disputed_epoch(&env);
+
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    client.resolve_signal_dispute_timeout(&asset, &5);
+
+    // clear_dispute already ran; a second call finds no open dispute.
+    let result = client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert_eq!(result, Err(Ok(Error::DisputeWindowClosed)));
+}
+
+#[test]
+fn resolve_signal_dispute_timeout_does_not_block_a_committee_ruling_that_arrives_first() {
+    let env = Env::default();
+    let (client, asset, _staking, committee, disputer, contract_id) = setup_disputed_epoch(&env);
+
+    // The committee rules well before the deadline.
+    env.ledger().set_timestamp(time_at_epoch(5) + 3_600);
+    client.resolve_signal_dispute(&asset, &5, &true, &BytesN::from_array(&env, &[0u8; 32]));
+
+    // The dispute is already cleared; a late timeout call has nothing
+    // left to act on, and the committee's on-time ruling is not
+    // counted as a miss.
+    env.ledger()
+        .set_timestamp(time_at_epoch(5) + crate::SIGNAL_DISPUTE_RULING_SECS);
+    let result = client.try_resolve_signal_dispute_timeout(&asset, &5);
+    assert_eq!(result, Err(Ok(Error::DisputeWindowClosed)));
+    let misses = env.as_contract(&contract_id, || {
+        crate::storage::get_committee_misses(&env, &committee)
+    });
+    assert_eq!(misses, 0);
+    let _ = disputer;
 }
 
 // -- finalize_endpoint --
@@ -1573,6 +1870,57 @@ fn set_event_in_progress_requires_registry_auth() {
     );
 }
 
+#[test]
+fn event_in_progress_reads_the_flag_directly_with_no_auth() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    assert!(!fx.client.event_in_progress(&asset));
+
+    fx.client.set_event_in_progress(&asset, &true);
+    assert!(fx.client.event_in_progress(&asset));
+
+    fx.client.set_event_in_progress(&asset, &false);
+    assert!(!fx.client.event_in_progress(&asset));
+}
+
+/// PR #15 review, finding F4: `newest_epoch` must keep reporting the
+/// real newest epoch ever written even when that epoch's own ring
+/// POSITION is currently `Empty` (overturned, not yet reposted) —
+/// unlike reading the position's own stored `.epoch`, which resets to
+/// 0 on an empty slot.
+#[test]
+fn newest_epoch_survives_an_overturn_of_the_newest_slot() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let governor_client = crate::mocks::MockGovernorClient::new(&env, &governor);
+    governor_client.set_committee(&Address::generate(&env));
+
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+    post(&env, &client, &asset, 5, 9_900_000);
+    assert_eq!(client.newest_epoch(&asset), Some(5));
+
+    let disputer = Address::generate(&env);
+    client.dispute_signals(&disputer, &asset, &5, &BytesN::from_array(&env, &[9u8; 32]));
+    client.resolve_signal_dispute(&asset, &5, &false, &BytesN::from_array(&env, &[0u8; 32]));
+
+    // Epoch 5's own ring position is now Empty, but it is still the
+    // newest epoch anyone ever posted.
+    assert!(client.ring(&asset).iter().all(|slot| slot.epoch != 5));
+    assert_eq!(
+        client.newest_epoch(&asset),
+        Some(5),
+        "an overturned newest slot must not make newest_epoch regress to None or 0"
+    );
+}
+
 // -- Required error coverage: Unauthorized, NotInitialized, MathOverflow --
 
 /// `Error::Unauthorized` (3) is never returned by any production call
@@ -1878,7 +2226,13 @@ fn backfill_after_an_outage_matches_no_outage() {
 /// entirely) — used by the C6 tests to build a long posting history
 /// with a deliberate gap, without fill_ring_with_constant_signal's
 /// automatic flush/finalize_endpoint call masking the gap.
-fn post_one_healthy_epoch(env: &Env, client: &RiskOracleClient, staking: &Address, asset: &Address, epoch: u64) {
+fn post_one_healthy_epoch(
+    env: &Env,
+    client: &RiskOracleClient,
+    staking: &Address,
+    asset: &Address,
+    epoch: u64,
+) {
     let keeper = Address::generate(env);
     let staking_client = crate::mocks::MockStakingClient::new(env, staking);
     staking_client.set_aggregate(asset, &epoch, &EndpointStatus::Up);
@@ -1914,7 +2268,10 @@ fn finality_keeps_advancing_past_a_permanently_missing_epoch() {
          epoch 100 is permanently missing; got stuck at epoch {}",
         score.epoch
     );
-    assert!(!score.stale, "a score this close to the newest epoch must not read stale");
+    assert!(
+        !score.stale,
+        "a score this close to the newest epoch must not read stale"
+    );
 }
 
 #[test]
@@ -1939,7 +2296,12 @@ fn finality_keeps_advancing_past_an_overturned_epoch_that_is_never_reposted() {
     }
     // Dispute and overturn epoch 100 (disputer wins), then never repost it.
     let disputer = Address::generate(&env);
-    client.dispute_signals(&disputer, &asset, &100, &BytesN::from_array(&env, &[9u8; 32]));
+    client.dispute_signals(
+        &disputer,
+        &asset,
+        &100,
+        &BytesN::from_array(&env, &[9u8; 32]),
+    );
     client.resolve_signal_dispute(&asset, &100, &false, &BytesN::from_array(&env, &[0u8; 32]));
 
     for epoch in 101..230u64 {
@@ -1978,7 +2340,12 @@ fn finality_keeps_advancing_past_an_unresolved_dispute() {
     }
     // Dispute epoch 100 and never resolve it: it stays Disputed forever.
     let disputer = Address::generate(&env);
-    client.dispute_signals(&disputer, &asset, &100, &BytesN::from_array(&env, &[9u8; 32]));
+    client.dispute_signals(
+        &disputer,
+        &asset,
+        &100,
+        &BytesN::from_array(&env, &[9u8; 32]),
+    );
 
     for epoch in 101..230u64 {
         post_one_healthy_epoch(&env, &client, &staking, &asset, epoch);
@@ -2011,8 +2378,7 @@ fn a_frozen_score_must_report_stale_judged_against_its_own_epoch() {
     assert!(!fresh.stale);
     let scored_epoch = fresh.epoch;
 
-    env.ledger()
-        .set_timestamp((scored_epoch + 1 + 200) * 3_600);
+    env.ledger().set_timestamp((scored_epoch + 1 + 200) * 3_600);
     let frozen = fx.client.score(&asset);
     assert!(
         frozen.stale,
@@ -2336,8 +2702,7 @@ fn check_stale_does_not_fire_one_second_before_first_stale_time() {
     }
     let last_epoch = fx.client.score(&asset).epoch;
 
-    env.ledger()
-        .set_timestamp(first_stale_time(last_epoch) - 1);
+    env.ledger().set_timestamp(first_stale_time(last_epoch) - 1);
     assert!(
         !fx.client.check_stale(&asset),
         "one second before first_stale_time, the asset must not read stale yet"
@@ -2360,7 +2725,8 @@ fn check_stale_recovers_silently_then_relapses_with_a_fresh_asset_stale() {
     }
     let first_last_epoch = fx.client.score(&asset).epoch;
 
-    env.ledger().set_timestamp(first_stale_time(first_last_epoch));
+    env.ledger()
+        .set_timestamp(first_stale_time(first_last_epoch));
     assert!(fx.client.check_stale(&asset));
     assert_eq!(
         asset_stale_count(&env, &contract_id, &asset, first_last_epoch),
@@ -2386,9 +2752,15 @@ fn check_stale_recovers_silently_then_relapses_with_a_fresh_asset_stale() {
         // only exposes the LAST invocation's events): none of these,
         // including the one that eventually clears the stale state,
         // may emit asset_stale.
-        assert_eq!(asset_stale_count(&env, &contract_id, &asset, first_last_epoch), 0);
+        assert_eq!(
+            asset_stale_count(&env, &contract_id, &asset, first_last_epoch),
+            0
+        );
     }
-    assert!(!fx.client.score(&asset).stale, "a fresh epoch must clear the stale state");
+    assert!(
+        !fx.client.score(&asset).stale,
+        "a fresh epoch must clear the stale state"
+    );
     let second_last_epoch = fx.client.score(&asset).epoch;
 
     // Relapse: go quiet again, past first_stale_time for the new
@@ -2420,7 +2792,10 @@ fn a_late_backfill_that_is_stale_on_arrival_emits_asset_stale_via_post_signals()
         post_one_healthy_epoch(&env, &fx.client, &fx.staking, &asset, epoch);
     }
     let last_epoch = fx.client.score(&asset).epoch;
-    assert!(!fx.client.score(&asset).stale, "sanity check: a real score must exist here");
+    assert!(
+        !fx.client.score(&asset).stale,
+        "sanity check: a real score must exist here"
+    );
     assert!(
         last_epoch < 170,
         "sanity check: last_epoch must be below the never-posted epoch 170"
@@ -2506,9 +2881,8 @@ fn topics_for_event_named(
     env: &Env,
     event_name: &str,
 ) -> Option<std::vec::Vec<soroban_sdk::xdr::ScVal>> {
-    let name_scval = soroban_sdk::xdr::ScVal::Symbol(
-        soroban_sdk::xdr::ScSymbol(event_name.try_into().unwrap()),
-    );
+    let name_scval =
+        soroban_sdk::xdr::ScVal::Symbol(soroban_sdk::xdr::ScSymbol(event_name.try_into().unwrap()));
     for event in env.events().all().events() {
         let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
         if body.topics.get(1) == Some(&name_scval) {
@@ -2656,4 +3030,3 @@ fn every_event_uses_the_sylox_event_name_asset_topic_convention() {
     client.post_signals(&keeper3, &asset3, &s3);
     assert_event_topics(&env, "asset_stale", &asset3);
 }
-

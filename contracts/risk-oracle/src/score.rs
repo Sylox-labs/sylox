@@ -248,7 +248,9 @@ pub fn aggregate_from_ring(
     // compares supply now against supply 24 slots ago, matching S's
     // definition ("supply_change_24h_bps") rather than reusing the
     // one-epoch field under a 24h sounding name.
-    let supply_change_24h_bps = match window.get(AGGREGATE_SLOTS_7D - AGGREGATE_SLOTS_24H).flatten()
+    let supply_change_24h_bps = match window
+        .get(AGGREGATE_SLOTS_7D - AGGREGATE_SLOTS_24H)
+        .flatten()
     {
         Some(slot) if slot.supply > 0 => {
             let diff = latest

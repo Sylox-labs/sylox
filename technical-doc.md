@@ -1,6 +1,79 @@
 # Sylox Protocol: Technical Documentation
 
-Version: v1.2 draft, October 8, 2026 · Author: David Ejere
+Version: v1.4 draft, October 9, 2026 · Author: David Ejere
+
+## Changelog v1.4
+
+Every change from v1.3, driven entirely by building `Treasury` and moving reward and slash accounting into it (PR #13), and by fixing issue #11 (keepers were never rewarded). No code changes in this revision; `Treasury`, the `Staking` refactor, and the `RiskOracle` finality-time reward call are already built and merged to match what is documented here.
+
+**ADR-012 One home for each kind of money**
+
+- `Staking` holds only participant funds (keeper bonds, reporter stakes including cooldown, locked dispute bonds, `Claimable` balances); `Treasury` holds only protocol funds, in the four buckets Section 12.7 already named. Enforced structurally: `Staking` has no code path left that credits `Claimable` with a protocol-destined amount; every one now reaches `Treasury` through a real `deposit` call. `Staking`'s own balance invariant tightens from `>=` to exact `==` (apart from direct donations). Sections 4.5, 7.5, 7.8, 12.3, 12.7, 13, 14, 15.1, 23, 24.2.
+
+**Treasury (Section 12.7), built to match the interface exactly**
+
+- `Treasury`'s full API: `deposit`, `accrue_reward`, `claim_reward`, `allocate`, `spend`, `balance`, `accrued`, exactly as Section 12.7 already specified. Governor auth on `allocate`/`spend`; `Staking` auth on `accrue_reward`. Section 12.3, 12.7.
+- Every inflow and outflow emits an event under ADR-007's convention, naming its bucket: `deposited`, `reward_accrued`, `reward_claimed`, `allocated`, `spent`, all 5 already specified by Section 13, plus a new `reward_shortfall` (see below). Section 13.
+- `accrue_reward` never accrues more than its bucket holds (T2): it returns the amount actually accrued, which can be less than requested, and never fails the calling flow. When it accrues less than requested, a new `reward_shortfall` event (not previously specified) makes the shortfall visible onchain, carrying `to`, `bucket`, `requested`, `accrued` and `shortfall`, rather than leaving a caller to infer it only by diffing `reward_accrued`'s own two fields. Section 13.
+- A new `InvalidAmount` error (703, not previously specified) rejects a non-positive amount consistently across all 4 of `Treasury`'s mutating entry points (`deposit`, `accrue_reward`, `allocate`, `spend`), the same guard Section 12.3's own `lock_bond` already uses. Section 14.
+- `Treasury`'s own storage keeps one key per bucket (`Bucket(TreasuryBucket)`) rather than the single `Buckets` instance key Section 15.1 previously showed, the same per-field-storage-cost reasoning `Staking` already uses elsewhere for similarly shaped state. Section 15.1.
+- Invariant **T1** (Treasury's USDC balance is at least the sum of its bucket balances plus every accrued, unclaimed reward) is already Section 12.7's own Invariant I15; **T3** (USDC leaves `Treasury` only through a `claim_reward` or a governed `spend`) and **T4** (`allocate` moves balance between buckets without changing the total) are new, implicit in the interface as specified but not previously stated as invariants. Section 21.1.
+
+**Staking refactor (Section 7.5, 7.8, 12.3), ADR-012's own consequence**
+
+- `RewardPool`, `AccruedReward(addr)`, `fund_rewards` and `claim_rewards` are removed entirely, now that `Treasury` exists to be the real caller `feat/staking` (PR #7) had always left room for. `settle_probes`'s reporter-reward accrual and `Staking.reward_keeper` both call `Treasury.accrue_reward` directly; reporters and keepers claim with `Treasury.claim_reward`, not a `Staking`-local balance. Sections 4.5, 7.5, 12.3, 12.7, 15.1, 23.
+- `forfeit_bond` and `slash`'s protocol-destined half (previously credited into `Claimable(treasury_address)`, a stand-in, Section 7.8) now reaches `Treasury` through a real `deposit_treasury_share` call into the `Slashed` bucket; `Staking`'s own `treasury: Address` config field, set at `initialize`, must be a real deployed `Treasury` contract for this to succeed. Winners' shares are unaffected, still credited to `Claimable` and paid by `claim`. Sections 4.5, 7.8, 12.3.
+- `deposit_treasury_share`'s nested `usdc.transfer(Staking, Treasury, amount)` call needs `env.authorize_as_current_contract(...)`, since `Staking` (not a human signer) is the `from` the token's own `transfer` checks, two call hops away from `Staking`'s own code. Section 16.1.
+- `Staking`'s own balance invariant (Section 21.1) tightens from `>=` to exact `==`, apart from direct donations, now that every protocol-destined amount genuinely leaves on the same call that decides it, rather than sitting in `Staking`'s own storage until some later, unspecified movement. ADR-012.
+
+**Issue #11 fix: `RiskOracle` rewards keepers at finality time**
+
+- `Staking.reward_keeper(keeper, epochs: u32) -> i128` (changed from `reward_keeper(keeper)`, no return value): accrues `keeper_reward * epochs` from `Treasury`'s `KeeperRewards` bucket, only if the keeper is currently active and not suspended; otherwise a no-op returning `0`, not an error, so a single grouped call covering several keepers can never fail outright over one ineligible keeper. Sections 12.3, 24.2 (closes the open question Section 24.2 previously tracked under "is `reward_keeper` meant to be called from `RiskOracle` at all, and on which transition").
+- `RiskOracle`'s backward finality scan (ADR-008), on every call that advances it, groups the epochs it finds newly Final by poster and calls `Staking.reward_keeper` once per distinct poster found, with that poster's own count. An epoch's `final_announced` flag (ADR-008) already makes "newly Final on this call" a one-time fact, so a keeper is rewarded exactly once per epoch; an overturned epoch's slot state is `Overturned`, never `Final`, so it never appears in this grouping and is never rewarded, with no extra code needed for that guarantee. Section 12.1, 12.3.
+- Budget test (Section 21.3): the worst case, a full backfill window (`window_secs / epoch_secs + 1` = 73 epochs at the defaults) becoming Final in one call with several keepers posting across it, measured twice: once against `Staking` and `Treasury` mocked out (a lower bound, since a mock never makes `reward_keeper`'s own further call into `Treasury.accrue_reward`) and once against the real `Staking` and `Treasury`. Both comfortably under the live network's resource limits (new `sylox_types::network_limits`, below). Section 21.3.
+
+**Network limits, queried live rather than hardcoded from memory**
+
+- A new, test-only `sylox_types::network_limits` module holds `tx_max_instructions`, `tx_max_write_bytes`, `tx_max_disk_read_entries`, `tx_max_write_ledger_entries` and `contract_max_size_bytes`, queried from `stellar network settings` for testnet and mainnet (identical on both, as of this writing) rather than each budget test keeping its own remembered copy. Every budget test in this revision asserts its measured call stays under 50% of each. Sections 15.3, 21.3.
+
+**Section 24.2's keeper reward gap, removed**
+
+- The open question "Is `Staking.reward_keeper` meant to be called from `RiskOracle` at all in v1, and if so, on which transition?" is resolved: yes, from the same scan that already advances finality and emits `signals_final`, once per distinct poster found among the epochs that scan observes newly Final. Removed from Section 24.2; the decision and its reasoning are ADR-012 (folded in) and this changelog entry.
+- The companion question about a symmetric per-signal keeper bond (mirroring the disputer's `signal_dispute_bond`) is unaffected by this PR and stays open: `reward_keeper`'s own eligibility check (active, not suspended) is a read of `Staking`'s existing keeper state, not a new bond lock, and nothing in this PR changes whether a keeper's general stake, without a per-signal bond, remains the intended v1 design. Section 24.2.
+
+**Known gap: core contracts lack `upgrade()`**
+
+- Section 17.3 already specifies `upgrade(wasm_hash)` on every core contract, including `Treasury`; as built, none of `RiskOracle`, `Staking` or `Treasury` implements it yet (`Governor`, the governor-only auth it would check, is not built either). `Treasury` was deliberately not given one in this PR while its siblings still lack theirs, rather than making it the first and only core contract to carry it alone. Tracked as issue #12, open, to be done together with `Governor`. Section 17.3, 24.2.
+
+## Changelog v1.3
+
+Every change from v1.2, driven entirely by building `Staking` (PR #7) and documenting the approved deviations and review fixes it surfaced. No code changes in this revision; `Staking` and the two accompanying `RiskOracle` changes are already built and merged to match what is documented here.
+
+**ADR-010 Signal dispute ruling deadline and default outcome**
+
+- New parameter `signal_dispute_ruling_secs` (default 7 days), counted from `dispute_signals`, not from the posting's own `pending_until` window. If the committee has not ruled by the deadline, anyone can call `RiskOracle.resolve_signal_dispute_timeout(asset, epoch)`: the keeper's posting stands (slot Final), the disputer's bond is released in full, nobody is slashed, and a miss is recorded against the committee (`CommitteeMisses(committee)`, mirroring ADR-002's shape). Sections 5.4, 12.1, 13, 14, 15.1, 23.
+- `dispute_signals` now passes the disputed epoch's `poster` through to `Staking.lock_bond` as a new `subject: Option<Address>` parameter, so a keeper's bond cannot release while a dispute naming its posting is still open (see ADR-011). Section 12.3's `lock_bond` signature changes accordingly. Sections 4.5, 7.8, 12.3.
+
+**ADR-011 Removal is never an escape hatch**
+
+- Removal (`remove_keeper`/`remove_reporter`) deactivates immediately but never releases funds on the same call. Funds leave only after BOTH a derived exit delay (`keeper_exit_delay_secs`, `reporter_exit_delay_secs`, long enough that every posting or probe the removed party could be held accountable for has had its full window to run) and, for a keeper, no open signal dispute naming it. Stake in cooldown stays fully slashable until actually paid out; a voluntary `unstake_request` cannot exit faster than a governor removal would have allowed for the same stake (`unstake_cooldown_secs >= keeper_exit_delay_secs`/`reporter_exit_delay_secs`). A reporter's probe is scored using the region it was registered under at submission time (a stored snapshot), never a live lookup, so removal cannot retroactively change what an already-submitted probe counts toward. Sections 7.3, 7.7, 12.3, 15.1, 23.
+
+**Staking (Section 7, 12.3), built to match the interface exactly**
+
+- `Staking`'s full API: keeper bonds and reporter stakes (`add_keeper`/`remove_keeper`, `add_reporter`/`remove_reporter`, `stake`/`unstake_request`/`unstake`, `withdraw_keeper_bond`), probes and aggregation (`submit_probe`, `aggregate`, `settle_probes`), and bond escrow and slashing (`lock_bond`/`release_bond`/`forfeit_bond`, `slash`, `reward_keeper`), plus `fund_rewards`/`claim_rewards` (new, a stand-in for `Treasury.accrue_reward`/`claim_reward` until `Treasury` exists). Section 12.3.
+- Settlement window: `settle_probes` is callable only in `[epoch_close + probe_grace_secs, epoch_close + probe_grace_secs + settle_window_secs]`, the one span during which every probe for that epoch is guaranteed to still exist (temporary entries have independently extendable TTLs; settling on a partial set is attackable). An epoch nobody settles within its window simply never settles: no faults, no rewards, no funds ever at risk from the omission. New parameters `probe_grace_secs` (1h) and `settle_window_secs` (24h). Sections 7.3, 7.4, 12.3, 23.
+- Submitter index and region snapshot (ADR-011): `aggregate`/`settle_probes` read a per-(asset, epoch) index of submitting reporters, capped at `max_submitters_per_epoch` (32), and each probe's region as registered at submission time, never the live reporter set or registration. A reporter address can only ever contribute the one region it registered under; it cannot cover two regions by submitting twice (one report per reporter per asset per epoch, Section 7.3). Sections 7.3, 7.4, 15.1, 23.
+- One role per address: `add_keeper` rejects an address already registered as a reporter and `add_reporter` rejects an address already registered as a keeper (`RoleConflict`), so `slash` and every other keeper-or-reporter branch always has exactly one target. Section 12.3, 14.
+- `lock_bond(key, owner, amount, subject)`: `subject: Option<Address>` is required `Some(keeper)` for a `SignalDispute` key, required `None` for an event bond kind (`InvalidBondSubject` otherwise), and `amount` must be positive (`InvalidAmount`); a zero or negative bond would otherwise increment the subject keeper's open dispute count with no real collateral locked to justify it. Sections 4.5, 7.8, 12.3, 14.
+- `slash(who, amount, winner, reason)`: the amount actually deducted and paid out is `min(amount, who's remaining balance)`, never the caller's raw requested amount; a request exceeding what `who` holds is capped down rather than overpaid from other participants' funds. The `Slashed` event carries both the actual `amount` and the original `requested_amount`. This build's auth checks only `oracle`, not `oracle` or `registry`/committee (Section 24.2): `EventRegistry` is not implemented yet and has no real call site to test against. Sections 7.5, 7.8, 12.3, 13, 14.
+- `unstake`/`withdraw_keeper_bond` for a keeper with an open signal dispute return a dedicated `DisputesOpen`, distinct from `Suspended` (a fault/evidence outcome, a different condition). Section 14.
+- Reward and bond-settlement balances are held directly in `Staking` (`RewardPool`, `Claimable(addr)`, `AccruedReward(addr)`) rather than routed through `Treasury.accrue_reward`/`claim_reward`, since `Treasury` is not implemented yet; `fund_rewards` is callable by anyone until `Treasury` exists to call it. `reward_keeper` is implemented (a flat `keeper_reward` accrual) but, as Section 12.3 already noted, has no `RiskOracle` call site. Sections 4.5, 7.5, 7.8, 12.3, 12.7.
+- New parameters, with their defaults and derivations, folded into Section 23: `probe_grace_secs` (1h), `settle_window_secs` (24h), `probe_ttl_margin_secs` (1 day), `min_distinct_regions` (2, naming the existing "2 distinct regions" rule), `fault_majority_threshold` (3, naming Section 7.5's "majority of 3 or more"), `max_submitters_per_epoch` (32), `unstake_cooldown_secs` (7d), `keeper_exit_delay_secs` (derived, `signal_dispute_secs + epoch_secs`, 3h), `reporter_exit_delay_secs` (derived, `epoch_secs + probe_grace_secs + settle_window_secs`, 26h), `reporter_reward_per_epoch` (0.1 USDC per settled asset-epoch, the `reporter_reward_pool` stand-in).
+- `keeper_reward` changed from 0.50 to 0.05 USDC per accepted epoch (10x lower), so reward parameters stay within a sustainable operating cost at the target scale (10 assets, hourly epochs); no dollar figures are stated in this document. Section 23. `contracts/staking`'s own `params::KEEPER_REWARD_PER_ACCEPTED_EPOCH` constant on `main` is changed to match (`500_000`, 0.05 USDC) in this same PR: nothing is deployed to any network yet, so code and spec simply agree.
+- New error codes in the `Staking` 300 range: `AlreadyRegistered` (309), `Suspended` (310), `UnstakePending` (311), `NoUnstakeRequested` (312), `ProbeWindowClosed` (313), `SettlementNotOpen` (314), `SettlementWindowExpired` (315), `AlreadySettled` (316), `UnknownCaller` (317, unreachable by construction, same reasoning as `Unauthorized`), `InvalidBondSubject` (318), `RoleConflict` (319), `DisputesOpen` (320), `InvalidAmount` (321). `EpochNotClosed` (308) documented as unreachable: `SettlementNotOpen`/`SettlementWindowExpired` supersede it. Section 14.
+- New storage: `Staking`'s `Submitters(asset, epoch)` (temporary, the per-epoch submitter index), `ProbesSettled(asset, epoch)` (temporary, settlement marker), `AllReporters` (instance, duplicate-registration check only, never consulted by `aggregate`/`settle_probes`), `RewardPool` (instance), `AccruedReward(addr)` (persistent); `KeeperInfo`/`ReporterInfo` (Section 12.3's read types, not previously defined anywhere in the spec's type tables) now include `unstake_requested_at`, `removed_at` and, for a keeper, `open_dispute_count`. Section 15.1.
+- Section 22.4/22.5: the keeper service calls `Staking.settle_probes` and `RiskOracle.check_stale` every epoch, alongside `finalize_endpoint` (which already calls `settle_probes` internally); an operator running their own epoch-close automation should not assume `finalize_endpoint` alone covers every asset if some assets' `finalize_endpoint` calls lag. Section 22.4.
+- `Section 12.3`'s own table of which `Staking` functions `RiskOracle` actually calls, extended with `release_bond` (now also called from `resolve_signal_dispute_timeout`) and the `subject` parameter on `lock_bond`'s call from `dispute_signals`.
 
 ## Changelog v1.2
 
@@ -210,6 +283,8 @@ flowchart LR
 ```
 
 The Governor governs every contract through timelocked actions; its arrows are omitted for readability. The indexer reads events from all contracts; the arrow shows it reading the series, the busiest source. Section 3.5 shows the same contracts as a build and runtime dependency graph.
+
+`Treasury` is built (`feat/treasury`, PR #13): the `ST -->|slashed funds, reward accruals| TR` and `TR -->|keeper and reporter rewards| KP, RN` arrows above are the real, current call shape, not a forward reference. `Staking` holds and pays only participant funds; every protocol-destined amount reaches `Treasury` through a real `deposit`/`accrue_reward` call (ADR-012, Section 4.5, 7.5, 7.8).
 
 ## 3. Contract inventory and deployment topology
 
@@ -566,6 +641,8 @@ pub enum TreasuryBucket { Fees, Slashed, KeeperRewards, ReporterRewards }
 
 `RiskOracle` and `EventRegistry` keep the dispute, proposal and challenge records; the USDC behind each record sits in `Staking` under its `BondKey` (Section 7.8). `Treasury` accounts its USDC in the four buckets (Section 12.7).
 
+A `BondKey::SignalDispute` bond also carries a `subject`: the keeper whose posting is disputed, passed from `RiskOracle.dispute_signals` into `Staking.lock_bond` (ADR-010, ADR-011). `Staking` uses this to count, per keeper, how many signal disputes naming it are still open, so removal cannot release a keeper's bond while one of its postings is still under dispute (Section 12.3). An event bond kind (`EventProposal`, `EventChallenge`) carries no subject: `EventRegistry` has no equivalent "which address does this concern" question a bond lock needs to answer.
+
 ## 5. Anchor Risk Oracle
 
 The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by bonded keepers, and derives the score and band onchain from those signals. Any posting can be disputed within a window by anyone who recomputes it from public data and gets a different result. `RiskOracle` holds no funds: keeper bonds and dispute bonds sit in `Staking` (Section 7.8).
@@ -597,10 +674,11 @@ The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by 
 
 ### 5.4 Disputing a posting
 
-- Anyone calls `dispute_signals(asset, epoch, alt_hash)` with a hash of their own inputs bundle. `RiskOracle` records the dispute and has `Staking` lock a bond of `signal_dispute_bond` USDC from the disputer under `BondKey::SignalDispute(asset, epoch)`.
+- Anyone calls `dispute_signals(asset, epoch, alt_hash)` with a hash of their own inputs bundle. `RiskOracle` records the dispute and has `Staking` lock a bond of `signal_dispute_bond` USDC from the disputer under `BondKey::SignalDispute(asset, epoch)`, naming the epoch's poster as the bond's `subject` (Section 4.5, ADR-011) so the keeper's own bond cannot be released by a removal while this dispute is open.
 - A dispute does not reset any window. The disputed epoch stays non final (Pending in the sense of Section 5.7, `Disputed` in its ring slot) until resolved; if overturned it reopens for reposting (Section 5.2).
 - The dispute is decided by the committee multisig in v1 (a recomputation is deterministic, so the committee runs the open source recomputation tool on both bundles). Moving this to onchain verifiable recomputation is on the decentralization path (Section 1.6).
 - Loser forfeits: 50% to the winner, 50% to the `Treasury`. If the keeper wins, `RiskOracle` instructs `Staking` to forfeit the disputer's bond to the keeper. If the disputer wins, `RiskOracle` instructs `Staking` to release the disputer's bond and slash the keeper by `keeper_slash` with the disputer as winner; `Staking` suspends a keeper after `keeper_max_faults`. `resolve_signal_dispute`'s own `reason` argument is accepted but not persisted by `RiskOracle` and not forwarded to `Staking.slash` (which always receives a zero filled reason from this call site); a committee ruling's actual reason lives only in whatever offchain record the committee publishes, not onchain.
+- **Ruling deadline (ADR-010).** If the committee has not ruled within `signal_dispute_ruling_secs` (default 7 days) of the dispute, anyone can call `resolve_signal_dispute_timeout(asset, epoch)`: the default outcome favors the data, the same reasoning Section 8.9 gives for an escalated Tier 1 event. The keeper's posting stands (its slot becomes Final), the disputer's bond is released in full, and nobody is slashed; the committee's silence is read as no evidence the posting was wrong, not as a loss for either side. A miss is recorded against the committee address (`committee_misses`, Section 12.1), grounds for rotating the committee through governance.
 
 ### 5.5 Staleness
 
@@ -613,7 +691,7 @@ The `RiskOracle` contract stores one `SignalSet` per asset per epoch, posted by 
 ### 5.6 Keepers
 
 - v1: up to 5 permissioned keepers, each added by governance and bonded in `Staking` (`keeper_bond`, default 5,000 USDC). Together with the committee they are the v1 trust root for payouts (Section 1.6).
-- Any keeper may post for any asset; the first valid posting for an epoch wins. When it becomes Final, `RiskOracle` calls `Staking.reward_keeper`, which accrues `keeper_reward` from the `Treasury` keeper reward pool.
+- Any keeper may post for any asset; the first valid posting for an epoch wins. `Staking.reward_keeper` exists and accrues `keeper_reward` from `Staking`'s own local reward balance (a stand-in for the `Treasury` keeper reward pool until `Treasury` exists), but as built `RiskOracle` never actually calls it when a posting becomes Final: no `RiskOracle` call site invokes `reward_keeper` yet (Section 12.3, 24.2), a known, open gap, not a design decision.
 - Reference keeper implementation is open source (Section 18), so third parties can run one. Open keeper registration with higher stakes is a later version item (Section 1.6).
 
 ### 5.7 Signal lifecycle
@@ -659,23 +737,30 @@ sequenceDiagram
 
   alt no dispute within signal_dispute_secs
     Oracle->>Oracle: effectively Final once signal_dispute_secs elapses; observed and announced by the backward scan on the next state changing call for this asset (ADR-008)
-    Oracle->>Staking: reward_keeper(keeper)
+    Note over Oracle,Staking: Staking.reward_keeper exists but, as built, nothing calls it here yet (known gap, Section 24.2)
     Oracle-->>Keeper: signals_final event (once, when first observed Final)
   else disputed
     Disputer->>Oracle: dispute_signals(asset, epoch, alt_hash)
-    Oracle->>Staking: lock_bond(SignalDispute(asset, epoch), disputer, signal_dispute_bond)
+    Oracle->>Staking: lock_bond(SignalDispute(asset, epoch), disputer, signal_dispute_bond, subject = Some(keeper))
     Oracle-->>Disputer: signals_disputed event, state = Disputed
-    Committee->>Committee: run sylox-recompute on both bundles
-    Committee->>Oracle: resolve_signal_dispute(asset, epoch, keeper_wins, reason)
-    alt keeper_wins
-      Oracle->>Oracle: state = Final
-      Oracle->>Staking: forfeit_bond(SignalDispute, winner = keeper), 50% keeper, 50% Treasury
-      Oracle-->>Keeper: signals_resolved event
-    else disputer_wins
-      Oracle->>Oracle: state = Overturned, epoch reopened for reposting
-      Oracle->>Staking: release_bond(SignalDispute), disputer refunded
-      Oracle->>Staking: slash(keeper, keeper_slash, winner = disputer), 50% disputer, 50% Treasury
-      Oracle-->>Disputer: signals_resolved event
+    alt committee rules before signal_dispute_ruling_secs
+      Committee->>Committee: run sylox-recompute on both bundles
+      Committee->>Oracle: resolve_signal_dispute(asset, epoch, keeper_wins, reason)
+      alt keeper_wins
+        Oracle->>Oracle: state = Final
+        Oracle->>Staking: forfeit_bond(SignalDispute, winner = keeper), 50% keeper, 50% Treasury
+        Oracle-->>Keeper: signals_resolved event
+      else disputer_wins
+        Oracle->>Oracle: state = Overturned, epoch reopened for reposting
+        Oracle->>Staking: release_bond(SignalDispute), disputer refunded
+        Oracle->>Staking: slash(keeper, keeper_slash, winner = disputer), 50% disputer, 50% Treasury
+        Oracle-->>Disputer: signals_resolved event
+      end
+    else nobody rules within signal_dispute_ruling_secs (ADR-010)
+      Anyone->>Oracle: resolve_signal_dispute_timeout(asset, epoch)
+      Oracle->>Oracle: state = Final, a miss recorded against the committee
+      Oracle->>Staking: release_bond(SignalDispute), disputer refunded in full, keeper not slashed
+      Oracle-->>Disputer: signal_dispute_timed_out event
     end
   end
 ```
@@ -770,16 +855,20 @@ pub struct ProbeReport {
     pub asset: Address,
     pub epoch: u64,
     pub status: EndpointStatus,
-    pub region: Symbol,            // e.g. "eu", "us", "af"
+    pub region: Symbol,            // e.g. "eu", "us", "af"; accepted on the wire but IGNORED by Staking (ADR-011), see below
     pub evidence_hash: BytesN<32>, // raw HTTP transcripts bundle
 }
 ```
 
-Reporters submit `submit_probe(reporter, report)` with `reporter.require_auth()`. One report per reporter per asset per epoch.
+Reporters submit `submit_probe(reporter, report)` with `reporter.require_auth()`. One report per reporter per asset per epoch, accepted only for the current epoch or the just-closed epoch within `probe_grace_secs` (new parameter, default 1h, Section 23) of its close.
+
+`report.region` is accepted on the wire but ignored: `Staking` uses the reporter's own REGISTERED region (fixed at `add_reporter`, immutable afterward) for aggregation, never the field on the individual report. A reporter address can therefore never cover two regions by submitting twice; a single address contributes exactly the one region it registered under, no matter what it puts in `report.region` (ADR-011).
+
+`Staking` keeps a per (asset, epoch) index of every reporter who submitted a probe for it, capped at `max_submitters_per_epoch` (new parameter, default 32, well above the 5 to 9 reporter target so no legitimate network could ever hit it). `aggregate`/`settle_probes` iterate this index, together with the region each probe was snapshotted under at submission (not a live lookup of the reporter's current registration), so a reporter removed after submitting still counts toward that epoch's result exactly as it would have before removal (ADR-011).
 
 ### 7.4 Aggregation
 
-- At least `min_reporters` (default 3) reports from at least 2 distinct regions are needed for a status other than Unknown.
+- At least `min_reporters` (default 3) reports from at least `min_distinct_regions` (new parameter, default 2) distinct regions are needed for a status other than Unknown.
 - Status = the status reported by a strict majority; if no strict majority, Degraded. "Strict majority" means more than half of the reports received for that asset and epoch.
 - `Staking.aggregate(asset, epoch)` computes this; it is a read with no side effects.
 - The endpoint status comes only from this aggregate. `RiskOracle` writes it into the epoch's `SignalSet.endpoint` and ring slot during `post_signals` if the aggregate exists by then, or when anyone calls `RiskOracle.finalize_endpoint(asset, epoch)` after the epoch closes. `finalize_endpoint` lives on `RiskOracle`, reads `Staking.aggregate`, and then calls `Staking.settle_probes(asset, epoch)` so rewards and faults are booked exactly once. A keeper can never set the endpoint status.
@@ -787,8 +876,9 @@ Reporters submit `submit_probe(reporter, report)` with `reporter.require_auth()`
 ### 7.5 Incentives and slashing
 
 - Stake: `reporter_stake` (default 1,000 USDC), held in `Staking`.
-- Reward: an equal share of `reporter_reward_pool` per asset epoch among reporters who agreed with the majority. `Staking.settle_probes` books it by calling `Treasury.accrue_reward` against the `ReporterRewards` bucket; reporters claim with `Treasury.claim_reward`. If the bucket runs short, an accrual is capped at what it holds; nothing is owed beyond that.
-- Fault: a report that disagrees with the majority in an epoch where the majority had at least 3 reporters counts one fault. More than `reporter_max_faults` (default 10) faults in 30 days triggers a slash of `reporter_slash_bps` (default 1,000 = 10%) and suspension. The slashed amount goes to the `Treasury` (`Slashed`).
+- **Settlement window.** `settle_probes(asset, epoch)` is callable exactly once per (asset, epoch), only during `[epoch_close + probe_grace_secs, epoch_close + probe_grace_secs + settle_window_secs]` (new parameter, default 24h): the one span during which every probe for that epoch is guaranteed to still exist. Probes are separate temporary entries with independently extendable TTLs; settling on a set that cannot be guaranteed complete would let an address that extends only its own probe's TTL manufacture a majority by letting everyone else's probe expire first. **An epoch nobody settles within its window simply never settles**: no faults are recorded, no rewards are reserved, the reward pool is untouched. This is intended behavior, not an error state: stakes stay exactly where they were and nothing was transferred speculatively, so a missed settlement window costs nothing beyond the rewards that epoch would otherwise have paid out.
+- Reward: an equal share of `reporter_reward_per_epoch` (0.1 USDC per settled asset-epoch) among reporters who agreed with the majority, for every epoch actually settled within its window. `Staking.settle_probes` accrues each matching reporter's share via `Treasury.accrue_reward(reporter, ReporterRewards, share)` (ADR-012); reporters claim with `Treasury.claim_reward`. `Treasury.accrue_reward` itself caps an accrual at what the `ReporterRewards` bucket holds and emits `reward_shortfall` if it could not cover the full request (Section 12.7); nothing is owed beyond that.
+- Fault: a report that disagrees with the majority in an epoch where the majority had at least `fault_majority_threshold` (new parameter, naming the existing "3 or more" rule, default 3) reporters counts one fault. More than `reporter_max_faults` (default 10) faults in 30 days triggers a slash of `reporter_slash_bps` (default 1,000 = 10%) and suspension. The slashed amount goes to the `Treasury` (`Slashed`).
 - Provably false evidence (an evidence bundle that contradicts the signed status) is slashed fully after a committee ruling.
 
 ### 7.6 Sybil resistance
@@ -806,10 +896,13 @@ stateDiagram-v2
   Staked --> Staked: submit_probe each epoch
   Staked --> Suspended: faults > reporter_max_faults in 30d, or false evidence ruling
   Staked --> Unstaking: unstake_request (cooldown starts)
-  Unstaking --> [*]: unstake, after cooldown
+  Unstaking --> [*]: unstake, after cooldown >= reporter_exit_delay_secs
   Suspended --> Staked: governor re-adds, re-stake
-  Suspended --> [*]: remove_reporter
+  Staked --> Removed: remove_reporter (governor); deactivated immediately, no new probes
+  Removed --> [*]: unstake, after reporter_exit_delay_secs (ADR-011); stake stays slashable until then
 ```
+
+Removal (`Staked -> Removed`) is not an instant exit: it deactivates the reporter immediately but does not release its stake. The stake leaves only after `reporter_exit_delay_secs` has passed (ADR-011), long enough that every epoch the reporter could have probed can still run through its own settlement window and fault or slash it if warranted; a reporter's own voluntary `unstake_request` is held to the same floor (`unstake_cooldown_secs >= reporter_exit_delay_secs`), so neither path can be used to exit faster than the accountability window allows.
 
 Each epoch, every active reporter probes independently and the contract resolves one aggregate status from however many reports arrive:
 
@@ -826,18 +919,19 @@ sequenceDiagram
   par independent probes, every probe_secs
     R1->>Anchor: GET stellar.toml, GET /info (7.1)
     Anchor-->>R1: status, latency
-    R1->>Staking: submit_probe(asset, epoch, status, region="eu", evidence_hash)
+    R1->>Staking: submit_probe(asset, epoch, status, region ignored, evidence_hash)
+    Note over Staking: Staking uses R1's REGISTERED region ("eu"), snapshotted now, never the field above
   and
     R2->>Anchor: GET stellar.toml, GET /info
     Anchor-->>R2: status, latency
-    R2->>Staking: submit_probe(asset, epoch, status, region="us", evidence_hash)
+    R2->>Staking: submit_probe(asset, epoch, status, region ignored, evidence_hash)
   and
     R3->>Anchor: GET stellar.toml, GET /info
     Anchor-->>R3: status, latency
-    R3->>Staking: submit_probe(asset, epoch, status, region="af", evidence_hash)
+    R3->>Staking: submit_probe(asset, epoch, status, region ignored, evidence_hash)
   end
 
-  Note over Staking: after epoch closes, needs >= min_reporters from >= 2 regions
+  Note over Staking: after epoch closes, needs >= min_reporters from >= min_distinct_regions
   alt strict majority on one status
     Staking->>Staking: aggregate = the status reported by the strict majority
   else no strict majority
@@ -855,9 +949,10 @@ sequenceDiagram
   Staking-->>Oracle: EndpointStatus
   Oracle->>Oracle: write SignalSet.endpoint and ring slot
 
+  Note over Staking: only inside [epoch_close + probe_grace_secs, + settle_window_secs] (7.5); outside it, settle_probes rejects and the epoch never settles
   Oracle->>Staking: settle_probes(asset, epoch), once per asset epoch
-  Staking->>Treasury: accrue_reward for each reporter matching the aggregate (7.5)
-  Staking->>Staking: reporters disagreeing with a 3+ majority accrue one fault
+  Staking->>Treasury: accrue_reward(reporter, ReporterRewards, share) for each reporter matching the aggregate, reporter_reward_per_epoch split equally (7.5, ADR-012)
+  Staking->>Staking: reporters disagreeing with a fault_majority_threshold+ majority accrue one fault
 ```
 
 ### 7.8 Bond escrow and slashing
@@ -868,17 +963,18 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | Keeper bond | `Keeper(addr)` stake | Keeper, via `stake` | `slash` from `RiskOracle` on a lost signal dispute |
 | Reporter stake | `Reporter(addr)` stake | Reporter, via `stake` | Fault slashes inside `Staking` (7.5); false evidence slash after a committee ruling |
-| Signal dispute bond | `SignalDispute(asset, epoch)` | `RiskOracle.dispute_signals` | `release_bond` or `forfeit_bond` from `resolve_signal_dispute` |
-| Tier 2 proposer bond | `EventProposal(event_id)` | `EventRegistry.propose_tier2` | `release_bond` or `forfeit_bond` from `finalize`, `rule` or `resolve_timeout` |
-| Challenger bond | `EventChallenge(event_id)` | `EventRegistry.challenge` | `release_bond` or `forfeit_bond` from `rule` or `resolve_timeout` |
+| Signal dispute bond | `SignalDispute(asset, epoch)`, `subject` = the disputed posting's keeper | `RiskOracle.dispute_signals` | `release_bond` or `forfeit_bond` from `resolve_signal_dispute`, or `release_bond` from `resolve_signal_dispute_timeout` (ADR-010) |
+| Tier 2 proposer bond | `EventProposal(event_id)`, no subject | `EventRegistry.propose_tier2` | `release_bond` or `forfeit_bond` from `finalize`, `rule` or `resolve_timeout` |
+| Challenger bond | `EventChallenge(event_id)`, no subject | `EventRegistry.challenge` | `release_bond` or `forfeit_bond` from `rule` or `resolve_timeout` |
 
 Settlement rules:
 
-- `release_bond(key)` credits the full bond back to its owner.
-- `forfeit_bond(key, winner)` credits 50% to the winner and sends 50% to the `Treasury` (`Slashed`). With no bonded counterparty (a challenge against a Tier 1 or Tier 3 proposal), `winner` is `None` and 100% goes to the `Treasury`.
-- `slash(who, amount, winner, reason)` takes from a keeper or reporter stake with the same 50/50 split, and suspends the keeper or reporter once its fault limit is reached.
+- `lock_bond(key, owner, amount, subject)` requires `amount > 0` and a `subject` matching the key's kind: `Some(keeper)` for `SignalDispute`, `None` for an event bond kind; a mismatch or a non-positive amount is rejected, never silently accepted (Section 12.3, 14).
+- `release_bond(key)` credits the full bond back to its owner, and, for a `SignalDispute` bond, decrements the named keeper's open dispute count by one (ADR-011).
+- `forfeit_bond(key, winner)` credits 50% to the winner and sends 50% to the `Treasury` (`Slashed`), and decrements the open dispute count the same way `release_bond` does. With no bonded counterparty (a challenge against a Tier 1 or Tier 3 proposal), `winner` is `None` and 100% goes to the `Treasury`.
+- `slash(who, amount, winner, reason)` takes from a keeper or reporter stake with the same 50/50 split, capped at `min(amount, who's remaining balance)`: a request exceeding what `who` actually holds is paid out at what was actually deducted, never at the full requested amount, so the difference is never drawn from other participants' funds. Suspends the keeper or reporter once its fault limit is reached.
 - Refunds and winnings are credited to a claimable balance and paid by `claim(who)`, never pushed, so a recipient whose USDC trustline is missing or frozen cannot block a resolution.
-- On a ruling deadline timeout (Section 8.9) every bond on the event is released; nobody is slashed.
+- On a ruling deadline timeout (Section 8.9, ADR-010) every bond on the event or dispute is released; nobody is slashed.
 
 ## 8. Credit Event Registry
 
@@ -1064,7 +1160,7 @@ sequenceDiagram
   participant Anyone
 
   Challenger->>Registry: challenge(event_id, evidence)
-  Registry->>Staking: lock_bond(EventChallenge(event_id), challenger, challenge_bond)
+  Registry->>Staking: lock_bond(EventChallenge(event_id), challenger, challenge_bond, subject = None)
   Registry->>Registry: state = Escalated, escalated_at = now
   Registry-->>Challenger: event_escalated { event_id, ruling_deadline }
 
@@ -1357,6 +1453,7 @@ fn disable_asset(env, asset: Address);                     // auth: governor
 fn post_signals(env, keeper: Address, asset: Address, s: SignalSet); // auth: keeper; any closed, non Final epoch inside window_secs; s.endpoint ignored; checks staleness (check_stale) on the way out
 fn dispute_signals(env, disputer: Address, asset: Address, epoch: u64, alt_hash: BytesN<32>); // auth: disputer; bond locked in Staking; checks staleness on the way out
 fn resolve_signal_dispute(env, asset: Address, epoch: u64, keeper_wins: bool, reason: BytesN<32>); // auth: committee; instructs Staking; checks staleness on the way out
+fn resolve_signal_dispute_timeout(env, asset: Address, epoch: u64); // anyone, after signal_dispute_ruling_secs from the dispute if the committee has not ruled (ADR-010); keeper's posting stands, disputer's bond released in full, nobody slashed, a miss recorded against the committee
 fn finalize_endpoint(env, asset: Address, epoch: u64);     // anyone, after the epoch closes; reads Staking.aggregate, then Staking.settle_probes; checks staleness on the way out
 fn set_event_band(env, asset: Address);                    // auth: registry contract
 fn clear_event_band(env, asset: Address);                  // auth: registry contract (re-enable, Section 8.8)
@@ -1379,6 +1476,8 @@ fn reference_rate(env, asset: Address) -> i128;            // reference to USD, 
 fn asset_config(env, asset: Address) -> Option<AssetConfig>;
 fn assets(env) -> Vec<Address>;
 ```
+
+`resolve_signal_dispute_timeout` (ADR-010) records a miss against the committee in its own `CommitteeMisses(committee)` storage (Section 15.1), mirroring `EventRegistry.committee_misses`'s role (Section 12.2) for the analogous event ruling timeout. As built, `RiskOracle` has no public read exposing this counter; it is written but not yet readable from outside the contract. Flagged in Section 24.2 as a gap to close, most likely by adding a `committee_misses(committee) -> u32` read matching `EventRegistry`'s own.
 
 ### 12.2 EventRegistry
 
@@ -1414,52 +1513,53 @@ v1.0's `escalate` is folded into `challenge` (Section 8.1) and `withdraw_bond` i
 fn initialize(env, governor: Address, oracle: Address, registry: Address, treasury: Address, usdc: Address);
 
 // membership
-fn add_keeper(env, keeper: Address);                       // auth: governor
-fn remove_keeper(env, keeper: Address);                    // auth: governor
-fn add_reporter(env, reporter: Address, region: Symbol);   // auth: governor
-fn remove_reporter(env, reporter: Address);                // auth: governor
+fn add_keeper(env, keeper: Address);                       // auth: governor; rejects an address already registered as a reporter (RoleConflict)
+fn remove_keeper(env, keeper: Address);                    // auth: governor; deactivates immediately, does not release the bond (ADR-011)
+fn add_reporter(env, reporter: Address, region: Symbol);   // auth: governor; region fixed from here on; rejects an address already registered as a keeper (RoleConflict)
+fn remove_reporter(env, reporter: Address);                // auth: governor; deactivates immediately, does not release the stake (ADR-011)
 
 // keeper bonds and reporter stakes
 fn stake(env, who: Address, amount: i128);                 // auth: who (a registered keeper or reporter)
-fn unstake_request(env, who: Address, amount: i128);       // auth: who, starts cooldown
-fn unstake(env, who: Address) -> i128;                     // auth: who, after cooldown
+fn unstake_request(env, who: Address, amount: i128);       // auth: who, starts cooldown (unstake_cooldown_secs, >= the removal exit delay, ADR-011)
+fn unstake(env, who: Address) -> i128;                      // auth: who, after cooldown; for a keeper, also requires no open signal dispute (DisputesOpen otherwise)
+fn withdraw_keeper_bond(env, keeper: Address) -> i128;      // anyone, the removal exit path (ADR-011): after keeper_exit_delay_secs from remove_keeper AND no open signal dispute naming this keeper
 
 // probes
-fn submit_probe(env, reporter: Address, r: ProbeReport);   // auth: reporter
-fn settle_probes(env, asset: Address, epoch: u64);         // anyone, once per asset epoch after it closes; books faults, accrues rewards in Treasury
+fn submit_probe(env, reporter: Address, r: ProbeReport);   // auth: reporter; current epoch or the just-closed epoch within probe_grace_secs; r.region ignored, the reporter's registered region is used (ADR-011)
+fn settle_probes(env, asset: Address, epoch: u64);         // anyone, once per asset epoch, only inside its settlement window (7.5); books faults, accrues matching reporters' rewards via Treasury.accrue_reward (ADR-012); never settles outside the window
 
-// bond escrow (Section 7.8)
-fn lock_bond(env, key: BondKey, owner: Address, amount: i128); // auth: RiskOracle for SignalDispute, EventRegistry for EventProposal and EventChallenge; pulls USDC from owner
-fn release_bond(env, key: BondKey);                        // auth: the contract that locked it; full amount to owner's claimable balance
-fn forfeit_bond(env, key: BondKey, winner: Option<Address>); // auth: the contract that locked it; 50% to winner (if any), rest to Treasury Slashed
-fn slash(env, who: Address, amount: i128, winner: Option<Address>, reason: BytesN<32>); // auth: RiskOracle or EventRegistry, or committee for false probe evidence (7.5)
-fn reward_keeper(env, keeper: Address);                    // auth: RiskOracle; accrues keeper_reward in Treasury
-fn claim(env, who: Address) -> i128;                       // auth: who; pays refunds and winnings
+// bond escrow (Section 7.8, ADR-010, ADR-011, ADR-012)
+fn lock_bond(env, key: BondKey, owner: Address, amount: i128, subject: Option<Address>); // auth: RiskOracle for SignalDispute, EventRegistry for EventProposal and EventChallenge; pulls USDC from owner; subject = Some(keeper) for SignalDispute, None for an event kind (InvalidBondSubject otherwise); amount must be positive (InvalidAmount otherwise)
+fn release_bond(env, key: BondKey);                        // auth: the contract that locked it; full amount to owner's claimable balance; decrements the subject keeper's open dispute count, if any
+fn forfeit_bond(env, key: BondKey, winner: Option<Address>); // auth: the contract that locked it; 50% to winner (if any) credited to Claimable, the rest reaches Treasury's Slashed bucket via a real deposit call (ADR-012); same open dispute count decrement as release_bond
+fn slash(env, who: Address, amount: i128, winner: Option<Address>, reason: BytesN<32>); // auth: RiskOracle in this build (EventRegistry/committee not yet wired, Section 24.2); actual amount deducted and paid out is min(amount, who's remaining balance), never the raw request; the protocol's half reaches Treasury's Slashed bucket via a real deposit call (ADR-012)
+fn reward_keeper(env, keeper: Address, epochs: u32) -> i128; // auth: RiskOracle; accrues keeper_reward * epochs from Treasury's KeeperRewards bucket via Treasury.accrue_reward, only for a currently active, non-suspended keeper; otherwise a no-op returning 0, not an error (ADR-012, issue #11 fix)
+fn claim(env, who: Address) -> i128;                       // auth: who; pays bond settlement refunds and winnings; reporter and keeper rewards are claimed from Treasury.claim_reward instead (ADR-012)
 
 // reads
 fn keeper(env, keeper: Address) -> Option<KeeperInfo>;
-fn is_active_keeper(env, keeper: Address) -> bool;
+fn is_active_keeper(env, keeper: Address) -> bool;          // added, fully bonded (>= keeper_bond), not suspended and not removed
 fn reporter(env, reporter: Address) -> Option<ReporterInfo>;
 fn bond(env, key: BondKey) -> Option<(Address, i128)>;     // (owner, amount)
 fn claimable(env, who: Address) -> i128;
 fn probes(env, asset: Address, epoch: u64) -> Vec<ProbeReport>;
-fn aggregate(env, asset: Address, epoch: u64) -> EndpointStatus; // strict majority, else Degraded (7.4)
+fn aggregate(env, asset: Address, epoch: u64) -> EndpointStatus; // strict majority, else Degraded (7.4); never writes (S4)
 ```
 
-`RiskOracle`'s own view of this interface, confirmed against the built contract (Section 5.4, 7.4, 7.8):
+`RiskOracle`'s own view of this interface, confirmed against the built contract (Section 5.4, 7.4, 7.8, ADR-010, ADR-011, ADR-012):
 
 | Function | Called from `RiskOracle` | Notes |
 | --- | --- | --- |
 | `is_active_keeper` | `post_signals` | Gates every posting; `false` rejects with `KeeperNotActive` |
 | `aggregate` | `post_signals`, `finalize_endpoint` | Sole source of `SignalSet.endpoint`; any keeper posted value is discarded |
 | `settle_probes` | `finalize_endpoint` | Called unconditionally once per `finalize_endpoint` call, regardless of whether that call is what resolved the endpoint |
-| `lock_bond` | `dispute_signals` | `key = BondKey::SignalDispute(asset, epoch)`, `owner` = the disputer |
-| `release_bond` | `resolve_signal_dispute`, disputer wins | Same key; releases the disputer's own bond back to them |
+| `lock_bond` | `dispute_signals` | `key = BondKey::SignalDispute(asset, epoch)`, `owner` = the disputer, `subject` = `Some(signals.poster)`, the disputed epoch's keeper |
+| `release_bond` | `resolve_signal_dispute` (disputer wins), `resolve_signal_dispute_timeout` | Same key; releases the disputer's own bond back to them |
 | `forfeit_bond` | `resolve_signal_dispute`, keeper wins | Same key; `winner` = the original poster (the keeper) |
 | `slash` | `resolve_signal_dispute`, disputer wins | `who` = the keeper, by address directly, not a `BondKey` operation |
-| `reward_keeper` | nowhere yet | Declared in this interface but no `RiskOracle` call site invokes it; see Section 24.2 |
+| `reward_keeper` | the backward finality scan (ADR-008), on every call that advances it | Called once per distinct poster found among the epochs that scan observes newly Final on this call, with that poster's own count; an overturned epoch is never in this set, so it is never rewarded (issue #11 fix) |
 
-There is exactly one `BondKey` `RiskOracle` ever uses, `BondKey::SignalDispute(asset, epoch)`, always the disputer's own bond. `RiskOracle` never locks a bond for a keeper's own posting; `slash` is the only call that touches a keeper's stake, directly by address, assuming `Staking` already holds a slashable stake for every address `is_active_keeper` returns `true` for. Whether a keeper is meant to post its own per-signal bond, symmetric to the disputer's, is an open question (Section 24.2).
+There is exactly one `BondKey` `RiskOracle` ever uses, `BondKey::SignalDispute(asset, epoch)`, always the disputer's own bond, with the disputed epoch's keeper as its `subject` (ADR-011). `RiskOracle` never locks a bond for a keeper's own posting; `slash` is the only call that touches a keeper's stake, directly by address, assuming `Staking` already holds a slashable stake for every address `is_active_keeper` returns `true` for. Whether a keeper is meant to post its own per-signal bond, symmetric to the disputer's, is an open question (Section 24.2), unaffected by `reward_keeper` now having a real call site.
 
 ### 12.4 MarketFactory
 
@@ -1529,15 +1629,15 @@ fn committee(env) -> Address;
 
 ### 12.7 Treasury
 
-`Treasury` holds protocol fees, slashed funds and the keeper and reporter reward pools, accounted in four `TreasuryBucket`s (Section 4.5). It pays out in exactly two ways: accrued rewards claimed by the keeper or reporter who earned them, and governance actions.
+`Treasury` holds protocol fees, slashed funds and the keeper and reporter reward pools, accounted in four `TreasuryBucket`s (Section 4.5, ADR-012). It pays out in exactly two ways: accrued rewards claimed by the keeper or reporter who earned them, and governance actions. Built exactly to this interface (`feat/treasury`, PR #13); every function below is real, not a forward reference to a contract that does not exist yet.
 
 ```rust
 fn initialize(env, governor: Address, staking: Address, usdc: Address);
-fn deposit(env, from: Address, bucket: TreasuryBucket, amount: i128); // auth: from; pulls USDC into the bucket (Series fees, Staking slashed funds, top ups)
-fn accrue_reward(env, to: Address, bucket: TreasuryBucket, amount: i128) -> i128; // auth: staking; KeeperRewards or ReporterRewards only; accrues min(amount, bucket balance), returns it
-fn claim_reward(env, who: Address) -> i128;                // auth: who; pays everything accrued to who
-fn allocate(env, from: TreasuryBucket, to: TreasuryBucket, amount: i128); // auth: governor (TreasuryAllocate action)
-fn spend(env, bucket: TreasuryBucket, to: Address, amount: i128); // auth: governor (TreasurySpend action)
+fn deposit(env, from: Address, bucket: TreasuryBucket, amount: i128); // auth: from; pulls USDC into the bucket (Series fees, Staking slashed funds, top ups); amount must be positive (InvalidAmount)
+fn accrue_reward(env, to: Address, bucket: TreasuryBucket, amount: i128) -> i128; // auth: staking; KeeperRewards or ReporterRewards only (WrongBucket otherwise); amount must be positive (InvalidAmount); accrues min(amount, bucket balance), returns it; emits reward_shortfall if accrued < amount
+fn claim_reward(env, who: Address) -> i128;                // auth: who; pays everything accrued to who (NothingToClaim if nothing is)
+fn allocate(env, from: TreasuryBucket, to: TreasuryBucket, amount: i128); // auth: governor (TreasuryAllocate action); amount must be positive (InvalidAmount) and <= from's balance (InsufficientBucket)
+fn spend(env, bucket: TreasuryBucket, to: Address, amount: i128); // auth: governor (TreasurySpend action); amount must be positive (InvalidAmount) and <= bucket's balance (InsufficientBucket)
 
 // reads
 fn balance(env, bucket: TreasuryBucket) -> i128;           // unallocated balance of the bucket
@@ -1545,10 +1645,10 @@ fn accrued(env, who: Address) -> i128;                     // accrued and not ye
 ```
 
 - **Fees in:** `Series.buy_cover` calls `deposit(series, Fees, fee)` (Section 9.4 step 7). When a contract is the `from`, it authorizes the nested USDC transfer with `env.authorize_as_current_contract` before the call, because the token sees `Treasury`, not the depositor, as its direct invoker.
-- **Slashed funds in:** `Staking` deposits the protocol half of every forfeited bond and slash into `Slashed` (Section 7.8).
-- **Rewards out:** only `Staking` can accrue rewards, for keepers (`reward_keeper`, on instruction from `RiskOracle`) and reporters (`settle_probes`). An accrual moves funds from the reward bucket into the recipient's accrued balance, so accrued rewards are always fully backed. A short bucket caps the accrual; it never fails the calling flow.
-- **Governance:** `allocate` moves funds between buckets (typically from `Fees` into the reward pools); `spend` pays maintenance or committee costs out of a bucket. Both are timelocked `Governor` actions (Section 17.2).
-- **Invariant I15:** the USDC balance of `Treasury` is at least the sum of the bucket balances plus all accrued, unclaimed rewards.
+- **Slashed funds in:** `Staking` deposits the protocol half of every forfeited bond and slash into `Slashed` through a real `deposit` call (ADR-012; Section 7.8), not a local credit inside `Staking` itself.
+- **Rewards out:** only `Staking` can accrue rewards, for keepers (`reward_keeper`, called from the finality scan, Section 12.1, 12.3) and reporters (`settle_probes`). An accrual moves funds from the reward bucket into the recipient's accrued balance, so accrued rewards are always fully backed (T2). A short bucket caps the accrual and emits `reward_shortfall`; it never fails the calling flow.
+- **Governance:** `allocate` moves funds between buckets (typically from `Fees` into the reward pools) without changing the total held across buckets (T4); `spend` pays maintenance or committee costs out of a bucket. Both are timelocked `Governor` actions (Section 17.2).
+- **Invariant T1 (= I15):** the USDC balance of `Treasury` is at least the sum of the bucket balances plus all accrued, unclaimed rewards (`>=`, since a direct transfer counts as a donation, not a violation). **T2:** `accrue_reward` never accrues more than its bucket holds. **T3:** USDC leaves `Treasury` only through `claim_reward` (to the address it was accrued to) or `spend` (governor). **T4:** `allocate` never changes the total held across buckets. Section 21.1.
 
 ## 13. Events reference
 
@@ -1560,6 +1660,7 @@ Every state change emits a contract event. Topics are `("sylox", <event>, <prima
 | RiskOracle | `signals_final` | asset | epoch |
 | RiskOracle | `signals_disputed` | asset | epoch, disputer, alt\_hash |
 | RiskOracle | `signals_resolved` | asset | epoch, keeper\_wins, reason |
+| RiskOracle | `signal_dispute_timed_out` | asset | epoch, disputer, committee (ADR-010) |
 | RiskOracle | `endpoint_finalized` | asset | epoch, status |
 | RiskOracle | `score_updated` | asset | epoch, score, formula\_version |
 | RiskOracle | `band_changed` | asset | from, to, epoch |
@@ -1573,15 +1674,19 @@ Every state change emits a contract event. Topics are `("sylox", <event>, <prima
 | EventRegistry | `event_cured` | asset | event\_id |
 | EventRegistry | `ruling_timed_out` | asset | event\_id, outcome (Declared or Rejected), committee, misses\_after |
 | Staking | `staked` / `unstaked` | who | amount, total\_after |
-| Staking | `probe_submitted` | asset | reporter, epoch, status, region |
+| Staking | `probe_submitted` | asset | reporter, epoch, status, region (the reporter's registered region, Section 7.3; the probe's own `region` field is never emitted, since it is ignored) |
 | Staking | `probes_settled` | asset | epoch, aggregate, rewarded, faulted |
 | Staking | `bond_locked` | owner | key, amount |
 | Staking | `bond_released` | owner | key, amount |
-| Staking | `bond_forfeited` | owner | key, amount, winner, to\_treasury |
-| Staking | `slashed` | who | amount, winner, to\_treasury, reason, suspended |
+| Staking | `bond_forfeited` | owner | key, amount, winner, to\_treasury (now backed by a real `Treasury.deposit` call into `Slashed`, ADR-012, not a local credit) |
+| Staking | `slashed` | who | amount (actually deducted and paid out), requested\_amount (the caller's original request, before capping, ADR fix S5), winner, to\_treasury (as above, ADR-012), reason, suspended |
 | Staking | `claimed` | who | amount |
+| Staking | `keeper_removed` | keeper | removed\_at, withdrawable\_at |
+| Staking | `reporter_removed` | reporter | removed\_at, withdrawable\_at |
+| Staking | `keeper_bond_withdrawn` | keeper | amount |
 | Treasury | `deposited` | bucket | from, amount |
 | Treasury | `reward_accrued` | to | bucket, requested, accrued |
+| Treasury | `reward_shortfall` | to | bucket, requested, accrued, shortfall (emitted alongside `reward_accrued` whenever accrued < requested, ADR-012, Section 12.7) |
 | Treasury | `reward_claimed` | who | amount |
 | Treasury | `allocated` | from\_bucket | to\_bucket, amount |
 | Treasury | `spent` | bucket | to, amount |
@@ -1630,6 +1735,7 @@ Each contract defines a `#[contracterror]` enum with `u32` codes in its own rang
 | 109 | `ReferenceRateUnavailable` | RiskOracle | `reference_rate` has no fresh rate: FX adapter missing or stale |
 | 110 | `AggregationFailed` | RiskOracle | The ring does not have enough history, or a required window read came back empty, for computing the score from a Final epoch; distinct from `SanityBoundFailed`, which is about one posted `SignalSet`'s own fields |
 | 111 | `ReferenceNotSupported` | RiskOracle | `add_asset` or `update_asset` was given `Reference::Asset`, rejected in v1: no USD rate is defined anywhere in this spec for an asset pegged reference |
+| 112 | `RulingDeadlineNotReached` | RiskOracle | `resolve_signal_dispute_timeout` called before `signal_dispute_ruling_secs` has elapsed since the dispute opened (ADR-010); same name as `EventRegistry`'s own 212, a different contract's error range |
 | 200 | `UnknownDefinition` | EventRegistry | No canonical definition for (asset, kind), or no such version |
 | 201 | `EventInProgress` | EventRegistry | Another event is open for this (asset, kind) |
 | 202 | `Tier1CheckFailed` | EventRegistry | Ring buffer data does not meet the definition, including too many missing epochs or a low baseline liquidity |
@@ -1645,13 +1751,26 @@ Each contract defines a `#[contracterror]` enum with `u32` codes in its own rang
 | 212 | `RulingDeadlineNotReached` | EventRegistry | `resolve_timeout` called before the ruling deadline |
 | 300 | `NotReporter` | Staking | Address not a registered reporter |
 | 301 | `DuplicateProbe` | Staking | Already reported this asset and epoch |
-| 302 | `StakeTooLow` | Staking | Below `reporter_stake` or `keeper_bond` |
-| 303 | `UnstakeCooldown` | Staking | Cooldown not over |
+| 302 | `StakeTooLow` | Staking | Below `reporter_stake` or `keeper_bond`, a non-positive `stake`/`unstake_request` amount, or a non-positive `slash` amount |
+| 303 | `UnstakeCooldown` | Staking | Cooldown not over, for either `unstake` or `withdraw_keeper_bond` |
 | 304 | `NotKeeper` | Staking | Address not a registered keeper |
 | 305 | `BondExists` | Staking | A bond is already locked under this `BondKey` |
 | 306 | `UnknownBond` | Staking | No locked bond under this `BondKey` |
-| 307 | `NothingToClaim` | Staking | Claimable balance is zero |
-| 308 | `EpochNotClosed` | Staking | Probe for a future epoch, or `settle_probes` before the epoch closed |
+| 307 | `NothingToClaim` | Staking | Claimable or accrued reward balance is zero |
+| 308 | `EpochNotClosed` | Staking | Unreachable as built: `settle_probes`'s own window checks (314, 315) supersede it, distinguishing "too early" from "too late" with codes this single one could not; kept for code number compatibility |
+| 309 | `AlreadyRegistered` | Staking | `add_keeper`/`add_reporter` for an address already registered under the SAME role |
+| 310 | `Suspended` | Staking | A keeper or reporter action attempted while suspended, or a removed reporter's `submit_probe` |
+| 311 | `UnstakePending` | Staking | `unstake_request` called while an unstake is already pending |
+| 312 | `NoUnstakeRequested` | Staking | `unstake` called with no pending `unstake_request` |
+| 313 | `ProbeWindowClosed` | Staking | `submit_probe` for an epoch outside the current epoch or the just closed epoch's grace period, or the per epoch submitter cap already reached |
+| 314 | `SettlementNotOpen` | Staking | `settle_probes` called before its settlement window opens |
+| 315 | `SettlementWindowExpired` | Staking | `settle_probes` called after its settlement window closed; the epoch simply never settles |
+| 316 | `AlreadySettled` | Staking | `settle_probes` called twice for the same (asset, epoch) |
+| 317 | `UnknownCaller` | Staking | Unreachable as built: every bond or slash auth check goes through `Address::require_auth()` on the registered `oracle`/`registry` address directly, which traps rather than returning this code; kept for code number compatibility, same reasoning as `Unauthorized` |
+| 318 | `InvalidBondSubject` | Staking | `lock_bond`'s `subject` did not match its `BondKey` kind: `Some(keeper)` required for `SignalDispute`, `None` required for an event kind |
+| 319 | `RoleConflict` | Staking | `add_keeper`/`add_reporter` for an address already registered under the OTHER role |
+| 320 | `DisputesOpen` | Staking | `unstake`/`withdraw_keeper_bond` for a keeper with an open signal dispute naming it; distinct from `Suspended` |
+| 321 | `InvalidAmount` | Staking | `lock_bond` called with a non-positive `amount` |
 | 400 | `TooManySeries` | MarketFactory | Asset at max open series |
 | 401 | `CoverCapExceeded` | MarketFactory | Asset wide cap reached in `reserve_cover` |
 | 402 | `InvalidTerms` | MarketFactory | Asset unknown or stale; term, cap, dates or fee invalid; `require_holding` with an `Asset` reference |
@@ -1702,7 +1821,8 @@ Soroban storage has three classes with different lifetimes and costs: instance (
 | RiskOracle | `DownStreak(asset)` | persistent | Hysteresis down streak counter (Section 6.4), kept separate from `Score(asset)` so advancing it does not require rewriting the whole `RiskScore` |
 | RiskOracle | `EventInProgress(asset)` | persistent | Set by `EventRegistry` via `set_event_in_progress`; forces the band to at least Distress at read time while `true` (Section 6.3) |
 | RiskOracle | `StaleAnnounced(asset)` | persistent | Whether `asset_stale` has already been emitted for the asset's current stale period (ADR-009); cleared when a fresh, non-stale epoch is scored |
-| RiskOracle | `Dispute(asset, epoch)` | persistent | Dispute record only (disputer, alt hash, outcome); the bond is in `Staking` |
+| RiskOracle | `Dispute(asset, epoch)` | persistent | Dispute record: disputer, alt hash, and `opened_at` (ADR-010, the ruling deadline's own clock, distinct from the posting's `pending_until`); the bond is in `Staking` |
+| RiskOracle | `CommitteeMisses(committee)` | persistent | Signal dispute ruling deadlines that committee let pass without a ruling (ADR-010); no public read yet (Section 12.1, 24.2) |
 | EventRegistry | `Config` | instance | governor, oracle, staking, factory addresses; next event id |
 | EventRegistry | `Def(asset, kind, version)` | persistent | `EventDefinition`, never overwritten |
 | EventRegistry | `Canonical(asset, kind)` | persistent | Current canonical version (`u32`) |
@@ -1710,14 +1830,16 @@ Soroban storage has three classes with different lifetimes and costs: instance (
 | EventRegistry | `Status(asset, kind)` | persistent | `AssetEventStatus` for the canonical version |
 | EventRegistry | `CommitteeMisses(committee)` | persistent | Missed ruling deadlines for that committee address |
 | Staking | `Config` | instance | governor, oracle, registry, treasury, USDC addresses |
-| Staking | `Keeper(addr)` | persistent | Bond, faults, active or suspended, unstake cooldown |
-| Staking | `Reporter(addr)` | persistent | Stake, region, faults, active or suspended, unstake cooldown |
-| Staking | `Probe(asset, epoch, reporter)` | temporary | `ProbeReport`, kept 7 days |
-| Staking | `ProbesSettled(asset, epoch)` | temporary | Marker so `settle_probes` books rewards and faults once, kept 7 days |
-| Staking | `Bond(key)` | persistent | Owner and amount for a `BondKey` (signal dispute, event proposal or challenge bond) |
-| Staking | `Claimable(addr)` | persistent | Refunds and winnings awaiting `claim` |
+| Staking | `Keeper(addr)` | persistent | `KeeperInfo`: bond, fault times (pruned rolling 30d window), suspended, `unstake_requested_at`, `removed_at`, `open_dispute_count` (ADR-011) |
+| Staking | `Reporter(addr)` | persistent | `ReporterInfo`: stake, region (fixed at `add_reporter`), fault times, suspended, `unstake_requested_at`, `removed_at` |
+| Staking | `AllReporters` | instance | Every reporter address ever added; `add_reporter`'s own duplicate check only, never consulted by `aggregate`/`settle_probes` |
+| Staking | `Probe(asset, epoch, reporter)` | temporary | `StoredProbe`: the `ProbeReport` plus `region_at_submission` (the snapshot, ADR-11); TTL extended at write time to cover the full settlement window with margin |
+| Staking | `Submitters(asset, epoch)` | temporary | The per (asset, epoch) index of submitting reporters, capped at `max_submitters_per_epoch` (Section 7.3); same TTL treatment as `Probe` |
+| Staking | `ProbesSettled(asset, epoch)` | temporary | Marker so `settle_probes` books rewards and faults once; same TTL treatment as `Probe` |
+| Staking | `Bond(key)` | persistent | `BondRecord`: owner, amount, and `subject` (`Some(keeper)` for a `SignalDispute` key, `None` for an event kind, ADR-011) |
+| Staking | `Claimable(addr)` | persistent | Bond settlement refunds and winnings owed to a specific participant, awaiting `claim` (ADR-012: participant funds only, never a protocol-destined amount) |
 | Treasury | `Config` | instance | governor, staking, USDC addresses |
-| Treasury | `Buckets` | instance | Balance of each `TreasuryBucket` |
+| Treasury | `Bucket(bucket)` | instance, one key per `TreasuryBucket` | Balance of that bucket; one key per bucket rather than a single `Buckets` map, the same per-field-storage-cost reasoning `Staking` uses elsewhere for similarly shaped state |
 | Treasury | `Accrued(addr)` | persistent | Rewards accrued to a keeper or reporter, awaiting `claim_reward` |
 | MarketFactory | `Config` | instance | governor, oracle, registry, treasury, USDC addresses, series Wasm hash |
 | MarketFactory | `SeriesCounter` | instance | Monotonic counter; the deployment salt (Section 3.2) |
@@ -1731,7 +1853,7 @@ Soroban storage has three classes with different lifetimes and costs: instance (
 | Governor | `Params` | instance | Parameter map |
 | Governor | `Action(id)` | persistent | `QueuedAction` (Section 17.1) |
 
-Funds sit only where the "Holds funds?" column of Section 3.1 says: `Series` (collateral and premiums), `Staking` (bonds and stakes), `Treasury` (fees, slashed funds, reward pools). No `RiskOracle` or `EventRegistry` key guards a balance.
+Funds sit only where the "Holds funds?" column of Section 3.1 says: `Series` (collateral and premiums), `Staking` (participant funds: bonds and stakes, including stake in cooldown, and `Claimable`), `Treasury` (protocol funds: fees, slashed funds, reward pools, in the four `TreasuryBucket`s). No `RiskOracle` or `EventRegistry` key guards a balance. This split is exact (ADR-012): `Staking` keeps no key that can hold a protocol-destined amount, and `Staking`'s own USDC balance equals its participant-fund liabilities exactly, apart from direct donations (Section 21.1).
 
 ### 15.2 TTL policy
 
@@ -1753,6 +1875,7 @@ A claimant whose balance entry was archived can restore it with a standard resto
 - The ring buffer holds 240 slots packed at 112 bytes each, 26,889 bytes per asset including its header (Section 5.8). Measured against the `RiskOracle` build: fits a single entry at 41% of `contract_data_entry_size_bytes`, and rewriting it every posting costs 28,012 write bytes (21.2% of `tx_max_write_bytes`), both with headroom. No paging fallback was needed.
 - The quote vector is capped at 64 entries to bound read and write cost of `buy_cover`.
 - `register_definition`'s live series check reads at most `max_series_per_asset` (default 4) series terms.
+- A full backfill window (`window_secs / epoch_secs + 1` = 73 epochs at the defaults) becoming Final in one `post_signals` call, grouped and rewarding several keepers at once (issue #11 fix, PR #13): measured at 8,583,607 instructions and 29,712 write bytes against a mocked `Staking`, and 8,217,132 instructions and 29,256 write bytes against the real `Staking` and `Treasury`, both comfortably under 50% of `tx_max_instructions` and `tx_max_write_bytes`. The real-contracts number came in slightly lower than the mock's, not higher, despite the extra cross-contract hop: both measurements use native test contracts rather than compiled Wasm, so the hop's own overhead is small, and the mock's own test bookkeeping (3 storage writes per call) outweighs `Treasury`'s single production write. `sylox_types::network_limits` holds the live values these percentages are computed against (Section 21.3).
 
 ## 16. Roles, authorization and access control
 
@@ -1763,24 +1886,24 @@ Every privileged call checks a role address with `require_auth()`; there are no 
 | Governor | Multisig contract, 4 of 7, 7 day timelock | Add assets, set parameters, register definitions (which is also how an asset is re-enabled after a Declared event), open series, upgrade contracts, add and remove keepers and reporters in `Staking`, allocate and spend `Treasury` funds | Change terms or pinned definition versions of an open series, change an asset's reference, move collateral, bonds or stakes, declare events |
 | Committee | Separate multisig, 4 of 7 | Rule on escalated events before their ruling deadline, propose Tier 3 events, resolve signal disputes, slash reporters for false evidence | Change parameters, touch collateral directly, extend a ruling deadline |
 | Guardian | 2 of 3 multisig of core team | Pause new deposits, new cover and new series per scope | Unpause (needs governor), pause claims or withdrawals, move funds |
-| Keeper | Bonded in `Staking`, permissioned by governance | Post signals for any closed, non Final epoch inside `window_secs`; claim keeper rewards from `Treasury` | Set the endpoint status, change Final postings, declare events |
-| Reporter | Staked in `Staking`, permissioned by governance | Submit probes, propose Tier 2 events (with bond), claim reporter rewards from `Treasury` | Decide disputes |
+| Keeper | Bonded in `Staking`, permissioned by governance | Post signals for any closed, non Final epoch inside `window_secs`; accrue keeper rewards (`Staking.reward_keeper`, called from `RiskOracle`'s finality scan, Treasury's `KeeperRewards` bucket) | Set the endpoint status, change Final postings, declare events |
+| Reporter | Staked in `Staking`, permissioned by governance | Submit probes, propose Tier 2 events (with bond), claim reporter rewards (`Treasury.claim_reward`, accrued from `Treasury`'s `ReporterRewards` bucket by `Staking.settle_probes`) | Decide disputes, cover a region other than the one it registered under |
 | Bond poster | Anyone | Dispute a signal posting, propose a Tier 2 event, or challenge any event, each with a bond locked in `Staking`; claim refunds and winnings | Withdraw a locked bond before its record resolves |
 | Seller | Anyone not on the related seller list | Deposit, quote, withdraw per Section 9.6, transfer the whole position to an address that holds none | Withdraw premiums before Triggered or Expired, touch other positions |
 | Buyer | Anyone; holding the asset if `require_holding` | Buy cover while the cover gate is `Clear` (Section 9.4) | Buy while an event is in progress or a trailing failure signal is present |
 | Holder | Anyone holding cover units | Transfer cover units (SEP-41), claim in Triggered | Claim outside Triggered |
-| Anyone | Any address | Permissionless triggers: `propose_tier1`, `finalize`, `resolve_timeout`, `finalize_endpoint`, `settle_probes`, `trigger`, `sync`, `claim_for` after the claim window, `deposit` into `Treasury` | Anything that needs one of the roles above |
+| Anyone | Any address | Permissionless triggers: `propose_tier1`, `finalize`, `resolve_timeout`, `resolve_signal_dispute_timeout`, `finalize_endpoint`, `settle_probes`, `withdraw_keeper_bond`, `trigger`, `sync`, `claim_for` after the claim window, `deposit` into `Treasury` | Anything that needs one of the roles above |
 | EventRegistry to RiskOracle | Contract | `set_event_band`, `clear_event_band`, `set_event_in_progress` | Anything else |
 | Series to MarketFactory | Contract, only series in `Deployed` | `reserve_cover`, `release_cover` | Anything else |
-| RiskOracle to Staking | Contract | `lock_bond`, `release_bond`, `forfeit_bond` for `SignalDispute` keys; `slash` keepers | Touch event bonds. `reward_keeper` is declared in the interface `RiskOracle` depends on (Section 12.3) but has no call site yet; see Section 24.2 |
-| EventRegistry to Staking | Contract | `lock_bond`, `release_bond`, `forfeit_bond` for `EventProposal` and `EventChallenge` keys; `slash` | Touch signal dispute bonds |
-| Staking to Treasury | Contract | `accrue_reward` against `KeeperRewards` and `ReporterRewards` | `allocate`, `spend`, any other bucket |
+| RiskOracle to Staking | Contract | `lock_bond`, `release_bond`, `forfeit_bond` for `SignalDispute` keys; `slash` keepers; `reward_keeper`, from the finality scan, once per distinct poster found among the epochs it observes newly Final on a given call (ADR-012, issue #11 fix) | Touch event bonds |
+| EventRegistry to Staking | Contract | `lock_bond`, `release_bond`, `forfeit_bond` for `EventProposal` and `EventChallenge` keys | Touch signal dispute bonds. `slash` as built checks only the oracle's auth, not the registry's (Section 24.2): `EventRegistry` is not implemented yet, so this has no real call site to test against |
+| Staking to Treasury | Contract | `deposit` into `Slashed` (the protocol's share of a forfeited bond or slash, ADR-012); `accrue_reward` against `KeeperRewards` and `ReporterRewards` | `allocate`, `spend`, any other bucket |
 
 ### 16.1 Contract to contract auth
 
 - The oracle stores the registry's address at `initialize` and checks `registry.require_auth()` in `set_event_band`, `clear_event_band` and `set_event_in_progress`; in Soroban a contract authorizes its own direct calls, so this succeeds only when the registry is the caller.
 - The factory records every series it deploys in a `Deployed(series)` set and checks membership plus `series.require_auth()` in `reserve_cover` and `release_cover`.
-- `Staking` stores the oracle and registry addresses at `initialize`. `lock_bond`, `release_bond` and `forfeit_bond` require the oracle's auth for a `SignalDispute` key and the registry's auth for `EventProposal` and `EventChallenge` keys, so neither contract can touch the other's bonds. `slash` requires the oracle, the registry or the committee (false probe evidence only); `reward_keeper` requires the oracle.
+- `Staking` stores the oracle and registry addresses at `initialize`. `lock_bond`, `release_bond` and `forfeit_bond` require the oracle's auth for a `SignalDispute` key and the registry's auth for `EventProposal` and `EventChallenge` keys, so neither contract can touch the other's bonds. `slash` is specified to require the oracle, the registry or the committee (false probe evidence only); as built it checks only the oracle's auth (Section 24.2), since Soroban's `require_auth()` traps on a mismatched caller with no non-panicking variant to fall back from, and `EventRegistry` is not implemented yet to give the registry branch a real call site to build against. `reward_keeper` requires the oracle.
 - `Treasury` stores the `Staking` address at `initialize` and checks `staking.require_auth()` in `accrue_reward`. `deposit` needs only the depositor's own auth.
 - The registry reads `MarketFactory.series_for` and `Series.terms` in `register_definition`; these are reads and need no auth.
 
@@ -1924,8 +2047,8 @@ Four services run outside the chain: the keeper computes signals, the reporter n
 | --- | --- |
 | Language | TypeScript (Node 20+), using the Stellar JS SDK for Horizon and Soroban RPC |
 | Inputs | Trade history and order books (Horizon), ledger operations for issuer accounts, ledger asset stats for supply, SAC events (Soroban RPC `getEvents`), FX reference on the asset's rate basis via adapter. Not probe results: the endpoint status is never keeper posted |
-| Schedule | Cron at each epoch close plus 60 seconds, per asset; after an outage, backfills every closed, non Final epoch still inside `window_secs` (Section 5.2) |
-| Output | `SignalSet` posted via `post_signals` with `endpoint = Unknown`; inputs bundle uploaded first, its SHA-256 placed in `inputs_hash`. Also calls `finalize_endpoint`, `settle_probes`, `finalize` and `resolve_timeout` when due, since these are permissionless |
+| Schedule | Cron at each epoch close plus 60 seconds, per asset; after an outage, backfills every closed, non Final epoch still inside `window_secs` (Section 5.2). Independently, calls `Staking.settle_probes(asset, epoch)` and `RiskOracle.check_stale(asset)` for every registered asset, every epoch, as their own scheduled step, not only as a side effect of posting: `finalize_endpoint` already calls `settle_probes` internally, but a service should not rely on `finalize_endpoint` happening for every asset every epoch to guarantee `settle_probes` ran, since an epoch that never gets `settle_probes` called inside its window simply never settles (Section 7.5) |
+| Output | `SignalSet` posted via `post_signals` with `endpoint = Unknown`; inputs bundle uploaded first, its SHA-256 placed in `inputs_hash`. Also calls `finalize_endpoint`, `settle_probes`, `check_stale`, `finalize` and `resolve_timeout` when due, since these are permissionless |
 | Determinism | Recomputation tool (`sylox-recompute`) takes a bundle and must output byte identical `SignalSet`; the keeper uses the same library |
 | Keys | Keeper signing key in an HSM or KMS; fee account separate from bond account |
 | Failure | Retries within the epoch; alerts after 2 missed epochs |
@@ -2082,12 +2205,13 @@ Read the band at borrow time inside your own contract; do not cache it across le
 
 ### 20.5 Reporters
 
-1. Get added by governance (provide organization, region, contact).
+1. Get added by governance (provide organization, region, contact); the region you provide is fixed by `add_reporter` and used for every probe you ever submit, regardless of what your probe's own `region` field says (ADR-011, Section 7.3).
 2. Stake `reporter_stake` USDC via `Staking.stake`.
-3. Run the reporter node with your key in KMS, region label set honestly.
+3. Run the reporter node with your key in KMS.
 4. Watch your fault count via `Staking.reporter(addr)`; investigate any disagreement with the majority.
-5. Claim rewards from `Treasury.claim_reward`, and bond refunds or winnings from `Staking.claim`.
+5. Claim probe rewards from `Treasury.claim_reward`, accrued by `Staking.settle_probes` (Section 7.5), and bond refunds or winnings from `Staking.claim`.
 6. File Tier 2 claims only with complete evidence bundles (probes, stuck SEP-24 transactions, anchor statements where available, Section 8.3); a lost challenge costs your bond.
+7. If you are removed, your stake stays locked and slashable for `reporter_exit_delay_secs` after removal, not released immediately; your own voluntary `unstake_request` is held to the same floor (ADR-011).
 
 ### 20.6 Anchors
 
@@ -2118,9 +2242,16 @@ The protocol's safety is stated as invariants that must hold after every transac
 | I11 | Series terms, including pinned definition versions, never change after `open_series` | Series |
 | I12 | A posted epoch's signals are immutable once Final, except by a resolved dispute and the one time write of `endpoint` from the `Staking` aggregate | RiskOracle |
 | I13 | Every live series pins the current canonical definition version of each kind it covers | EventRegistry, MarketFactory |
-| I14 | USDC balance of `Staking` ≥ sum of keeper bonds, reporter stakes, locked bonds and claimable balances | Staking, always |
-| I15 | USDC balance of `Treasury` ≥ sum of bucket balances plus accrued, unclaimed rewards | Treasury, always |
+| I14 | USDC balance of `Staking` = sum of keeper bonds, reporter stakes (including cooldown), locked bonds and claimable balances, exactly, apart from direct donations (S1, tightened from ≥ to = by ADR-012, PR #13; PR #7's original S1 also counted an unallocated local reward balance, now removed) | Staking, always |
+| I15 | USDC balance of `Treasury` ≥ sum of bucket balances plus accrued, unclaimed rewards (= T1, Section 12.7, PR #13) | Treasury, always |
+| T2 | `Treasury.accrue_reward` never accrues more than its bucket holds; it returns the amount actually accrued | Treasury, always |
+| T3 | USDC leaves `Treasury` only through `claim_reward` (to the address it was accrued to) or `spend` (governor) | Treasury, always |
+| T4 | `Treasury.allocate` moves balance between buckets without changing the total held across buckets | Treasury, always |
 | I16 | `RiskOracle` and `EventRegistry` never hold or transfer USDC | RiskOracle, EventRegistry |
+| I17 | A bond in `Staking` is Locked, Released or Forfeited, and moves at most once; `slash`, `release_bond` and `forfeit_bond` never pay out more than the amount actually deducted from the target's bond or stake (S2, S5, PR #7 review fix) | Staking, always |
+| I18 | No `Staking` function moves a participant's stake or bond to any address other than that participant, a named dispute winner, or `Treasury`, and every amount reaching `Treasury` does so through a real `deposit` call, never a local credit (S3, PR #7; ADR-012, PR #13) | Staking, always |
+| I19 | An address is registered as a keeper or a reporter in `Staking`, never both at once (S6, PR #7) | Staking, always |
+| I20 | A keeper's bond cannot be withdrawn (`unstake` or `withdraw_keeper_bond`) while `open_dispute_count > 0` (ADR-011) | Staking, always |
 
 ### 21.2 Threat to control mapping
 
@@ -2130,6 +2261,9 @@ The protocol's safety is stated as invariants that must hold after every transac
 | One wick forcing a band change | `peg_ratio_p10` instead of a window minimum | 6.1, 11.3 |
 | False keeper data | Bonded keepers, inputs hash, deterministic recompute, disputes, backfill of overturned epochs | 5.3, 5.4, I12 |
 | False reporter claims | Stake, strict majority, slashing, Tier 2 bonds, endpoint only from the aggregate | 7.4, 7.5, 8.3 |
+| Removal as an escape hatch (a keeper or reporter removed, or voluntarily unstaking, before accountability lands) | Removal deactivates immediately but never releases funds on the same call; exit delays derived from the accountability window each posting or probe needs; stake stays slashable until actually paid out; voluntary unstake cooldown floored at the same exit delay (ADR-011) | 7.3, 7.7, 12.3, I20 |
+| Settling probes on a partial, TTL-expired set | Settlement allowed only inside a window during which every probe for the epoch is guaranteed to still exist; outside it, the epoch simply never settles (no funds moved, nothing to exploit) | 7.5 |
+| Slash request exceeding the target's remaining balance | `slash` pays out only what it actually deducted (`min(requested, remaining)`), never the raw request, so a request past what exists cannot draw the difference from other participants' funds (PR #7 review fix S5) | 7.8, I14, I17 |
 | Committee capture | Separate multisig, published reasons, escalation only | 8.4, 16 |
 | Committee inaction | Ruling deadline, default outcome, `resolve_timeout` by anyone, misses recorded per committee | 8.9 |
 | Contract bug drains a pool | Isolated series, non upgradeable series, invariants, audit; funds split across `Series`, `Staking` and `Treasury` | 3.1, 3.2, 17.3, I1 to I10, I14 to I16 |
@@ -2143,7 +2277,7 @@ The protocol's safety is stated as invariants that must hold after every transac
 | Layer | Tooling | What it covers |
 | --- | --- | --- |
 | Unit | `soroban-sdk` testutils, `Env::default()`, mocked auths | Every function, every error path |
-| Property | `proptest` with random sequences of deposit, quote, buy, trigger, claim, withdraw; of lock, release, forfeit, slash and claim in `Staking`; of deposit, accrue, claim, allocate and spend in `Treasury` | I1 to I6, I10, I14, I15 after every step |
+| Property | `proptest` with random sequences of deposit, quote, buy, trigger, claim, withdraw; of stake, unstake, submit\_probe, settle\_probes, lock, release, forfeit, slash (including amounts that exceed the target's remaining balance, PR #7) and claim in `Staking`; of deposit, accrue\_reward, claim\_reward, allocate and spend in `Treasury` (PR #13) | I1 to I6, I10, I14, I15 (= T1), I17, I18, T2 to T4 after every step |
 | Fuzz | `cargo-fuzz` on premium math and signal sanity checks | Overflow, rounding direction |
 | Integration | Local quickstart network with all contracts, scripted scenarios | Full flows across contracts |
 | Scenario | Replays of historical depeg periods from public data on other stablecoins, scaled to Stellar assets | Trigger behaviour, false positives |
@@ -2272,6 +2406,7 @@ All per network settings live in `deploy/<network>.toml` (contract ids, USDC SAC
 | Alert | Condition | Severity |
 | --- | --- | --- |
 | Feed stale | The monitor calls `check_stale(asset)` for every registered asset once per epoch; alert on its `asset_stale` event or a `true` return (ADR-009) | High |
+| Settlement missed | The keeper service calls `Staking.settle_probes(asset, epoch)` for every registered asset once per epoch, inside that epoch's settlement window (Section 7.5); alert if a window closes with `settle_probes` never having succeeded for it, since that epoch then permanently never settles | High |
 | Keeper disagreement | Two keepers' computed values differ beyond tolerance | High |
 | Reporter split | No majority for an asset in an epoch | Medium |
 | Band up move | Any asset moves to Warning or Distress | Medium, notify subscribers |
@@ -2279,7 +2414,7 @@ All per network settings live in `deploy/<network>.toml` (contract ids, USDC SAC
 | Ruling deadline near | An Escalated event within 48 hours of its ruling deadline with no ruling | High, page committee |
 | Ruling timed out | Any `ruling_timed_out` | High, notify governance (committee rotation grounds) |
 | Unusual cover | Cover bought on an asset above 20% of its cap within 24 hours | Medium |
-| Invariant check | Offchain check of I1 to I3 per series, I14 for `Staking` and I15 for `Treasury` per hour fails | Critical, consider guardian pause |
+| Invariant check | Offchain check of I1 to I3 per series, I14 for `Staking`, and I15/T2 to T4 for `Treasury`, per hour fails | Critical, consider guardian pause |
 | Reward pool low | A `Treasury` reward bucket below one week of expected accruals | Medium, propose `TreasuryAllocate` |
 | TTL low | Any core entry within 30 days of expiry | Medium |
 
@@ -2287,6 +2422,7 @@ All per network settings live in `deploy/<network>.toml` (contract ids, USDC SAC
 
 - **Event proposed:** confirm signals from raw bundles; notify committee; watch for challenges; call `finalize` on time. After a challenge, track the ruling deadline from `event_escalated`; if it passes, call `resolve_timeout`.
 - **Keeper outage:** second keeper takes over automatically (any keeper may post); if all keepers are down past staleness, new cover stops by design; restore and backfill every closed, non Final epoch still inside `window_secs` (Section 5.2). Epochs older than the window stay missing and count toward `max_missing_epochs`.
+- **Settlement missed:** if `Staking.settle_probes(asset, epoch)` was never called inside that epoch's settlement window (Section 7.5), that epoch's rewards and faults are gone for good; the epoch is not recoverable, so this is a monitoring and process fix (ensure the keeper service's own `settle_probes` schedule, Section 18.1, 22.4, is actually running for every asset), not an onchain remediation.
 - **Definition change:** queue `RegisterDefinition`; stop opening series that pin the current version for that (asset, kind); `sync` live series as they expire; execute once none pins the old version (Section 8.8).
 - **Suspected manipulation:** compare DEX activity with AMM cross checks; file a challenge with evidence; guardian may pause `NewCover` on the asset.
 - **Contract bug:** guardian pauses affected scopes; existing series run to expiry; fix via governor upgrade for core contracts, new Wasm for future series.
@@ -2294,28 +2430,39 @@ All per network settings live in `deploy/<network>.toml` (contract ids, USDC SAC
 
 ## 23. Parameter reference
 
-Every tunable value in one place, with its v1 default. All defaults are starting points to revisit with testnet data; changes go through the governor (Section 17). `epoch_secs` (3,600 seconds) and `RING_SLOTS` (240) are frozen for v1, not governance parameters, so they are not in this table: either value changing would require re-encoding every asset's existing packed `Ring(asset)` entry under a new layout version, which is a migration, not a parameter change `SetParam` should be able to trigger silently (Section 5.8).
+Every tunable value in one place, with its v1 default. All defaults are starting points to revisit with testnet data; changes go through the governor (Section 17). `epoch_secs` (3,600 seconds) and `RING_SLOTS` (240) are frozen for v1, not governance parameters, so they are not in this table: either value changing would require re-encoding every asset's existing packed `Ring(asset)` entry under a new layout version, which is a migration, not a parameter change `SetParam` should be able to trigger silently (Section 5.8). Reward parameters (`keeper_reward`, `reporter_reward_per_epoch`) are set so that 10 assets posting and probing at hourly epochs stays within a sustainable operating cost; this document states no dollar figures, since the sustainable level depends on funding sources and market conditions this spec does not fix.
 
 | Parameter | Default | Unit | Used in |
 | --- | --- | --- | --- |
 | `window_secs` | 259,200 (72h) | seconds | Peg TWAP and `peg_ratio_p10` window; backfill limit for posting |
 | `signal_dispute_secs` | 7,200 (2h) | seconds | Signal dispute window |
 | `signal_dispute_bond` | 1,000 | USDC | Signal disputes |
+| `signal_dispute_ruling_secs` | 604,800 (7d) | seconds from the dispute | ADR-010: deadline for the committee to rule on a signal dispute before `resolve_signal_dispute_timeout` applies the default outcome |
 | `stale_after_epochs` | 3 | epochs | Staleness |
 | `amm_tolerance_bps` | 300 | bps | AMM cross check |
 | `keeper_bond` | 5,000 | USDC | Keepers |
 | `keeper_slash` | 1,000 | USDC | Lost disputes |
 | `keeper_max_faults` | 3 | count per 30 days | Suspension |
-| `keeper_reward` | 0.50 | USDC per accepted epoch | `Treasury` keeper reward pool |
+| `keeper_reward` | 0.05 | USDC per accepted epoch | `Staking.reward_keeper` accrues `keeper_reward * epochs` from `Treasury`'s `KeeperRewards` bucket, called from `RiskOracle`'s finality scan (ADR-012, issue #11 fix); lowered from 0.50 (v1.2) for sustainable cost at scale |
+| `keeper_exit_delay_secs` | `signal_dispute_secs + epoch_secs` (3h at defaults) | seconds, derived | ADR-011: how long after `remove_keeper` before `withdraw_keeper_bond` may pay out, so every posting's own dispute window has had time to close |
 | `band_down_epochs` | 3 | epochs | Hysteresis |
 | `d_max`, `r_max`, `c_max`, `k_max`, `s_max_bps` | 0.10, 0.10, 0.01, 20, 2,000 | ratio, ratio, ratio, count, bps | Score components |
 | Weights P, E, R, I, L, S | 3,500, 2,000, 1,500, 1,500, 1,000, 500 | bps | Score |
 | `probe_secs` | 900 | seconds | Reporters |
 | `degraded_ms` | 5,000 | ms | Probe mapping |
-| `min_reporters` | 3 | count, 2+ regions | Aggregation |
+| `probe_grace_secs` | 3,600 (1h) | seconds | Section 7.3: how long after an epoch closes a reporter may still submit a probe for it |
+| `settle_window_secs` | 86,400 (24h) | seconds | Section 7.5: how long `settle_probes`'s window stays open after `probe_grace_secs` ends; an epoch nobody settles within it never settles |
+| `probe_ttl_margin_secs` | 86,400 (1d) | seconds | Margin added on top of the settlement window's own close when extending a probe's storage TTL, so it is guaranteed to outlive the window it must be settlable within |
+| `min_reporters` | 3 | count, `min_distinct_regions`+ regions | Aggregation |
+| `min_distinct_regions` | 2 | count | Aggregation: names the existing "2 distinct regions" rule |
+| `fault_majority_threshold` | 3 | count | Section 7.5: names the existing "a majority of 3 or more" rule |
+| `max_submitters_per_epoch` | 32 | count | Cap on the per (asset, epoch) submitter index `aggregate`/`settle_probes` iterate; well above the 5 to 9 reporter target (7.6) |
 | `reporter_stake` | 1,000 | USDC | Reporters |
 | `reporter_max_faults` | 10 | count per 30 days | Slashing |
 | `reporter_slash_bps` | 1,000 | bps | Slashing |
+| `reporter_reward_per_epoch` | 0.1 | USDC per settled asset-epoch, split equally among matching reporters | `Staking.settle_probes` accrues each matching reporter's share from `Treasury`'s `ReporterRewards` bucket via `Treasury.accrue_reward` (ADR-012) |
+| `unstake_cooldown_secs` | 604,800 (7d) | seconds | A keeper or reporter's own voluntary `unstake_request`; must be `>= keeper_exit_delay_secs` and `>= reporter_exit_delay_secs` (ADR-011) so a voluntary exit can never outrun a governor removal for the same stake |
+| `reporter_exit_delay_secs` | `epoch_secs + probe_grace_secs + settle_window_secs` (26h at defaults) | seconds, derived | ADR-011: how long after `remove_reporter` before its stake leaves cooldown, so every epoch it could have probed can still settle and fault or slash it if warranted |
 | `depeg_threshold` | 0.95 | ratio | Event definition |
 | `depeg_window_secs` | 259,200 | seconds | Event definition |
 | `max_missing_epochs` | 6 (of 72) | epochs | Event definition (Depeg) |
@@ -2388,8 +2535,9 @@ Every tunable value in one place, with its v1 default. All defaults are starting
 - [ ] Cost per epoch of `post_signals` for 10 assets, and whether batching postings per transaction is needed.
 - [ ] Legal review of event definitions wording before they are registered onchain.
 - [ ] Should `AssetConfig` gain a real `l_target` field for component L, or should the spec simply say `min_liquidity` doubles as `L_target` in v1 (Section 6.1)? `RiskOracle` uses `min_liquidity` today with no separate field.
-- [ ] Does `Staking.reward_keeper` need a symmetric per-signal bond lock from the keeper (mirroring the disputer's `signal_dispute_bond`), or is slashing a keeper's general stake by address, with no per-signal bond, the intended v1 design? `RiskOracle` has no call that locks a keeper bond today; only `slash`, directly by address, touches a keeper's stake on a lost dispute.
-- [ ] Is `Staking.reward_keeper` meant to be called from `RiskOracle` at all in v1, and if so, on which transition? It is declared in the `Staking` interface `RiskOracle` depends on (Section 12.3) but no `RiskOracle` call site invokes it yet.
+- [ ] Does `Staking.reward_keeper` need a symmetric per-signal bond lock from the keeper (mirroring the disputer's `signal_dispute_bond`), or is slashing a keeper's general stake by address, with no per-signal bond, the intended v1 design? `RiskOracle` has no call that locks a keeper bond today; only `slash`, directly by address, touches a keeper's stake on a lost dispute. Unaffected by `reward_keeper` now having a real call site (ADR-012, issue #11 fix, `feat/treasury` PR #13): that fix is about when and how much to reward, not about adding any new bond lock, so this question remains exactly as open as it was.
 - [ ] Should `signal_dispute_bond` and `keeper_slash` (Section 23) become per-asset or formula-level configurable parameters rather than contract constants, given that cover value likely scales with cover cap per asset?
 - [ ] `add_asset` does not yet validate that a `Fiat` reference's `fx_adapter` is actually set, or that `amm_adapters` entries are well formed; is this validation meant to live in `add_asset` itself, or in a separate governance review step before an asset goes live?
 - [ ] `peg_ratio_p10 <= peg_ratio` is enforced as a sanity bound on posted signals (Section 11.3) while this document's general statement elsewhere says a 10th percentile can sit above a volume weighted mean. Since `RiskOracle` now computes its own `peg_ratio_p10` onchain for scoring and treats the keeper posted field as audit only, should the posted field's bound be relaxed to match the general statement, or should the general statement be narrowed to describe only the onchain computation?
+- [ ] `Staking.slash`'s auth checks only `RiskOracle` in the built contract (Section 12.3), not `RiskOracle` or `EventRegistry` as Section 7.8/12.3 specify: Soroban's `Address::require_auth()` traps on a mismatched caller with no non-panicking variant and no portable "who actually invoked this call" read, so there is no way to try one candidate's auth, catch a failure, and fall back to the next. `EventRegistry` is not built yet, so this has no real call site to test against today. When `EventRegistry` is built, how should `Staking.slash` distinguish its two legitimate callers: a `kind` argument (the `BondKey` variant pattern `lock_bond`/`release_bond`/`forfeit_bond` already use), or two separate functions?
+- [ ] `RiskOracle.resolve_signal_dispute_timeout` (ADR-010) writes `CommitteeMisses(committee)` but exposes no public read for it, unlike `EventRegistry.committee_misses` (Section 12.2). Should `RiskOracle` gain a matching `committee_misses(committee) -> u32` read, and should the two contracts' miss counters for the same committee address ever be combined into one figure for a governance dashboard, or deliberately kept separate per contract?

@@ -39,6 +39,36 @@ const EPOCH_SECS: u64 = 3_600;
 /// `signal_dispute_secs`.
 const SIGNAL_DISPUTE_SECS: u64 = 7_200;
 
+/// ADR-010 amendment (feat/event-registry PR #15 review, finding F1):
+/// how long the committee has to rule on an open signal dispute, from
+/// `dispute_signals`, before `resolve_signal_dispute_timeout` becomes
+/// callable. Was 7 days, matching ADR-002's `ruling_deadline_secs`
+/// precedent for event disputes; lowered to 6 days because the full
+/// worst-case timeline (`WINDOW_SECS + SIGNAL_DISPUTE_SECS +
+/// SIGNAL_DISPUTE_RULING_SECS`, a late post disputed right before
+/// `pending_until` and never ruled on) must fit inside the ring's own
+/// capacity (`RING_SLOTS * EPOCH_SECS`, 240h) with room for the epoch
+/// that triggers the overwrite to itself close — see the const
+/// assertion below. At 7 days the worst case was 242h, already past
+/// the 240h ring: a keeper's own still-open dispute could be silently
+/// overwritten by the ring wrapping around before anyone ruled.
+const SIGNAL_DISPUTE_RULING_SECS: u64 = 518_400;
+
+/// ADR-010 amendment (finding F1): the worst-case dispute timeline —
+/// posted at the last legal instant, disputed immediately, never
+/// ruled on — must resolve (time out) before the ring wraps around
+/// and `write_ring_slot` overwrites the still-open dispute. `+
+/// EPOCH_SECS` covers the one additional epoch that closes, and so
+/// becomes postable, in the time it takes `resolve_signal_dispute_timeout`
+/// to actually run at the deadline instant. Any future change to
+/// `WINDOW_SECS`, `SIGNAL_DISPUTE_SECS`, `SIGNAL_DISPUTE_RULING_SECS`,
+/// `EPOCH_SECS` or `storage::RING_SLOTS` that breaks this fails the
+/// build rather than silently reintroducing the bug.
+const _: () = assert!(
+    WINDOW_SECS + SIGNAL_DISPUTE_SECS + SIGNAL_DISPUTE_RULING_SECS + EPOCH_SECS
+        <= storage::RING_SLOTS as u64 * EPOCH_SECS
+);
+
 /// technical-doc.md Section 23 `stale_after_epochs` default.
 const STALE_AFTER_EPOCHS: u64 = 3;
 
@@ -213,7 +243,9 @@ impl RiskOracle {
         // backfill window for any OLDER epoch that has quietly
         // crossed finality since the last state changing call touched
         // it ("on backfill" in review item C1's wording).
-        if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+        if let Some(newest_final) =
+            try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
+        {
             recompute_score(&env, &asset, newest_final)?;
         }
         check_stale_internal(&env, &asset)?;
@@ -250,12 +282,15 @@ impl RiskOracle {
         if storage::get_dispute(&env, &asset, epoch).is_some() {
             return Err(Error::DisputeWindowClosed);
         }
+        let signals = storage::get_signals(&env, &asset, epoch).ok_or(Error::WrongEpoch)?;
 
         let bond = signal_dispute_bond();
+        let now = env.ledger().timestamp();
         StakingClient::new(&env, &config.staking).lock_bond(
             &sylox_types::BondKey::SignalDispute(asset.clone(), epoch),
             &disputer,
             &bond,
+            &Some(signals.poster.clone()),
         );
         storage::set_dispute(
             &env,
@@ -264,6 +299,7 @@ impl RiskOracle {
             &DisputeRecord {
                 disputer: disputer.clone(),
                 alt_hash: alt_hash.clone(),
+                opened_at: now,
             },
         );
         storage::set_slot_disputed(&env, &asset, epoch);
@@ -320,7 +356,9 @@ impl RiskOracle {
                 }
                 .publish(&env);
             }
-            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+            if let Some(newest_final) =
+                try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
+            {
                 recompute_score(&env, &asset, newest_final)?;
             }
         } else {
@@ -344,7 +382,9 @@ impl RiskOracle {
             // epoch, now Empty, without stopping), but a resolution
             // can still be the event that unblocks something later
             // that was waiting on this one, so sweep here too.
-            if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+            if let Some(newest_final) =
+                try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
+            {
                 recompute_score(&env, &asset, newest_final)?;
             }
         }
@@ -355,6 +395,67 @@ impl RiskOracle {
             epoch,
             keeper_wins,
             reason,
+        }
+        .publish(&env);
+        check_stale_internal(&env, &asset)?;
+        Ok(())
+    }
+
+    /// ADR-010 (issue #4 fix). Permissionless, callable once
+    /// `SIGNAL_DISPUTE_RULING_SECS` has passed since `dispute_signals`
+    /// opened this dispute, if the committee still has not ruled via
+    /// `resolve_signal_dispute`. Default outcome mirrors ADR-002's
+    /// rule for data backed claims: the keeper's posting stands (slot
+    /// `Final`, same as a `keeper_wins: true` committee ruling). "Both
+    /// bonds released in full, nobody slashed" (the task's own
+    /// wording): there is only one actual `BondKey::SignalDispute`
+    /// lock to release, the disputer's (technical-doc.md Section 24.2
+    /// notes a keeper has no symmetric per-signal bond in v1; only
+    /// `slash`, by address, ever touches a keeper's stake), so in
+    /// practice this means the disputer's bond is refunded
+    /// (`release_bond`, not `forfeit_bond`) AND the keeper's stake is
+    /// left untouched (no `slash` call either) — both parties come
+    /// out exactly as they would from a `keeper_wins: true` ruling,
+    /// which is the committee's silence being read as "no evidence
+    /// the posting was wrong", not as a loss for either side.
+    pub fn resolve_signal_dispute_timeout(
+        env: Env,
+        asset: Address,
+        epoch: u64,
+    ) -> Result<(), Error> {
+        let config = Self::require_config(&env)?;
+        let dispute =
+            storage::get_dispute(&env, &asset, epoch).ok_or(Error::DisputeWindowClosed)?;
+        let now = env.ledger().timestamp();
+        if now < dispute.opened_at + SIGNAL_DISPUTE_RULING_SECS {
+            return Err(Error::RulingDeadlineNotReached);
+        }
+
+        let staking = StakingClient::new(&env, &config.staking);
+        let bond_key = sylox_types::BondKey::SignalDispute(asset.clone(), epoch);
+        staking.release_bond(&bond_key);
+        if storage::set_slot_final(&env, &asset, epoch) {
+            events::SignalsFinal {
+                asset: asset.clone(),
+                epoch,
+            }
+            .publish(&env);
+        }
+        if let Some(newest_final) =
+            try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
+        {
+            recompute_score(&env, &asset, newest_final)?;
+        }
+        storage::clear_dispute(&env, &asset, epoch);
+
+        let committee = GovernorClient::new(&env, &config.governor).committee();
+        storage::record_committee_miss(&env, &committee);
+
+        events::SignalDisputeTimedOut {
+            asset: asset.clone(),
+            epoch,
+            disputer: dispute.disputer,
+            committee,
         }
         .publish(&env);
         check_stale_internal(&env, &asset)?;
@@ -398,7 +499,9 @@ impl RiskOracle {
         // have closed, Section 7.4), so it is also where review item C1
         // and C5's lazy finality sweep gets a chance to run even if no
         // new SignalSet is ever posted for a later epoch on this asset.
-        if let Some(newest_final) = try_advance_finality(&env, &asset, FINALITY_LOOKBACK_EPOCHS) {
+        if let Some(newest_final) =
+            try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
+        {
             recompute_score(&env, &asset, newest_final)?;
         }
         check_stale_internal(&env, &asset)?;
@@ -453,6 +556,32 @@ impl RiskOracle {
         // floor on every read (see its doc comment), so the change is
         // visible immediately with no write to the stored RiskScore.
         Ok(())
+    }
+
+    /// technical-doc.md Section 12.1 (feat/event-registry design note,
+    /// review item D6): read-only, no auth. Lets `EventRegistry` assert
+    /// invariant E4 (its own active-event count agrees with this flag)
+    /// directly, rather than inferring the flag only through its one
+    /// visible effect on `band()`'s own Distress floor.
+    pub fn event_in_progress(env: Env, asset: Address) -> bool {
+        storage::get_event_in_progress(&env, &asset)
+    }
+
+    /// PR #15 review, finding F4: read-only, no auth. Wraps the
+    /// existing `storage::get_newest_epoch_pub`, which reads the
+    /// dedicated `RingNewest` key directly rather than the newest
+    /// ring POSITION's own stored epoch. The two disagree exactly
+    /// when the newest position is `Empty` (its epoch was overturned
+    /// and not yet reposted): the position's slot reports epoch `0`
+    /// (`empty_slot()`'s default), while `RingNewest` still correctly
+    /// reports the real newest epoch ever written. `EventRegistry`
+    /// needs the latter for its own `slot_for_epoch` arithmetic
+    /// (`ring()`'s layout is "oldest first, ending at RingNewest");
+    /// reading the former made every subsequent `slot_for_epoch` call
+    /// miss, misclassifying every cure-window epoch as permanently
+    /// missing.
+    pub fn newest_epoch(env: Env, asset: Address) -> Option<u64> {
+        storage::get_newest_epoch_pub(&env, &asset)
     }
 
     /// technical-doc.md Section 12.1, 6.2. `set_formula` rejects any
@@ -902,13 +1031,34 @@ fn check_amm_cross_check(env: &Env, cfg: &AssetConfig, s: &SignalSet) -> Result<
 /// bound without depending on the module-level constant.
 ///
 /// Returns the newest epoch now known Final, if any.
-fn try_advance_finality(env: &Env, asset: &Address, max_lookback: u32) -> Option<u64> {
+fn try_advance_finality(
+    env: &Env,
+    config: &Config,
+    asset: &Address,
+    max_lookback: u32,
+) -> Option<u64> {
     let now = env.ledger().timestamp();
     let Some(newest_posted) = storage::get_newest_epoch_pub(env, asset) else {
         return storage::get_newest_final(env, asset);
     };
     let (newest_final, newly_announced) =
         storage::advance_finality(env, asset, now, newest_posted, max_lookback);
+
+    // Issue #11 fix (feat/treasury): reward the posting keeper of
+    // every epoch newly observed Final here, the same place
+    // `signals_final` is emitted. Grouped by poster so a single
+    // reward_keeper call covers every epoch this one scan found for
+    // that keeper, never one call per epoch. An epoch already
+    // announced Final before this call (not in `newly_announced`)
+    // never rewards again: `newly_announced` is, by construction
+    // (`storage::advance_finality`'s own `final_announced` flag
+    // check), exactly the set of epochs crossing into Final for the
+    // first time on this call. An overturned epoch never reaches
+    // Final at all (its slot state is `Overturned`, not `Final`), so
+    // it can never appear in `newly_announced` and is never rewarded.
+    if !newly_announced.is_empty() {
+        reward_posters_for_newly_final_epochs(env, config, asset, &newly_announced);
+    }
 
     for epoch in newly_announced.iter() {
         events::SignalsFinal {
@@ -937,6 +1087,39 @@ fn try_advance_finality(env: &Env, asset: &Address, max_lookback: u32) -> Option
         }
     }
     advanced
+}
+
+/// Issue #11 fix (feat/treasury): groups `newly_announced` by the
+/// epoch's own poster (read from `Signals(asset, epoch)`, the only
+/// place that field lives; `RingSlot` itself carries no poster) and
+/// calls `Staking.reward_keeper(poster, count)` exactly once per
+/// distinct poster, with `count` the number of newly Final epochs
+/// that poster posted in this one scan. `Map` is small and bounded
+/// by `max_lookback` (at most `RING_SLOTS`), the same bound every
+/// other part of the finality scan already carries, so this never
+/// grows unbounded. A missing `Signals` entry (should not happen for
+/// a genuinely Final epoch, since only a resolved, overturned
+/// dispute ever removes one, and an overturned epoch's slot is never
+/// Final) is skipped rather than panicking, since this reward step
+/// must never be the reason a finality scan itself fails.
+fn reward_posters_for_newly_final_epochs(
+    env: &Env,
+    config: &Config,
+    asset: &Address,
+    newly_announced: &Vec<u64>,
+) {
+    let mut counts: Map<Address, u32> = Map::new(env);
+    for epoch in newly_announced.iter() {
+        let Some(signals) = storage::get_signals(env, asset, epoch) else {
+            continue;
+        };
+        let count = counts.get(signals.poster.clone()).unwrap_or(0);
+        counts.set(signals.poster, count + 1);
+    }
+    let staking = StakingClient::new(env, &config.staking);
+    for (poster, count) in counts.iter() {
+        staking.reward_keeper(&poster, &count);
+    }
 }
 
 /// Review item C1: the one place a `RiskScore` is actually computed and
