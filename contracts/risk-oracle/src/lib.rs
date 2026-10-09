@@ -39,14 +39,35 @@ const EPOCH_SECS: u64 = 3_600;
 /// `signal_dispute_secs`.
 const SIGNAL_DISPUTE_SECS: u64 = 7_200;
 
-/// ADR-010 (feat/staking, issue #4 fix): how long the committee has to
-/// rule on an open signal dispute, from `dispute_signals`, before
-/// `resolve_signal_dispute_timeout` becomes callable. Default 7 days,
-/// matching ADR-002's `ruling_deadline_secs` precedent for event
-/// disputes, though shorter: a signal dispute's underlying question
-/// (what did the endpoint report) is far narrower than an event
-/// definition's.
-const SIGNAL_DISPUTE_RULING_SECS: u64 = 604_800;
+/// ADR-010 amendment (feat/event-registry PR #15 review, finding F1):
+/// how long the committee has to rule on an open signal dispute, from
+/// `dispute_signals`, before `resolve_signal_dispute_timeout` becomes
+/// callable. Was 7 days, matching ADR-002's `ruling_deadline_secs`
+/// precedent for event disputes; lowered to 6 days because the full
+/// worst-case timeline (`WINDOW_SECS + SIGNAL_DISPUTE_SECS +
+/// SIGNAL_DISPUTE_RULING_SECS`, a late post disputed right before
+/// `pending_until` and never ruled on) must fit inside the ring's own
+/// capacity (`RING_SLOTS * EPOCH_SECS`, 240h) with room for the epoch
+/// that triggers the overwrite to itself close — see the const
+/// assertion below. At 7 days the worst case was 242h, already past
+/// the 240h ring: a keeper's own still-open dispute could be silently
+/// overwritten by the ring wrapping around before anyone ruled.
+const SIGNAL_DISPUTE_RULING_SECS: u64 = 518_400;
+
+/// ADR-010 amendment (finding F1): the worst-case dispute timeline —
+/// posted at the last legal instant, disputed immediately, never
+/// ruled on — must resolve (time out) before the ring wraps around
+/// and `write_ring_slot` overwrites the still-open dispute. `+
+/// EPOCH_SECS` covers the one additional epoch that closes, and so
+/// becomes postable, in the time it takes `resolve_signal_dispute_timeout`
+/// to actually run at the deadline instant. Any future change to
+/// `WINDOW_SECS`, `SIGNAL_DISPUTE_SECS`, `SIGNAL_DISPUTE_RULING_SECS`,
+/// `EPOCH_SECS` or `storage::RING_SLOTS` that breaks this fails the
+/// build rather than silently reintroducing the bug.
+const _: () = assert!(
+    WINDOW_SECS + SIGNAL_DISPUTE_SECS + SIGNAL_DISPUTE_RULING_SECS + EPOCH_SECS
+        <= storage::RING_SLOTS as u64 * EPOCH_SECS
+);
 
 /// technical-doc.md Section 23 `stale_after_epochs` default.
 const STALE_AFTER_EPOCHS: u64 = 3;
@@ -535,6 +556,32 @@ impl RiskOracle {
         // floor on every read (see its doc comment), so the change is
         // visible immediately with no write to the stored RiskScore.
         Ok(())
+    }
+
+    /// technical-doc.md Section 12.1 (feat/event-registry design note,
+    /// review item D6): read-only, no auth. Lets `EventRegistry` assert
+    /// invariant E4 (its own active-event count agrees with this flag)
+    /// directly, rather than inferring the flag only through its one
+    /// visible effect on `band()`'s own Distress floor.
+    pub fn event_in_progress(env: Env, asset: Address) -> bool {
+        storage::get_event_in_progress(&env, &asset)
+    }
+
+    /// PR #15 review, finding F4: read-only, no auth. Wraps the
+    /// existing `storage::get_newest_epoch_pub`, which reads the
+    /// dedicated `RingNewest` key directly rather than the newest
+    /// ring POSITION's own stored epoch. The two disagree exactly
+    /// when the newest position is `Empty` (its epoch was overturned
+    /// and not yet reposted): the position's slot reports epoch `0`
+    /// (`empty_slot()`'s default), while `RingNewest` still correctly
+    /// reports the real newest epoch ever written. `EventRegistry`
+    /// needs the latter for its own `slot_for_epoch` arithmetic
+    /// (`ring()`'s layout is "oldest first, ending at RingNewest");
+    /// reading the former made every subsequent `slot_for_epoch` call
+    /// miss, misclassifying every cure-window epoch as permanently
+    /// missing.
+    pub fn newest_epoch(env: Env, asset: Address) -> Option<u64> {
+        storage::get_newest_epoch_pub(&env, &asset)
     }
 
     /// technical-doc.md Section 12.1, 6.2. `set_formula` rejects any

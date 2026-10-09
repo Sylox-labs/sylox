@@ -45,6 +45,7 @@ fn definition(env: &Env, kind: EventKind, version: u32) -> EventDefinition {
         max_missing_epochs: 6,
         cure_threshold: 9_800_000,
         freeze_pct_bps: 0,
+        auth_revocation_threshold: 0,
         mint_spike_bps: 0,
         halt_window_secs: 0,
         challenge_secs: 86_400,

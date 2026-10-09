@@ -1,19 +1,1211 @@
 #![no_std]
 
-//! EventRegistry: event definitions, Tier 1 proposals, Tier 2 claims and
-//! disputes, Tier 3 rulings, final event status. technical-doc.md Section 8.
+//! EventRegistry: event definitions, Tier 1 proposals, challenges, the
+//! committee ruling deadline, final event status. technical-doc.md
+//! Section 8 (all), 12.2, 13, 14, 15, 21; ADR-001, 002, 003, 005, 006,
+//! 007, 008, 012. Design: `docs/design/event-registry.md`.
+//!
+//! Scope of this build (feat/event-registry): `register_definition`,
+//! `propose_tier1` for Depeg and IssuerFreeze, `challenge`, `finalize`
+//! (including Depeg cure), `rule`, `resolve_timeout`, every Section
+//! 12.2 read, the `RiskOracle` push calls, bonds via `Staking`.
+//! `propose_tier2` (WithdrawalHalt), `propose_tier3` (Insolvency) and
+//! MintWithoutBacking are each a known-gap issue, not stubbed here.
+//!
+//! **Lead decision (design note Section 2): `propose_tier1` takes an
+//! explicit `version`.** Deviates from Section 8.1/8.2/8.8 and ADR-001,
+//! which take only (asset, kind) and always the canonical version. A
+//! series pins the version canonical when it opened; a newer version
+//! can supersede that one while the series is still live, and a real
+//! failure discovered after that point must still be provable against
+//! the OLDER, still-pinned version. Corrected by design review item D3:
+//! `version` is accepted only if it is canonical, or `version_has_live_cover`
+//! reports a live series still pins it (always `false` in this build,
+//! `MarketFactory` is out of scope: every proposal in this build is
+//! canonical-only, in practice).
+//!
+//! **Lead decision (design note Section 6): `ActiveCount(asset)`
+//! replaces a single boolean push to `RiskOracle.set_event_in_progress`.**
+//! Several (kind, version) events can be live for one asset at once;
+//! a boolean cannot represent that correctly. Design review item D3b:
+//! asset-wide effects (this count, the oracle push, `set_event_band`)
+//! fire only for a CANONICAL-version event.
+//!
+//! **No compliance-action exclusion mechanism (design review item D5).**
+//! An earlier draft of the design note invented one; it was an
+//! unbonded, unilateral governor veto over an IssuerFreeze payout and
+//! is dropped. Section 8.2's own requirement ("no governance flag
+//! marks the issuer's action as a declared compliance action") is
+//! satisfied by the existing `challenge`/`rule`/`resolve_timeout` path:
+//! anyone who believes a counted action was a legitimate compliance
+//! action challenges the proposal with evidence, and the committee
+//! rules.
+//!
+//! **No time-based cooldown after Cured/Rejected (design review item
+//! D4).** `propose_tier1` instead accepts a new proposal for the same
+//! (asset, kind, version) once its own freshly computed `window_start`
+//! is strictly after the prior event's own `left_at` (the
+//! `storage::get_left_at`/`LeftAt` check inside `propose_tier1`
+//! below); see the design note's own Section 2a for the argument
+//! this still rejects re-proposing unchanged data.
+//!
+//! **Cure is strict (design review item R1).** Any permanently missing
+//! epoch anywhere in the cure window means no cure at all, routing to
+//! Declared unconditionally; there is no partial credit for a window
+//! a keeper (who may also have sold cover on the series) can
+//! selectively leave incomplete. "Permanently missing" tests the
+//! slot's own state (`Empty`, review item R2), never elapsed time
+//! alone; a `Disputed` epoch is "not ready" until resolved or timed
+//! out (review item R3), which `guaranteed_finalizable_at`'s own
+//! worst-case formula accounts for (see `finalize` and its tests).
 
-use soroban_sdk::{contract, contractimpl, Address, Env};
+mod clients;
+mod error;
+mod events;
+mod storage;
+
+use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Vec};
+use sylox_types::{
+    AssetEventStatus, BondKey, CoverGate, EventDefinition, EventKind, EventRecord, EventState,
+    IssuerFlags, SlotState,
+};
+
+pub use error::Error;
+use storage::Config;
+
+use clients::{GovernorClient, RiskOracleClient, StakingClient};
+
+/// Epoch length. Frozen for v1 (technical-doc.md Section 23); mirrors
+/// `RiskOracle`'s own private `EPOCH_SECS`, which `EventRegistry`
+/// cannot reach directly (separate contract crate), the same
+/// duplication `Staking::params::EPOCH_SECS` already carries.
+const EPOCH_SECS: u64 = 3_600;
+
+/// Backfill window: how long after an epoch's own close a keeper may
+/// still post it (ADR-005). Mirrors `RiskOracle`'s own private
+/// `WINDOW_SECS`.
+const WINDOW_SECS: u64 = 259_200;
+
+/// `RiskOracle`'s own ring buffer size (Section 5.8), frozen for v1.
+/// `EventRegistry` never needs this as a standalone constant in
+/// production logic (every scan is bounded by the `Vec` `ring()`
+/// actually returns, whose `.len()` always equals this), but
+/// `register_definition`'s own "window plus baseline fits the ring"
+/// check needs a number to check against before any asset has ever
+/// posted (so no real `ring()` call to measure against exists yet).
+const RING_SLOTS: u32 = 240;
+
+/// IssuerFreeze's own fixed 7 day window (Section 8.2), and the Depeg
+/// liquidity baseline immediately before its own window (ADR-005):
+/// the same 168 epoch span, used for two different purposes.
+const BASELINE_EPOCHS: u64 = 7 * 24;
+
+/// PR #15 review, finding F3: the largest number of cure-window
+/// epochs (`challenge_secs / EPOCH_SECS`) `validate_definition_params`
+/// will accept, 72 hours' worth. Keeps `storage::CureProgress`'s own
+/// `recorded: u128` bitmap comfortably sized for every definition
+/// this build can register, with headroom to spare.
+const MAX_CURE_EPOCHS: u64 = 72;
+
+// `SIGNAL_DISPUTE_SECS` and `SIGNAL_DISPUTE_RULING_SECS` (ADR-010)
+// are not needed by this contract's own production logic (it only
+// ever classifies each cure-window epoch's CURRENT state, never
+// predicts when every epoch will settle); the test modules that
+// verify `guaranteed_finalizable_at`'s own worst-case formula
+// (design review item R3) each define their own local copies.
 
 #[contract]
 pub struct EventRegistry;
 
 #[contractimpl]
 impl EventRegistry {
-    pub fn initialize(_env: Env, _governor: Address, _oracle: Address, _usdc: Address) {
-        todo!("Section 12.2: initialize")
+    pub fn initialize(
+        env: Env,
+        governor: Address,
+        oracle: Address,
+        staking: Address,
+        factory: Address,
+        usdc: Address,
+    ) -> Result<(), Error> {
+        if storage::get_config(&env).is_some() {
+            return Err(Error::AlreadyInitialized);
+        }
+        storage::set_config(
+            &env,
+            &Config {
+                governor,
+                oracle,
+                staking,
+                factory,
+                usdc,
+            },
+        );
+        Ok(())
+    }
+
+    /// technical-doc.md Section 8.8. `def.version` is ignored on input
+    /// (the caller cannot pick a version number); the stored version is
+    /// always the previous canonical version plus one, starting at 1.
+    pub fn register_definition(env: Env, def: EventDefinition) -> Result<u32, Error> {
+        let config = Self::require_config(&env)?;
+        config.governor.require_auth();
+
+        let asset_config = RiskOracleClient::new(&env, &config.oracle)
+            .asset_config(&def.asset)
+            .ok_or(Error::InvalidDefinition)?;
+        if def.reference != asset_config.reference {
+            return Err(Error::InvalidDefinition);
+        }
+        validate_definition_params(&def)?;
+        if def.kind == EventKind::IssuerFreeze
+            && !issuer_freeze_possible(&asset_config.issuer_flags)
+        {
+            return Err(Error::FreezeImpossible);
+        }
+
+        let previous_version = storage::get_canonical(&env, &def.asset, def.kind);
+        let version = previous_version + 1;
+
+        // An event for (asset, kind) in progress blocks a new version
+        // (Section 8.8): the canonical definition cannot shift under a
+        // proposal that is still being decided.
+        if matches!(
+            storage::get_status(&env, &def.asset, def.kind),
+            AssetEventStatus::InProgress(_)
+        ) {
+            return Err(Error::EventInProgress);
+        }
+
+        // `DefinitionInUse`: a live series still pinning `previous_version`
+        // blocks registering a new one over it (Section 8.8). Wired
+        // through the same shared `version_has_live_cover` stand-in
+        // `propose_tier1` uses (design note Section 2); it always
+        // returns `false` in this build (no `MarketFactory` exists to
+        // report a live series at all), so this check is unreachable
+        // for now, but genuinely enforces the rule the moment
+        // `version_has_live_cover` has something real to report,
+        // with no further change needed here.
+        if previous_version > 0
+            && Self::version_has_live_cover(&env, &config, &def.asset, def.kind, previous_version)
+        {
+            return Err(Error::DefinitionInUse);
+        }
+
+        let mut stored = def.clone();
+        stored.version = version;
+        storage::set_def(&env, &stored);
+        storage::set_canonical(&env, &def.asset, def.kind, version);
+
+        events::DefinitionRegistered {
+            asset: def.asset,
+            kind: def.kind,
+            version,
+            previous_version,
+        }
+        .publish(&env);
+
+        Ok(version)
+    }
+
+    /// technical-doc.md Section 8.2, as amended by this build's lead
+    /// decision (design note Section 2) and design review item D3.
+    pub fn propose_tier1(
+        env: Env,
+        caller: Address,
+        asset: Address,
+        kind: EventKind,
+        version: u32,
+    ) -> Result<u64, Error> {
+        // PR #15 review, finding F5: nothing pays a Tier 1 proposer in
+        // this build, but `caller` is still stored as `proposer` and
+        // published in `EventProposed`, a public record an indexer
+        // will display. Without this, anyone could propose in someone
+        // else's name.
+        caller.require_auth();
+        let config = Self::require_config(&env)?;
+        let def = storage::get_def(&env, &asset, kind, version).ok_or(Error::UnknownDefinition)?;
+
+        let canonical = storage::get_canonical(&env, &asset, kind);
+        let is_canonical = version == canonical;
+        if !is_canonical && !Self::version_has_live_cover(&env, &config, &asset, kind, version) {
+            return Err(Error::VersionNotCovered);
+        }
+
+        if storage::get_live_event(&env, &asset, kind, version).is_some() {
+            return Err(Error::EventInProgress);
+        }
+
+        let now = env.ledger().timestamp();
+        let oracle = RiskOracleClient::new(&env, &config.oracle);
+        let window_start = match kind {
+            EventKind::Depeg => check_depeg(&env, &oracle, &asset, &def)?,
+            EventKind::IssuerFreeze => check_issuer_freeze(&env, &oracle, &asset, &def)?,
+            _ => return Err(Error::UnknownDefinition),
+        };
+
+        // Design review item D4: gated by new data, not a time
+        // cooldown. If a prior event for this exact (asset, kind,
+        // version) left Proposed/Escalated into Cured or Rejected,
+        // the new proposal's own freshly computed `window_start` must
+        // be strictly after that departure time.
+        if let Some(left_at) = storage::get_left_at(&env, &asset, kind, version) {
+            if window_start <= left_at {
+                return Err(Error::EventInProgress);
+            }
+        }
+
+        let id = storage::next_event_id(&env);
+        let record = EventRecord {
+            id,
+            asset: asset.clone(),
+            kind,
+            def_version: version,
+            tier: 1,
+            state: EventState::Proposed,
+            window_start,
+            proposed_at: now,
+            escalated_at: None,
+            declared_at: None,
+            evidence_hash: BytesN::from_array(&env, &[0u8; 32]),
+            proposer: caller.clone(),
+            bond: 0,
+        };
+        storage::set_event(&env, &record);
+        storage::set_live_event(&env, &asset, kind, version, id);
+        storage::clear_left_at(&env, &asset, kind, version);
+
+        if is_canonical {
+            storage::set_status(&env, &asset, kind, &AssetEventStatus::InProgress(id));
+            Self::enter_active(&env, &oracle, &asset);
+        }
+
+        events::EventProposed {
+            asset,
+            event_id: id,
+            kind,
+            def_version: version,
+            tier: 1,
+            window_start,
+            proposer: caller,
+            evidence: BytesN::from_array(&env, &[0u8; 32]),
+        }
+        .publish(&env);
+
+        Ok(id)
+    }
+
+    pub fn challenge(
+        env: Env,
+        challenger: Address,
+        event_id: u64,
+        evidence: BytesN<32>,
+    ) -> Result<(), Error> {
+        challenger.require_auth();
+        let config = Self::require_config(&env)?;
+        let mut record = storage::get_event(&env, event_id).ok_or(Error::UnknownEvent)?;
+        if record.state != EventState::Proposed {
+            return Err(Error::WrongState);
+        }
+        let def = storage::get_def(&env, &record.asset, record.kind, record.def_version)
+            .ok_or(Error::UnknownDefinition)?;
+        let now = env.ledger().timestamp();
+        if now >= record.proposed_at + def.challenge_secs {
+            return Err(Error::ChallengeWindowClosed);
+        }
+
+        let bond = challenge_bond_placeholder();
+        StakingClient::new(&env, &config.staking).lock_bond(
+            &BondKey::EventChallenge(event_id),
+            &challenger,
+            &bond,
+            &None,
+        );
+
+        record.state = EventState::Escalated;
+        record.escalated_at = Some(now);
+        storage::set_event(&env, &record);
+
+        events::EventChallenged {
+            asset: record.asset.clone(),
+            event_id,
+            challenger,
+            evidence: evidence.clone(),
+        }
+        .publish(&env);
+        events::EventEscalated {
+            asset: record.asset,
+            event_id,
+            escalated_at: now,
+            ruling_deadline: now + def.ruling_deadline_secs,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// technical-doc.md Section 8.1, as corrected by design review
+    /// items D1 (cure window), D2/R2/R3 (three-way epoch state) and R1
+    /// (cure strictness). See `docs/design/event-registry.md` Section 5.
+    pub fn finalize(env: Env, event_id: u64) -> Result<(), Error> {
+        let config = Self::require_config(&env)?;
+        let mut record = storage::get_event(&env, event_id).ok_or(Error::UnknownEvent)?;
+        if record.state != EventState::Proposed {
+            return Err(Error::WrongState);
+        }
+        let def = storage::get_def(&env, &record.asset, record.kind, record.def_version)
+            .ok_or(Error::UnknownDefinition)?;
+        let now = env.ledger().timestamp();
+        if now < record.proposed_at + def.challenge_secs {
+            return Err(Error::ChallengeWindowOpen);
+        }
+
+        let outcome = if record.kind == EventKind::Depeg {
+            cure_outcome(&env, &config, &record, &def)?
+        } else {
+            CureOutcome::Declared
+        };
+
+        match outcome {
+            CureOutcome::NotReady => Err(Error::DataNotFinal),
+            CureOutcome::Cured => {
+                record.state = EventState::Cured;
+                Self::leave_active(&env, &config, &record, now)?;
+                events::EventCured {
+                    asset: record.asset.clone(),
+                    event_id,
+                }
+                .publish(&env);
+                storage::set_event(&env, &record);
+                Ok(())
+            }
+            CureOutcome::Declared => {
+                record.state = EventState::Declared;
+                record.declared_at = Some(now);
+                Self::declare(&env, &config, &record)?;
+                storage::set_event(&env, &record);
+                Ok(())
+            }
+        }
+    }
+
+    /// PR #15 review, finding F2. Permissionless (no `require_auth`):
+    /// anyone, including the keeper service, may call this to record
+    /// a Depeg event's cure-window progress before an epoch that is
+    /// already decidable rotates out of `RiskOracle`'s own ring.
+    /// Unlike `finalize`, this never errors on "not ready" — recording
+    /// whatever is currently decidable, and keeping that record, is
+    /// itself the successful outcome; there being more to record later
+    /// is not a failure. Calling it twice in a row is a no-op the
+    /// second time (`record_cure_progress`'s own recorded-bit check).
+    pub fn checkpoint_cure(env: Env, event_id: u64) -> Result<storage::CureProgress, Error> {
+        let config = Self::require_config(&env)?;
+        let record = storage::get_event(&env, event_id).ok_or(Error::UnknownEvent)?;
+        if record.state != EventState::Proposed {
+            return Err(Error::WrongState);
+        }
+        if record.kind != EventKind::Depeg {
+            // IssuerFreeze has no cure path at all (`finalize` always
+            // decides it as `CureOutcome::Declared`); there is nothing
+            // for this function to record.
+            return Err(Error::WrongState);
+        }
+        let def = storage::get_def(&env, &record.asset, record.kind, record.def_version)
+            .ok_or(Error::UnknownDefinition)?;
+        let oracle = RiskOracleClient::new(&env, &config.oracle);
+        Ok(record_cure_progress(&env, &oracle, &record, &def))
+    }
+
+    pub fn rule(env: Env, event_id: u64, declare: bool, reason: BytesN<32>) -> Result<(), Error> {
+        let config = Self::require_config(&env)?;
+        let committee = GovernorClient::new(&env, &config.governor).committee();
+        committee.require_auth();
+
+        let mut record = storage::get_event(&env, event_id).ok_or(Error::UnknownEvent)?;
+        if record.state != EventState::Escalated {
+            return Err(Error::WrongState);
+        }
+        let def = storage::get_def(&env, &record.asset, record.kind, record.def_version)
+            .ok_or(Error::UnknownDefinition)?;
+        let now = env.ledger().timestamp();
+        let escalated_at = record.escalated_at.ok_or(Error::WrongState)?;
+        if now >= escalated_at + def.ruling_deadline_secs {
+            return Err(Error::RulingDeadlinePassed);
+        }
+
+        let staking = StakingClient::new(&env, &config.staking);
+        let key = BondKey::EventChallenge(event_id);
+        if declare {
+            staking.forfeit_bond(&key, &None);
+            record.state = EventState::Declared;
+            record.declared_at = Some(now);
+            Self::declare(&env, &config, &record)?;
+        } else {
+            staking.release_bond(&key);
+            record.state = EventState::Rejected;
+            Self::leave_active(&env, &config, &record, now)?;
+            events::EventRejected {
+                asset: record.asset.clone(),
+                event_id,
+                reason,
+            }
+            .publish(&env);
+        }
+        storage::set_event(&env, &record);
+        Ok(())
+    }
+
+    pub fn resolve_timeout(env: Env, event_id: u64) -> Result<(), Error> {
+        let config = Self::require_config(&env)?;
+        let mut record = storage::get_event(&env, event_id).ok_or(Error::UnknownEvent)?;
+        if record.state != EventState::Escalated {
+            return Err(Error::WrongState);
+        }
+        let def = storage::get_def(&env, &record.asset, record.kind, record.def_version)
+            .ok_or(Error::UnknownDefinition)?;
+        let now = env.ledger().timestamp();
+        let escalated_at = record.escalated_at.ok_or(Error::WrongState)?;
+        if now < escalated_at + def.ruling_deadline_secs {
+            return Err(Error::RulingDeadlineNotReached);
+        }
+
+        // ADR-002: on timeout every bond is refunded, unconditionally,
+        // regardless of the default outcome.
+        StakingClient::new(&env, &config.staking).release_bond(&BondKey::EventChallenge(event_id));
+
+        let committee = GovernorClient::new(&env, &config.governor).committee();
+        let misses_after = storage::increment_committee_misses(&env, &committee);
+
+        // Tier 1 default: Declared (Section 8.9).
+        let declared = true;
+        record.state = EventState::Declared;
+        record.declared_at = Some(now);
+        Self::declare(&env, &config, &record)?;
+        storage::set_event(&env, &record);
+
+        events::RulingTimedOut {
+            asset: record.asset,
+            event_id,
+            outcome_declared: declared,
+            committee,
+            misses_after,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    // -- reads --
+
+    pub fn definition(
+        env: Env,
+        asset: Address,
+        kind: EventKind,
+        version: u32,
+    ) -> Option<EventDefinition> {
+        storage::get_def(&env, &asset, kind, version)
+    }
+
+    pub fn current_version(env: Env, asset: Address, kind: EventKind) -> u32 {
+        storage::get_canonical(&env, &asset, kind)
+    }
+
+    pub fn event(env: Env, event_id: u64) -> Option<EventRecord> {
+        storage::get_event(&env, event_id)
+    }
+
+    pub fn event_status(env: Env, asset: Address, kind: EventKind) -> AssetEventStatus {
+        storage::get_status(&env, &asset, kind)
+    }
+
+    pub fn in_progress(env: Env, asset: Address) -> bool {
+        storage::get_active_count(&env, &asset) > 0
+    }
+
+    pub fn has_declared(env: Env, asset: Address) -> bool {
+        for kind in ALL_KINDS {
+            if matches!(
+                storage::get_status(&env, &asset, kind),
+                AssetEventStatus::Declared(..)
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// technical-doc.md Section 9.4 step 2, ADR-003. First-match order.
+    /// Thresholds and windows come from the asset's own canonical
+    /// Depeg definition where one is registered; the Section 23
+    /// default applies otherwise (matching Section 9.4's own stated
+    /// fallback rule verbatim). WithdrawalHalt is out of scope for
+    /// this build (no canonical definition of that kind can exist
+    /// yet), so its own window always uses the Section 23 default.
+    pub fn cover_gate(env: Env, asset: Address) -> Result<CoverGate, Error> {
+        let config = Self::require_config(&env)?;
+        if storage::get_active_count(&env, &asset) > 0 {
+            return Ok(CoverGate::EventInProgress);
+        }
+
+        let oracle = RiskOracleClient::new(&env, &config.oracle);
+        let ring = oracle.ring(&asset);
+        let newest_epoch = match oracle.newest_epoch(&asset) {
+            Some(e) => e,
+            None => return Ok(CoverGate::Clear),
+        };
+
+        let depeg_canonical = storage::get_canonical(&env, &asset, EventKind::Depeg);
+        let (depeg_window_secs, depeg_threshold) =
+            match storage::get_def(&env, &asset, EventKind::Depeg, depeg_canonical) {
+                Some(def) => (def.depeg_window_secs, def.depeg_threshold),
+                None => (DEFAULT_DEPEG_WINDOW_SECS, DEFAULT_DEPEG_THRESHOLD),
+            };
+        let halt_window_secs = DEFAULT_HALT_WINDOW_SECS;
+
+        let depeg_epochs = (depeg_window_secs / EPOCH_SECS) as u32;
+        if any_epoch_below_threshold(&ring, newest_epoch, depeg_epochs, depeg_threshold) {
+            return Ok(CoverGate::RecentDepeg);
+        }
+
+        let halt_epochs = (halt_window_secs / EPOCH_SECS) as u32;
+        if any_epoch_endpoint_down(&ring, newest_epoch, halt_epochs) {
+            return Ok(CoverGate::RecentEndpointOutage);
+        }
+
+        if any_epoch_with_issuer_action(&ring, newest_epoch, BASELINE_EPOCHS as u32) {
+            return Ok(CoverGate::RecentIssuerAction);
+        }
+
+        Ok(CoverGate::Clear)
+    }
+
+    /// technical-doc.md Section 8.6.
+    pub fn covers(env: Env, event_id: u64, def_version: u32, start: u64, expiry: u64) -> bool {
+        let Some(record) = storage::get_event(&env, event_id) else {
+            return false;
+        };
+        if record.def_version != def_version {
+            return false;
+        }
+        if record.window_start < start || record.window_start > expiry {
+            return false;
+        }
+        let window_len =
+            match storage::get_def(&env, &record.asset, record.kind, record.def_version) {
+                Some(def) => match record.kind {
+                    EventKind::Depeg => def.depeg_window_secs,
+                    EventKind::IssuerFreeze => BASELINE_EPOCHS * EPOCH_SECS,
+                    _ => 0,
+                },
+                None => 0,
+            };
+        record.proposed_at <= expiry + window_len
+    }
+
+    pub fn ruling_deadline(env: Env, event_id: u64) -> Option<u64> {
+        let record = storage::get_event(&env, event_id)?;
+        let def = storage::get_def(&env, &record.asset, record.kind, record.def_version)?;
+        record
+            .escalated_at
+            .map(|escalated_at| escalated_at + def.ruling_deadline_secs)
+    }
+
+    pub fn committee_misses(env: Env, committee: Address) -> u32 {
+        storage::get_committee_misses(&env, &committee)
+    }
+
+    pub fn active_event_count(env: Env, asset: Address) -> u32 {
+        storage::get_active_count(&env, &asset)
+    }
+
+    // -- internal --
+
+    fn require_config(env: &Env) -> Result<Config, Error> {
+        storage::get_config(env).ok_or(Error::NotInitialized)
+    }
+
+    /// Design note Section 2: the single function routing "does a live
+    /// series still pin this version" through one place. `MarketFactory`
+    /// is out of scope for this build; always `false`.
+    fn version_has_live_cover(
+        _env: &Env,
+        _config: &Config,
+        _asset: &Address,
+        _kind: EventKind,
+        _version: u32,
+    ) -> bool {
+        false
+    }
+
+    fn enter_active(env: &Env, oracle: &RiskOracleClient, asset: &Address) {
+        let count = storage::get_active_count(env, asset);
+        storage::set_active_count(env, asset, count + 1);
+        if count == 0 {
+            oracle.set_event_in_progress(asset, &true);
+        }
+    }
+
+    fn leave_active(
+        env: &Env,
+        config: &Config,
+        record: &EventRecord,
+        left_at: u64,
+    ) -> Result<(), Error> {
+        let canonical = storage::get_canonical(env, &record.asset, record.kind);
+        storage::clear_live_event(env, &record.asset, record.kind, record.def_version);
+        if record.def_version == canonical {
+            storage::set_status(env, &record.asset, record.kind, &AssetEventStatus::None);
+            let count = storage::get_active_count(env, &record.asset);
+            let next = count.saturating_sub(1);
+            storage::set_active_count(env, &record.asset, next);
+            if next == 0 {
+                RiskOracleClient::new(env, &config.oracle)
+                    .set_event_in_progress(&record.asset, &false);
+            }
+        }
+        storage::set_left_at(env, &record.asset, record.kind, record.def_version, left_at);
+        Ok(())
+    }
+
+    /// technical-doc.md Section 8.5. Design review item D3b: asset-wide
+    /// effects (`set_event_band`, clearing the active count) fire only
+    /// for a canonical-version event.
+    fn declare(env: &Env, config: &Config, record: &EventRecord) -> Result<(), Error> {
+        let canonical = storage::get_canonical(env, &record.asset, record.kind);
+        let is_canonical = record.def_version == canonical;
+        if is_canonical {
+            RiskOracleClient::new(env, &config.oracle).set_event_band(&record.asset);
+        }
+        // E2: Declared is terminal. `LiveEvent` is deliberately NOT
+        // cleared here, unlike the Cured/Rejected path in
+        // `leave_active`: clearing it would let a later
+        // `propose_tier1` call for this exact (asset, kind, version)
+        // succeed again (E3's own "no live event" check would read
+        // as free), creating a SECOND event whose own later
+        // resolution (Cured or Rejected) would then overwrite
+        // `Status(asset, kind)` back to `None` via `leave_active`,
+        // destroying the record that this version was ever Declared
+        // even though the oracle's own sticky `Event` band (set just
+        // above) is never cleared to match. `LiveEvent` staying set
+        // to this Declared event's own id is what keeps E1/E2/E3 all
+        // consistent with each other for the rest of this version's
+        // existence.
+        if is_canonical {
+            storage::set_status(
+                env,
+                &record.asset,
+                record.kind,
+                &AssetEventStatus::Declared(
+                    record.id,
+                    record.def_version,
+                    record.window_start,
+                    record.declared_at.unwrap_or_default(),
+                ),
+            );
+            let count = storage::get_active_count(env, &record.asset);
+            let next = count.saturating_sub(1);
+            storage::set_active_count(env, &record.asset, next);
+            if next == 0 {
+                RiskOracleClient::new(env, &config.oracle)
+                    .set_event_in_progress(&record.asset, &false);
+            }
+        }
+        events::EventDeclared {
+            asset: record.asset.clone(),
+            event_id: record.id,
+            kind: record.kind,
+            def_version: record.def_version,
+            window_start: record.window_start,
+            declared_at: record.declared_at.unwrap_or_default(),
+        }
+        .publish(env);
+        Ok(())
     }
 }
 
+const ALL_KINDS: [EventKind; 5] = [
+    EventKind::Depeg,
+    EventKind::IssuerFreeze,
+    EventKind::MintWithoutBacking,
+    EventKind::WithdrawalHalt,
+    EventKind::Insolvency,
+];
+
+enum CureOutcome {
+    NotReady,
+    Cured,
+    Declared,
+}
+
+/// A fixed placeholder challenge bond amount for this phase. Tier 1
+/// defines no `challenge_bond` field of its own on `EventDefinition`
+/// distinct from Tier 2's `claim_bond` (Section 8.3); this build uses
+/// the same `signal_dispute_bond` default (Section 23) every other
+/// bonded dispute in this workspace uses, the same pattern
+/// `RiskOracle`'s own private `signal_dispute_bond()` helper follows
+/// for its own, unrelated dispute bond.
+fn challenge_bond_placeholder() -> i128 {
+    10_000_000_000
+}
+
+fn issuer_freeze_possible(flags: &IssuerFlags) -> bool {
+    flags.auth_revocable || flags.clawback_enabled
+}
+
+fn validate_definition_params(def: &EventDefinition) -> Result<(), Error> {
+    match def.kind {
+        EventKind::Depeg => {
+            if def.freeze_pct_bps != 0
+                || def.auth_revocation_threshold != 0
+                || def.mint_spike_bps != 0
+                || def.halt_window_secs != 0
+            {
+                return Err(Error::InvalidDefinition);
+            }
+            if def.depeg_window_secs == 0 || def.depeg_threshold == 0 || def.cure_threshold == 0 {
+                return Err(Error::InvalidDefinition);
+            }
+            let window_epochs = def.depeg_window_secs / EPOCH_SECS;
+            if window_epochs + BASELINE_EPOCHS > RING_SLOTS as u64 {
+                return Err(Error::InvalidDefinition);
+            }
+        }
+        EventKind::IssuerFreeze => {
+            if def.depeg_threshold != 0
+                || def.depeg_window_secs != 0
+                || def.max_missing_epochs != 0
+                || def.cure_threshold != 0
+                || def.mint_spike_bps != 0
+                || def.halt_window_secs != 0
+            {
+                return Err(Error::InvalidDefinition);
+            }
+            if def.freeze_pct_bps == 0 && def.auth_revocation_threshold == 0 {
+                return Err(Error::InvalidDefinition);
+            }
+        }
+        _ => return Err(Error::InvalidDefinition),
+    }
+    if def.ruling_deadline_secs == 0 {
+        return Err(Error::InvalidDefinition);
+    }
+    // PR #15 review, finding F3: `challenge_secs` must be a whole
+    // number of epochs, between 1 and `MAX_CURE_EPOCHS`. Without the
+    // lower bound, a short `challenge_secs` landing inside a single
+    // epoch makes `cure_outcome`'s own cure-window loop run zero
+    // times, which reads as "no failure observed" and cures with no
+    // data at all. The upper bound keeps the cure window's own
+    // `CureProgress::recorded` bitmap (`u128`, finding F2) comfortably
+    // sized for every cure epoch it must address.
+    if def.challenge_secs == 0
+        || !def.challenge_secs.is_multiple_of(EPOCH_SECS)
+        || def.challenge_secs / EPOCH_SECS > MAX_CURE_EPOCHS
+    {
+        return Err(Error::InvalidDefinition);
+    }
+    Ok(())
+}
+
+/// Finds the `RingSlot` for `epoch` within `ring`'s own "oldest
+/// first" layout (technical-doc.md Section 12.1's own doc comment on
+/// `ring()`), without a linear scan: `ring`'s last element is always
+/// the newest epoch the oracle has ever stored a slot for (or, if the
+/// asset never posted, 0, an `Empty` placeholder), and every element
+/// before it is exactly one epoch older, in order.
+/// Finds the slot holding `epoch`'s own data, if any. `ring()`'s own
+/// "oldest first" layout (Section 12.1) is a fixed rotation of ring
+/// POSITIONS relative to the newest write, not "the N most recent
+/// epochs by number": if a gap in posting left some position
+/// unwritten since an EARLIER epoch occupied it, that position still
+/// holds that earlier epoch's own, already-verified-real data, which
+/// the naive "offset back from newest" arithmetic alone would
+/// misattribute to whatever epoch number the arithmetic expects at
+/// that offset. Checking the found slot's own `.epoch` field against
+/// what was actually asked for is what catches this: a mismatch
+/// means `epoch` was never written into the live span this `ring()`
+/// snapshot covers, the same as if the slot were `Empty`.
+fn slot_for_epoch(
+    ring: &Vec<sylox_types::RingSlot>,
+    newest_epoch: u64,
+    epoch: u64,
+) -> Option<sylox_types::RingSlot> {
+    if epoch > newest_epoch {
+        return None;
+    }
+    let back = newest_epoch - epoch;
+    if back as u32 >= ring.len() {
+        return None;
+    }
+    let index = ring.len() - 1 - back as u32;
+    let slot = ring.get(index).unwrap();
+    if slot.state != SlotState::Empty && slot.epoch != epoch {
+        return None;
+    }
+    Some(slot)
+}
+
+fn effective_state_of(slot: &sylox_types::RingSlot, now: u64) -> SlotState {
+    if slot.state == SlotState::Pending && now >= slot.pending_until {
+        SlotState::Final
+    } else {
+        slot.state
+    }
+}
+
+/// design note Section 5, review items R1/R2/R3.
+/// `target_epoch` is the epoch actually being asked about, independent
+/// of whether `slot` carries any real data for it: `slot_for_epoch`
+/// returns `None` both when `target_epoch` is outside this `ring()`
+/// snapshot's own live span, AND when a position-matching slot exists
+/// but holds a DIFFERENT, stale epoch's data (a gap, see
+/// `slot_for_epoch`'s own doc comment) — both cases mean `target_epoch`
+/// itself was never written, exactly like a verified `Empty` slot.
+fn epoch_disposition(
+    slot: Option<&sylox_types::RingSlot>,
+    target_epoch: u64,
+    now: u64,
+) -> EpochDisposition {
+    let is_empty = match slot {
+        None => true,
+        Some(slot) => slot.state == SlotState::Empty,
+    };
+    if is_empty {
+        let epoch_close = (target_epoch + 1) * EPOCH_SECS;
+        return if now > epoch_close + WINDOW_SECS {
+            EpochDisposition::PermanentlyMissing
+        } else {
+            EpochDisposition::NotReady
+        };
+    }
+    let slot = slot.unwrap();
+    let effective = effective_state_of(slot, now);
+    if effective == SlotState::Final {
+        EpochDisposition::Final(slot.peg_ratio)
+    } else {
+        // Pending (not yet past pending_until) or Disputed.
+        EpochDisposition::NotReady
+    }
+}
+
+enum EpochDisposition {
+    Final(i128),
+    PermanentlyMissing,
+    NotReady,
+}
+
+/// technical-doc.md Section 8.2, design note Section 3.
+fn check_depeg(
+    env: &Env,
+    oracle: &RiskOracleClient,
+    asset: &Address,
+    def: &EventDefinition,
+) -> Result<u64, Error> {
+    let ring = oracle.ring(asset);
+    let newest_epoch = oracle.newest_epoch(asset).ok_or(Error::Tier1CheckFailed)?;
+    let now = env.ledger().timestamp();
+
+    let window_epochs = def.depeg_window_secs / EPOCH_SECS;
+    if newest_epoch + 1 < window_epochs {
+        return Err(Error::Tier1CheckFailed);
+    }
+    let window_start_epoch = newest_epoch + 1 - window_epochs;
+
+    let mut missing: u32 = 0;
+    for epoch in window_start_epoch..=newest_epoch {
+        let slot = slot_for_epoch(&ring, newest_epoch, epoch);
+        match epoch_disposition(slot.as_ref(), epoch, now) {
+            EpochDisposition::Final(peg_ratio) => {
+                if peg_ratio >= def.depeg_threshold {
+                    return Err(Error::Tier1CheckFailed);
+                }
+            }
+            EpochDisposition::PermanentlyMissing | EpochDisposition::NotReady => {
+                missing += 1;
+            }
+        }
+    }
+    if missing > def.max_missing_epochs {
+        return Err(Error::Tier1CheckFailed);
+    }
+
+    // 7 day baseline, strictly before the window.
+    if window_start_epoch < BASELINE_EPOCHS {
+        return Err(Error::Tier1CheckFailed);
+    }
+    let baseline_start = window_start_epoch - BASELINE_EPOCHS;
+    let mut liquidity_values: Vec<i128> = Vec::new(env);
+    for epoch in baseline_start..window_start_epoch {
+        let slot = slot_for_epoch(&ring, newest_epoch, epoch);
+        if let EpochDisposition::Final(_) = epoch_disposition(slot.as_ref(), epoch, now) {
+            liquidity_values.push_back(slot.unwrap().liquidity_2pct);
+        }
+    }
+    if liquidity_values.is_empty() {
+        return Err(Error::Tier1CheckFailed);
+    }
+    let median_liquidity = median(&liquidity_values);
+    let min_liquidity = oracle
+        .asset_config(asset)
+        .map(|c| c.min_liquidity)
+        .unwrap_or(0);
+    if median_liquidity < min_liquidity {
+        return Err(Error::Tier1CheckFailed);
+    }
+
+    Ok(window_start_epoch * EPOCH_SECS)
+}
+
+/// technical-doc.md Section 8.2, design note Section 3.
+fn check_issuer_freeze(
+    env: &Env,
+    oracle: &RiskOracleClient,
+    asset: &Address,
+    def: &EventDefinition,
+) -> Result<u64, Error> {
+    let ring = oracle.ring(asset);
+    let newest_epoch = oracle.newest_epoch(asset).ok_or(Error::Tier1CheckFailed)?;
+    let now = env.ledger().timestamp();
+
+    let window_epochs: u64 = BASELINE_EPOCHS;
+    if newest_epoch + 1 < window_epochs {
+        return Err(Error::Tier1CheckFailed);
+    }
+    let window_start_epoch = newest_epoch + 1 - window_epochs;
+
+    let mut clawback_sum: i128 = 0;
+    let mut revocation_sum: u32 = 0;
+    let mut earliest_action_epoch: Option<u64> = None;
+    let mut latest_supply: i128 = 0;
+    for epoch in window_start_epoch..=newest_epoch {
+        let slot = slot_for_epoch(&ring, newest_epoch, epoch);
+        if let EpochDisposition::Final(_) = epoch_disposition(slot.as_ref(), epoch, now) {
+            let slot = slot.unwrap();
+            latest_supply = slot.supply;
+            if slot.clawback_amount > 0 || slot.auth_revocations > 0 {
+                clawback_sum = clawback_sum
+                    .checked_add(slot.clawback_amount)
+                    .ok_or(Error::MathOverflow)?;
+                revocation_sum = revocation_sum
+                    .checked_add(slot.auth_revocations)
+                    .ok_or(Error::MathOverflow)?;
+                if earliest_action_epoch.is_none() {
+                    earliest_action_epoch = Some(epoch);
+                }
+            }
+        }
+    }
+
+    let passes_clawback = if def.freeze_pct_bps > 0 && latest_supply > 0 {
+        let scaled = clawback_sum
+            .checked_mul(10_000)
+            .ok_or(Error::MathOverflow)?;
+        scaled / latest_supply >= def.freeze_pct_bps as i128
+    } else {
+        false
+    };
+    let passes_revocation =
+        def.auth_revocation_threshold > 0 && revocation_sum > def.auth_revocation_threshold;
+    if !passes_clawback && !passes_revocation {
+        return Err(Error::Tier1CheckFailed);
+    }
+
+    let window_start = earliest_action_epoch.ok_or(Error::Tier1CheckFailed)? * EPOCH_SECS;
+    Ok(window_start)
+}
+
+fn median(values: &Vec<i128>) -> i128 {
+    let mut sorted: soroban_sdk::Vec<i128> = values.clone();
+    // Simple insertion sort; `values` is bounded by 168 entries
+    // (the 7 day baseline), so this is cheap in practice.
+    let len = sorted.len();
+    for i in 1..len {
+        let key = sorted.get(i).unwrap();
+        let mut j = i;
+        while j > 0 && sorted.get(j - 1).unwrap() > key {
+            let prev = sorted.get(j - 1).unwrap();
+            sorted.set(j, prev);
+            j -= 1;
+        }
+        sorted.set(j, key);
+    }
+    let mid = len / 2;
+    if len.is_multiple_of(2) {
+        (sorted.get(mid - 1).unwrap() + sorted.get(mid).unwrap()) / 2
+    } else {
+        sorted.get(mid).unwrap()
+    }
+}
+
+/// design note Section 5. Returns the cure outcome for a Depeg event's
+/// cure window, `[proposed_at, proposed_at + challenge_secs)` by close
+/// time (review item D1).
+/// PR #15 review, finding F2: scans the cure window and records the
+/// result of every epoch whose disposition is currently Final or
+/// PermanentlyMissing into `event_id`'s own persisted `CureProgress`,
+/// merging with whatever was already recorded (recording is monotonic,
+/// see `CureProgress`'s own doc comment). An epoch whose disposition
+/// is NotReady is skipped, not stopped on: a later epoch in the window
+/// disputed or still Pending must never block recording an EARLIER
+/// epoch that is already decidable, because that earlier epoch is the
+/// one at risk of rotating out of the ring first. Returns the merged
+/// progress; never errors on "nothing new to record."
+fn record_cure_progress(
+    env: &Env,
+    oracle: &RiskOracleClient,
+    record: &EventRecord,
+    def: &EventDefinition,
+) -> storage::CureProgress {
+    let ring = oracle.ring(&record.asset);
+    let now = env.ledger().timestamp();
+    let newest_epoch = oracle.newest_epoch(&record.asset).unwrap_or(0);
+
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch_close = record.proposed_at + def.challenge_secs;
+    let last_cure_epoch = last_cure_epoch_close / EPOCH_SECS;
+
+    let mut progress = storage::get_cure_progress(env, record.id);
+    let mut epoch = first_cure_epoch;
+    let mut bit = 0u32;
+    while epoch < last_cure_epoch {
+        let mask = 1u128 << bit;
+        if progress.recorded & mask == 0 {
+            let slot = slot_for_epoch(&ring, newest_epoch, epoch);
+            match epoch_disposition(slot.as_ref(), epoch, now) {
+                EpochDisposition::NotReady => {}
+                EpochDisposition::PermanentlyMissing => {
+                    progress.recorded |= mask;
+                    progress.any_missing = true;
+                }
+                EpochDisposition::Final(peg_ratio) => {
+                    progress.recorded |= mask;
+                    if peg_ratio < def.cure_threshold {
+                        progress.any_below_threshold = true;
+                    }
+                }
+            }
+        }
+        epoch += 1;
+        bit += 1;
+    }
+    storage::set_cure_progress(env, record.id, &progress);
+    progress
+}
+
+/// design note Section 5, as amended by PR #15 review finding F2: the
+/// cure window, `[proposed_at, proposed_at + challenge_secs)` by close
+/// time (review item D1), is checked against PERSISTED progress
+/// (`record_cure_progress`), not a live re-scan alone, because the
+/// oracle's own ring only holds `RING_SLOTS` epochs — a cure-window
+/// epoch that becomes decidable while still inside the ring must be
+/// recorded before it rotates out, or a late `finalize` call
+/// misreads it as missing (finding F2's own worked example).
+///
+/// Decision order: an already-recorded failure (missing or below
+/// threshold) declares immediately, even while other epochs are
+/// still NotReady — one failure already rules out a cure, so there is
+/// nothing to gain by waiting on the rest. Only once there is no
+/// recorded failure does an unrecorded NotReady epoch block the
+/// decision. Cured requires every cure-window epoch recorded and
+/// clean.
+fn cure_outcome(
+    env: &Env,
+    config: &Config,
+    record: &EventRecord,
+    def: &EventDefinition,
+) -> Result<CureOutcome, Error> {
+    let oracle = RiskOracleClient::new(env, &config.oracle);
+    let progress = record_cure_progress(env, &oracle, record, def);
+
+    if progress.any_missing || progress.any_below_threshold {
+        return Ok(CureOutcome::Declared);
+    }
+
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + def.challenge_secs) / EPOCH_SECS;
+    let cure_epochs = last_cure_epoch.saturating_sub(first_cure_epoch) as u32;
+    // Finding F3: `validate_definition_params` guarantees at least one
+    // cure epoch; this is a defensive second line, never reachable
+    // for a definition registered through this build.
+    if cure_epochs == 0 {
+        return Ok(CureOutcome::Declared);
+    }
+    let all_recorded = if cure_epochs >= 128 {
+        false
+    } else {
+        let full_mask = (1u128 << cure_epochs) - 1;
+        progress.recorded & full_mask == full_mask
+    };
+    if all_recorded {
+        Ok(CureOutcome::Cured)
+    } else {
+        Ok(CureOutcome::NotReady)
+    }
+}
+
+/// technical-doc.md Section 23 defaults, used when the asset has no
+/// registered definition of that kind (Section 9.4's own stated
+/// fallback rule).
+const DEFAULT_DEPEG_WINDOW_SECS: u64 = 259_200;
+const DEFAULT_DEPEG_THRESHOLD: i128 = 9_500_000;
+const DEFAULT_HALT_WINDOW_SECS: u64 = 259_200;
+
+fn any_epoch_below_threshold(
+    ring: &Vec<sylox_types::RingSlot>,
+    newest_epoch: u64,
+    window_epochs: u32,
+    threshold: i128,
+) -> bool {
+    let start = newest_epoch.saturating_sub(window_epochs as u64);
+    let mut epoch = start;
+    while epoch <= newest_epoch {
+        if let Some(slot) = slot_for_epoch(ring, newest_epoch, epoch) {
+            if slot.state != SlotState::Empty && slot.peg_ratio < threshold {
+                return true;
+            }
+        }
+        epoch += 1;
+    }
+    false
+}
+
+fn any_epoch_endpoint_down(
+    ring: &Vec<sylox_types::RingSlot>,
+    newest_epoch: u64,
+    window_epochs: u32,
+) -> bool {
+    let start = newest_epoch.saturating_sub(window_epochs as u64);
+    let mut epoch = start;
+    while epoch <= newest_epoch {
+        if let Some(slot) = slot_for_epoch(ring, newest_epoch, epoch) {
+            if matches!(
+                slot.endpoint,
+                sylox_types::EndpointStatus::Down | sylox_types::EndpointStatus::Degraded
+            ) {
+                return true;
+            }
+        }
+        epoch += 1;
+    }
+    false
+}
+
+fn any_epoch_with_issuer_action(
+    ring: &Vec<sylox_types::RingSlot>,
+    newest_epoch: u64,
+    window_epochs: u32,
+) -> bool {
+    let start = newest_epoch.saturating_sub(window_epochs as u64);
+    let mut epoch = start;
+    while epoch <= newest_epoch {
+        if let Some(slot) = slot_for_epoch(ring, newest_epoch, epoch) {
+            if slot.clawback_amount > 0 || slot.auth_revocations > 0 {
+                return true;
+            }
+        }
+        epoch += 1;
+    }
+    false
+}
+
+#[cfg(test)]
+mod budget_test;
 #[cfg(test)]
 mod test;
