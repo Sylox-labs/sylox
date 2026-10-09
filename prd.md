@@ -146,7 +146,7 @@ Reserve reports published by the issuer
 Issuer, optionally signed
 Partly (signature yes, truth no)
 5.2 Risk score
-• A 0 to 100 score per asset, updated each epoch (target: hourly for onchain signals, every 15 minutes for endpoint probes).
+• A 0 to 100 score per asset, updated every 5 minutes by default (a governance setting), confirmed hourly. Endpoint probes stay hourly.
 • Formula published in the repo and stored as a versioned parameter set onchain. Changes go through governance (Section 17).
 • Score bands: Normal, Watch, Warning, Distress. A band change emits an event that wallets and lenders can subscribe to.
 5.3 How data gets onchain
