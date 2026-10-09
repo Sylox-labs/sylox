@@ -26,8 +26,11 @@ pub const KEEPER_MAX_FAULTS: u32 = 3;
 /// technical-doc.md Section 23, "USDC per accepted epoch". Used by
 /// `reward_keeper` (lead decision, feat/staking: a local accrual from
 /// the same reward pool `fund_rewards`/`settle_probes` share, see the
-/// module and `reward_keeper`'s own doc comments).
-pub const KEEPER_REWARD_PER_ACCEPTED_EPOCH: i128 = 5_000_000; // 0.50 USDC
+/// module and `reward_keeper`'s own doc comments). Lowered from
+/// 0.50 (feat/staking's own original default) to 0.05 in spec v1.3,
+/// so reward parameters stay within a sustainable operating cost at
+/// the target scale (10 assets, hourly epochs).
+pub const KEEPER_REWARD_PER_ACCEPTED_EPOCH: i128 = 500_000; // 0.05 USDC
 /// technical-doc.md Section 23.
 pub const REPORTER_STAKE: i128 = 10_000_000_000; // 1,000 USDC
 /// technical-doc.md Section 23, "count per 30 days".
