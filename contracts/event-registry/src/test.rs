@@ -71,6 +71,20 @@ impl MockStaking {
     pub fn bond(env: Env, key: sylox_types::BondKey) -> Option<(Address, i128)> {
         env.storage().temporary().get(&StakingKey::Bond(key))
     }
+
+    /// `RiskOracle.resolve_signal_dispute`'s own disputer-wins path
+    /// (finding F4's tests exercise it, via a real `RiskOracle`) calls
+    /// this to slash the overturned keeper's own stake. A no-op here
+    /// is enough: no event-registry test asserts anything about a
+    /// keeper's staked balance.
+    pub fn slash(
+        _env: Env,
+        _who: Address,
+        _amount: i128,
+        _winner: Option<Address>,
+        _reason: BytesN<32>,
+    ) {
+    }
 }
 
 #[derive(Clone)]
@@ -322,7 +336,7 @@ const SIGNAL_DISPUTE_SECS: u64 = 7_200;
 #[allow(dead_code)]
 const WINDOW_SECS: u64 = 259_200;
 #[allow(dead_code)]
-const SIGNAL_DISPUTE_RULING_SECS: u64 = 604_800;
+const SIGNAL_DISPUTE_RULING_SECS: u64 = 518_400;
 
 // -- initialize --
 
@@ -452,6 +466,69 @@ fn register_definition_rejects_a_window_plus_baseline_too_large_for_the_ring() {
     assert_eq!(result, Err(Ok(Error::InvalidDefinition)));
 }
 
+/// PR #15 review, finding F3: `challenge_secs` must be a whole number
+/// of epochs, and within `MAX_CURE_EPOCHS`, or the cure window can be
+/// empty (0 or sub-hour) or too large for the progress bitmap (73h).
+#[test]
+fn register_definition_rejects_a_challenge_secs_not_aligned_to_a_whole_epoch() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+
+    for bad in [1_800u64, 5_400, 73 * 3_600] {
+        let mut def = depeg_definition(&env, &asset);
+        def.challenge_secs = bad;
+        let result = fx.client.try_register_definition(&def);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidDefinition)),
+            "challenge_secs {bad} must be rejected"
+        );
+    }
+}
+
+/// PR #15 review, finding F3: a proposal whose cure window covers
+/// exactly one epoch still evaluates that epoch, rather than falling
+/// through a zero-iteration loop into an automatic Cured.
+#[test]
+fn finalize_evaluates_exactly_one_cure_epoch_when_challenge_secs_is_one_epoch() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    let mut def = depeg_definition(&env, &asset);
+    def.challenge_secs = EPOCH_SECS;
+    fx.client.register_definition(&def);
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &asset);
+    let id = fx
+        .client
+        .propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let record = fx.client.event(&id).unwrap();
+
+    // Exactly one cure epoch: [proposed_at, proposed_at + EPOCH_SECS).
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + EPOCH_SECS) / EPOCH_SECS;
+    assert_eq!(last_cure_epoch - first_cure_epoch, 1);
+
+    // Leave it permanently missing: never post it, advance past its
+    // own backfill window.
+    let epoch_close = (first_cure_epoch + 1) * EPOCH_SECS;
+    env.ledger()
+        .set_timestamp(epoch_close + WINDOW_SECS + SIGNAL_DISPUTE_SECS + 1);
+
+    fx.client.finalize(&id);
+    assert_eq!(
+        fx.client.event(&id).unwrap().state,
+        EventState::Declared,
+        "the single cure epoch must actually be evaluated, not skipped"
+    );
+}
+
 #[test]
 fn register_definition_rejects_issuer_freeze_when_neither_flag_is_set() {
     let env = Env::default();
@@ -543,6 +620,31 @@ fn propose_tier1_depeg_succeeds_on_a_failing_window() {
         fx.client.event_status(&asset, &EventKind::Depeg),
         AssetEventStatus::InProgress(found_id) if found_id == id
     ));
+}
+
+/// PR #15 review, finding F5: `propose_tier1` must authenticate
+/// `caller`, the address stored as `proposer` and published in
+/// `EventProposed` — a public record an indexer will display.
+#[test]
+fn propose_tier1_requires_callers_own_auth() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &asset);
+
+    let caller = Address::generate(&env);
+    fx.client
+        .propose_tier1(&caller, &asset, &EventKind::Depeg, &1);
+    assert_eq!(
+        env.auths()[0].0,
+        caller,
+        "propose_tier1 must check caller's own auth, not anyone else's"
+    );
 }
 
 #[test]
@@ -1302,6 +1404,475 @@ fn finalize_returns_data_not_final_while_a_cure_window_epoch_is_disputed() {
         fx.client.event(&id).unwrap().state,
         EventState::Cured,
         "once the dispute times out the epoch is Final and above cure_threshold"
+    );
+}
+
+/// PR #15 review, finding F4: the cure window is fully recovered and
+/// Final. Separately, the newest epoch overall (posted after the
+/// cure window, by a keeper who keeps posting) is disputed and
+/// overturned, leaving its own ring POSITION `Empty`. `finalize`,
+/// called right after the overturn, must still read the cure window
+/// correctly and decide Cured, not misread every cure-window epoch
+/// as missing because the newest ring position's own stored epoch
+/// reset to 0.
+#[test]
+fn finalize_cures_correctly_even_when_the_newest_epoch_was_just_overturned() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &asset);
+    let id = fx
+        .client
+        .propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let record = fx.client.event(&id).unwrap();
+
+    let challenge_secs = 86_400u64;
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + challenge_secs) / EPOCH_SECS;
+    for epoch in first_cure_epoch..last_cure_epoch {
+        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
+        fx.oracle.post_signals(
+            &fx.keeper,
+            &asset,
+            &signal_set(&env, &fx.keeper, epoch, 9_900_000, 500_000_000_000),
+        );
+    }
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
+
+    // One more epoch, posted after the whole cure window is already
+    // Final, then overturned: its own ring position is now Empty.
+    // Never rewind the clock: advance to whichever is later, the
+    // extra epoch's own close or where the clock already is.
+    let extra_epoch = last_cure_epoch;
+    let extra_close = (extra_epoch + 1) * EPOCH_SECS;
+    env.ledger()
+        .set_timestamp(extra_close.max(env.ledger().timestamp()));
+    fx.oracle.post_signals(
+        &fx.keeper,
+        &asset,
+        &signal_set(&env, &fx.keeper, extra_epoch, 9_900_000, 500_000_000_000),
+    );
+    let disputer = Address::generate(&env);
+    fx.oracle.dispute_signals(
+        &disputer,
+        &asset,
+        &extra_epoch,
+        &BytesN::from_array(&env, &[4u8; 32]),
+    );
+    fx.oracle.resolve_signal_dispute(
+        &asset,
+        &extra_epoch,
+        &false, // disputer wins: overturned, resets to Empty
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
+    assert!(fx
+        .oracle
+        .ring(&asset)
+        .iter()
+        .all(|slot| slot.epoch != extra_epoch));
+
+    env.ledger()
+        .set_timestamp((record.proposed_at + challenge_secs).max(env.ledger().timestamp() + 1));
+    fx.client.finalize(&id);
+    assert_eq!(
+        fx.client.event(&id).unwrap().state,
+        EventState::Cured,
+        "finding F4: an overturned newest epoch must not make finalize \
+         misread every cure-window epoch as missing"
+    );
+}
+
+/// PR #15 review, finding F4: the matching `cover_gate` case. With
+/// the newest epoch overturned, `cover_gate` must still read the
+/// real cure/depeg history correctly rather than reporting Clear
+/// because `newest_epoch` regressed to `Some(0)`.
+#[test]
+fn cover_gate_reports_recent_depeg_even_when_the_newest_epoch_was_just_overturned() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &asset);
+
+    // One more epoch, posted after the failing window, then
+    // overturned.
+    let extra_epoch = 240u64;
+    env.ledger().set_timestamp((extra_epoch + 1) * EPOCH_SECS);
+    fx.oracle.post_signals(
+        &fx.keeper,
+        &asset,
+        &signal_set(&env, &fx.keeper, extra_epoch, 9_900_000, 500_000_000_000),
+    );
+    let disputer = Address::generate(&env);
+    fx.oracle.dispute_signals(
+        &disputer,
+        &asset,
+        &extra_epoch,
+        &BytesN::from_array(&env, &[4u8; 32]),
+    );
+    fx.oracle.resolve_signal_dispute(
+        &asset,
+        &extra_epoch,
+        &false,
+        &BytesN::from_array(&env, &[0u8; 32]),
+    );
+
+    assert_eq!(fx.client.cover_gate(&asset), CoverGate::RecentDepeg);
+}
+
+// -- checkpoint_cure (PR #15 review, finding F2) --
+
+/// Posts every epoch from `start_epoch` through `through_epoch`
+/// (inclusive) continuously, `EPOCH_SECS` apart, each above
+/// `cure_threshold`. Used to simulate keepers who never stop posting,
+/// the scenario finding F2 is about: real keepers post every hour
+/// regardless of whether anyone has called `finalize` yet.
+fn post_continuous_healthy_run(
+    env: &Env,
+    oracle: &risk_oracle::RiskOracleClient,
+    keeper: &Address,
+    asset: &Address,
+    start_epoch: u64,
+    through_epoch: u64,
+) {
+    post_run(
+        env,
+        oracle,
+        keeper,
+        asset,
+        start_epoch,
+        through_epoch - start_epoch + 1,
+        9_900_000,
+        500_000_000_000,
+    );
+}
+
+/// PR #15 review, finding F2: without checkpointing, a cured depeg
+/// becomes Declared if `finalize` is called late enough that the
+/// cure window's own epochs have rotated out of `RiskOracle`'s ring
+/// (keepers post continuously; nothing stops them just because no one
+/// has called `finalize` yet). Run against the code BEFORE this fix,
+/// this scenario produces Declared; `checkpoint_cure`, called once
+/// while the cure-window epochs are still live, must make `finalize`
+/// still produce Cured even after the ring has long since rotated
+/// past them.
+#[test]
+fn checkpoint_cure_makes_a_late_finalize_still_cure() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &asset);
+    let id = fx
+        .client
+        .propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let record = fx.client.event(&id).unwrap();
+
+    let challenge_secs = 86_400u64;
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + challenge_secs) / EPOCH_SECS;
+    let last_epoch_in_window = last_cure_epoch - 1;
+
+    // Post every cure-window epoch except the very last one up front,
+    // above cure_threshold.
+    for epoch in first_cure_epoch..last_epoch_in_window {
+        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
+        fx.oracle.post_signals(
+            &fx.keeper,
+            &asset,
+            &signal_set(&env, &fx.keeper, epoch, 9_900_000, 500_000_000_000),
+        );
+    }
+    // The last cure-window epoch is posted late, disputed, and the
+    // dispute times out (R3's own worst-case path), still above
+    // cure_threshold.
+    let late_post_time = (last_epoch_in_window + 1) * EPOCH_SECS + WINDOW_SECS;
+    env.ledger().set_timestamp(late_post_time);
+    fx.oracle.post_signals(
+        &fx.keeper,
+        &asset,
+        &signal_set(
+            &env,
+            &fx.keeper,
+            last_epoch_in_window,
+            9_900_000,
+            500_000_000_000,
+        ),
+    );
+    let disputer = Address::generate(&env);
+    fx.oracle.dispute_signals(
+        &disputer,
+        &asset,
+        &last_epoch_in_window,
+        &BytesN::from_array(&env, &[3u8; 32]),
+    );
+    env.ledger()
+        .set_timestamp(late_post_time + SIGNAL_DISPUTE_RULING_SECS + 1);
+    fx.oracle
+        .resolve_signal_dispute_timeout(&asset, &last_epoch_in_window);
+
+    // Checkpoint now, while every cure-window epoch is still live in
+    // the ring (newest epoch so far is last_epoch_in_window, well
+    // under RING_SLOTS positions old relative to itself).
+    let progress = fx.client.checkpoint_cure(&id);
+    assert!(!progress.any_missing);
+    assert!(!progress.any_below_threshold);
+
+    // Keepers keep posting long after, until the entire cure window
+    // has rotated out of the ring (RING_SLOTS = 240 positions).
+    let keep_posting_from = last_epoch_in_window + 1;
+    let keep_posting_through = first_cure_epoch + 240 + 5;
+    post_continuous_healthy_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        keep_posting_from,
+        keep_posting_through,
+    );
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
+
+    fx.client.finalize(&id);
+    assert_eq!(
+        fx.client.event(&id).unwrap().state,
+        EventState::Cured,
+        "finding F2: a checkpointed cure must survive the cure window rotating \
+         out of the ring, even though finalize is called long after"
+    );
+}
+
+/// PR #15 review, finding F2: without ever calling `checkpoint_cure`,
+/// a genuinely cured depeg becomes Declared once `finalize` is called
+/// after the cure window has rotated out of the ring. Pins down the
+/// documented "seller's responsibility" rule (design note deviation
+/// list): nothing records cure-window progress unless something
+/// calls `checkpoint_cure` while that data is still live.
+#[test]
+fn finalize_without_a_checkpoint_declares_once_the_cure_window_has_rotated_out() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &asset);
+    let id = fx
+        .client
+        .propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let record = fx.client.event(&id).unwrap();
+
+    let challenge_secs = 86_400u64;
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + challenge_secs) / EPOCH_SECS;
+    for epoch in first_cure_epoch..last_cure_epoch {
+        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
+        fx.oracle.post_signals(
+            &fx.keeper,
+            &asset,
+            &signal_set(&env, &fx.keeper, epoch, 9_900_000, 500_000_000_000),
+        );
+    }
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
+
+    // No checkpoint_cure call. Keepers keep posting until the cure
+    // window has fully rotated out of the ring.
+    let keep_posting_from = last_cure_epoch;
+    let keep_posting_through = first_cure_epoch + 240 + 5;
+    post_continuous_healthy_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        keep_posting_from,
+        keep_posting_through,
+    );
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
+
+    fx.client.finalize(&id);
+    assert_eq!(
+        fx.client.event(&id).unwrap().state,
+        EventState::Declared,
+        "without a checkpoint, a rotated-out cure window reads as missing, \
+         which is Declared under the strict cure rule (R1)"
+    );
+}
+
+/// PR #15 review, finding F2: a recorded failure declares immediately,
+/// even while a later, unrecorded epoch is still NotReady — one
+/// failure already rules out a cure.
+#[test]
+fn checkpoint_cure_recorded_failure_short_circuits_an_unrecorded_not_ready_epoch() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &asset);
+    let id = fx
+        .client
+        .propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let record = fx.client.event(&id).unwrap();
+
+    let challenge_secs = 86_400u64;
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + challenge_secs) / EPOCH_SECS;
+    let last_epoch_in_window = last_cure_epoch - 1;
+
+    // The first cure epoch posts BELOW cure_threshold: a recorded
+    // failure. Every other epoch except the very last is posted
+    // healthy; the last epoch is left unposted (still NotReady,
+    // inside its own backfill window).
+    for epoch in first_cure_epoch..last_epoch_in_window {
+        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
+        let peg_ratio = if epoch == first_cure_epoch {
+            9_000_000 // below cure_threshold (9_800_000)
+        } else {
+            9_900_000
+        };
+        fx.oracle.post_signals(
+            &fx.keeper,
+            &asset,
+            &signal_set(&env, &fx.keeper, epoch, peg_ratio, 500_000_000_000),
+        );
+    }
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + SIGNAL_DISPUTE_SECS + 1);
+
+    // The last cure epoch is still unposted and inside its own
+    // backfill window: NotReady, not missing.
+    let progress = fx.client.checkpoint_cure(&id);
+    assert!(progress.any_below_threshold);
+    assert!(!progress.any_missing);
+
+    // finalize must declare right away: the already-recorded failure
+    // settles the outcome, regardless of the still-NotReady epoch.
+    env.ledger()
+        .set_timestamp((record.proposed_at + challenge_secs).max(env.ledger().timestamp() + 1));
+    fx.client.finalize(&id);
+    assert_eq!(
+        fx.client.event(&id).unwrap().state,
+        EventState::Declared,
+        "a recorded failure must declare immediately, not wait on a NotReady epoch"
+    );
+}
+
+/// PR #15 review, finding F2: calling `checkpoint_cure` twice in a row
+/// is a no-op the second time; the bitmap and flags are unchanged and
+/// nothing is counted twice.
+#[test]
+fn checkpoint_cure_is_idempotent() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &asset);
+    let id = fx
+        .client
+        .propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let record = fx.client.event(&id).unwrap();
+
+    let challenge_secs = 86_400u64;
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + challenge_secs) / EPOCH_SECS;
+    for epoch in first_cure_epoch..last_cure_epoch {
+        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
+        fx.oracle.post_signals(
+            &fx.keeper,
+            &asset,
+            &signal_set(&env, &fx.keeper, epoch, 9_900_000, 500_000_000_000),
+        );
+    }
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + SIGNAL_DISPUTE_SECS + 1);
+
+    let first = fx.client.checkpoint_cure(&id);
+    let second = fx.client.checkpoint_cure(&id);
+    assert_eq!(first, second);
+}
+
+/// PR #15 review, finding F2: `checkpoint_cure` is only valid for a
+/// Proposed Depeg event; IssuerFreeze has no cure path at all.
+#[test]
+fn checkpoint_cure_rejects_issuer_freeze_and_a_non_proposed_event() {
+    let env = Env::default();
+    let fx = setup(&env);
+
+    let freeze_asset = Address::generate(&env);
+    let freeze_issuer = Address::generate(&env);
+    fx.oracle.add_asset(&asset_config(
+        &env,
+        &freeze_asset,
+        &freeze_issuer,
+        IssuerFlags {
+            auth_revocable: true,
+            clawback_enabled: false,
+        },
+    ));
+    fx.client
+        .register_definition(&issuer_freeze_definition(&env, &freeze_asset));
+    post_issuer_actions(&env, &fx.oracle, &fx.keeper, &freeze_asset, 0, 4);
+    let freeze_id = fx.client.propose_tier1(
+        &Address::generate(&env),
+        &freeze_asset,
+        &EventKind::IssuerFreeze,
+        &1,
+    );
+    assert_eq!(
+        fx.client.try_checkpoint_cure(&freeze_id),
+        Err(Ok(Error::WrongState))
+    );
+
+    let depeg_asset = Address::generate(&env);
+    let depeg_issuer = Address::generate(&env);
+    fx.oracle.add_asset(&asset_config(
+        &env,
+        &depeg_asset,
+        &depeg_issuer,
+        IssuerFlags::default(),
+    ));
+    fx.client
+        .register_definition(&depeg_definition(&env, &depeg_asset));
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &depeg_asset);
+    let depeg_id = fx.client.propose_tier1(
+        &Address::generate(&env),
+        &depeg_asset,
+        &EventKind::Depeg,
+        &1,
+    );
+    fx.client.challenge(
+        &Address::generate(&env),
+        &depeg_id,
+        &BytesN::from_array(&env, &[1u8; 32]),
+    );
+    assert_eq!(
+        fx.client.try_checkpoint_cure(&depeg_id),
+        Err(Ok(Error::WrongState))
     );
 }
 

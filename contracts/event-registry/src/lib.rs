@@ -100,6 +100,13 @@ const RING_SLOTS: u32 = 240;
 /// the same 168 epoch span, used for two different purposes.
 const BASELINE_EPOCHS: u64 = 7 * 24;
 
+/// PR #15 review, finding F3: the largest number of cure-window
+/// epochs (`challenge_secs / EPOCH_SECS`) `validate_definition_params`
+/// will accept, 72 hours' worth. Keeps `storage::CureProgress`'s own
+/// `recorded: u128` bitmap comfortably sized for every definition
+/// this build can register, with headroom to spare.
+const MAX_CURE_EPOCHS: u64 = 72;
+
 // `SIGNAL_DISPUTE_SECS` and `SIGNAL_DISPUTE_RULING_SECS` (ADR-010)
 // are not needed by this contract's own production logic (it only
 // ever classifies each cure-window epoch's CURRENT state, never
@@ -209,6 +216,12 @@ impl EventRegistry {
         kind: EventKind,
         version: u32,
     ) -> Result<u64, Error> {
+        // PR #15 review, finding F5: nothing pays a Tier 1 proposer in
+        // this build, but `caller` is still stored as `proposer` and
+        // published in `EventProposed`, a public record an indexer
+        // will display. Without this, anyone could propose in someone
+        // else's name.
+        caller.require_auth();
         let config = Self::require_config(&env)?;
         let def = storage::get_def(&env, &asset, kind, version).ok_or(Error::UnknownDefinition)?;
 
@@ -375,6 +388,33 @@ impl EventRegistry {
         }
     }
 
+    /// PR #15 review, finding F2. Permissionless (no `require_auth`):
+    /// anyone, including the keeper service, may call this to record
+    /// a Depeg event's cure-window progress before an epoch that is
+    /// already decidable rotates out of `RiskOracle`'s own ring.
+    /// Unlike `finalize`, this never errors on "not ready" — recording
+    /// whatever is currently decidable, and keeping that record, is
+    /// itself the successful outcome; there being more to record later
+    /// is not a failure. Calling it twice in a row is a no-op the
+    /// second time (`record_cure_progress`'s own recorded-bit check).
+    pub fn checkpoint_cure(env: Env, event_id: u64) -> Result<storage::CureProgress, Error> {
+        let config = Self::require_config(&env)?;
+        let record = storage::get_event(&env, event_id).ok_or(Error::UnknownEvent)?;
+        if record.state != EventState::Proposed {
+            return Err(Error::WrongState);
+        }
+        if record.kind != EventKind::Depeg {
+            // IssuerFreeze has no cure path at all (`finalize` always
+            // decides it as `CureOutcome::Declared`); there is nothing
+            // for this function to record.
+            return Err(Error::WrongState);
+        }
+        let def = storage::get_def(&env, &record.asset, record.kind, record.def_version)
+            .ok_or(Error::UnknownDefinition)?;
+        let oracle = RiskOracleClient::new(&env, &config.oracle);
+        Ok(record_cure_progress(&env, &oracle, &record, &def))
+    }
+
     pub fn rule(env: Env, event_id: u64, declare: bool, reason: BytesN<32>) -> Result<(), Error> {
         let config = Self::require_config(&env)?;
         let committee = GovernorClient::new(&env, &config.governor).committee();
@@ -507,7 +547,7 @@ impl EventRegistry {
 
         let oracle = RiskOracleClient::new(&env, &config.oracle);
         let ring = oracle.ring(&asset);
-        let newest_epoch = match newest_epoch_in(&ring) {
+        let newest_epoch = match oracle.newest_epoch(&asset) {
             Some(e) => e,
             None => return Ok(CoverGate::Clear),
         };
@@ -744,7 +784,21 @@ fn validate_definition_params(def: &EventDefinition) -> Result<(), Error> {
         }
         _ => return Err(Error::InvalidDefinition),
     }
-    if def.challenge_secs == 0 || def.ruling_deadline_secs == 0 {
+    if def.ruling_deadline_secs == 0 {
+        return Err(Error::InvalidDefinition);
+    }
+    // PR #15 review, finding F3: `challenge_secs` must be a whole
+    // number of epochs, between 1 and `MAX_CURE_EPOCHS`. Without the
+    // lower bound, a short `challenge_secs` landing inside a single
+    // epoch makes `cure_outcome`'s own cure-window loop run zero
+    // times, which reads as "no failure observed" and cures with no
+    // data at all. The upper bound keeps the cure window's own
+    // `CureProgress::recorded` bitmap (`u128`, finding F2) comfortably
+    // sized for every cure epoch it must address.
+    if def.challenge_secs == 0
+        || !def.challenge_secs.is_multiple_of(EPOCH_SECS)
+        || def.challenge_secs / EPOCH_SECS > MAX_CURE_EPOCHS
+    {
         return Err(Error::InvalidDefinition);
     }
     Ok(())
@@ -786,17 +840,6 @@ fn slot_for_epoch(
         return None;
     }
     Some(slot)
-}
-
-fn newest_epoch_in(ring: &Vec<sylox_types::RingSlot>) -> Option<u64> {
-    if ring.is_empty() {
-        return None;
-    }
-    let last = ring.get(ring.len() - 1).unwrap();
-    if last.state == SlotState::Empty && ring.iter().all(|s| s.state == SlotState::Empty) {
-        return None;
-    }
-    Some(last.epoch)
 }
 
 fn effective_state_of(slot: &sylox_types::RingSlot, now: u64) -> SlotState {
@@ -856,7 +899,7 @@ fn check_depeg(
     def: &EventDefinition,
 ) -> Result<u64, Error> {
     let ring = oracle.ring(asset);
-    let newest_epoch = newest_epoch_in(&ring).ok_or(Error::Tier1CheckFailed)?;
+    let newest_epoch = oracle.newest_epoch(asset).ok_or(Error::Tier1CheckFailed)?;
     let now = env.ledger().timestamp();
 
     let window_epochs = def.depeg_window_secs / EPOCH_SECS;
@@ -918,7 +961,7 @@ fn check_issuer_freeze(
     def: &EventDefinition,
 ) -> Result<u64, Error> {
     let ring = oracle.ring(asset);
-    let newest_epoch = newest_epoch_in(&ring).ok_or(Error::Tier1CheckFailed)?;
+    let newest_epoch = oracle.newest_epoch(asset).ok_or(Error::Tier1CheckFailed)?;
     let now = env.ledger().timestamp();
 
     let window_epochs: u64 = BASELINE_EPOCHS;
@@ -994,6 +1037,74 @@ fn median(values: &Vec<i128>) -> i128 {
 /// design note Section 5. Returns the cure outcome for a Depeg event's
 /// cure window, `[proposed_at, proposed_at + challenge_secs)` by close
 /// time (review item D1).
+/// PR #15 review, finding F2: scans the cure window and records the
+/// result of every epoch whose disposition is currently Final or
+/// PermanentlyMissing into `event_id`'s own persisted `CureProgress`,
+/// merging with whatever was already recorded (recording is monotonic,
+/// see `CureProgress`'s own doc comment). An epoch whose disposition
+/// is NotReady is skipped, not stopped on: a later epoch in the window
+/// disputed or still Pending must never block recording an EARLIER
+/// epoch that is already decidable, because that earlier epoch is the
+/// one at risk of rotating out of the ring first. Returns the merged
+/// progress; never errors on "nothing new to record."
+fn record_cure_progress(
+    env: &Env,
+    oracle: &RiskOracleClient,
+    record: &EventRecord,
+    def: &EventDefinition,
+) -> storage::CureProgress {
+    let ring = oracle.ring(&record.asset);
+    let now = env.ledger().timestamp();
+    let newest_epoch = oracle.newest_epoch(&record.asset).unwrap_or(0);
+
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch_close = record.proposed_at + def.challenge_secs;
+    let last_cure_epoch = last_cure_epoch_close / EPOCH_SECS;
+
+    let mut progress = storage::get_cure_progress(env, record.id);
+    let mut epoch = first_cure_epoch;
+    let mut bit = 0u32;
+    while epoch < last_cure_epoch {
+        let mask = 1u128 << bit;
+        if progress.recorded & mask == 0 {
+            let slot = slot_for_epoch(&ring, newest_epoch, epoch);
+            match epoch_disposition(slot.as_ref(), epoch, now) {
+                EpochDisposition::NotReady => {}
+                EpochDisposition::PermanentlyMissing => {
+                    progress.recorded |= mask;
+                    progress.any_missing = true;
+                }
+                EpochDisposition::Final(peg_ratio) => {
+                    progress.recorded |= mask;
+                    if peg_ratio < def.cure_threshold {
+                        progress.any_below_threshold = true;
+                    }
+                }
+            }
+        }
+        epoch += 1;
+        bit += 1;
+    }
+    storage::set_cure_progress(env, record.id, &progress);
+    progress
+}
+
+/// design note Section 5, as amended by PR #15 review finding F2: the
+/// cure window, `[proposed_at, proposed_at + challenge_secs)` by close
+/// time (review item D1), is checked against PERSISTED progress
+/// (`record_cure_progress`), not a live re-scan alone, because the
+/// oracle's own ring only holds `RING_SLOTS` epochs — a cure-window
+/// epoch that becomes decidable while still inside the ring must be
+/// recorded before it rotates out, or a late `finalize` call
+/// misreads it as missing (finding F2's own worked example).
+///
+/// Decision order: an already-recorded failure (missing or below
+/// threshold) declares immediately, even while other epochs are
+/// still NotReady — one failure already rules out a cure, so there is
+/// nothing to gain by waiting on the rest. Only once there is no
+/// recorded failure does an unrecorded NotReady epoch block the
+/// decision. Cured requires every cure-window epoch recorded and
+/// clean.
 fn cure_outcome(
     env: &Env,
     config: &Config,
@@ -1001,35 +1112,31 @@ fn cure_outcome(
     def: &EventDefinition,
 ) -> Result<CureOutcome, Error> {
     let oracle = RiskOracleClient::new(env, &config.oracle);
-    let ring = oracle.ring(&record.asset);
-    let now = env.ledger().timestamp();
-    let newest_epoch = newest_epoch_in(&ring).unwrap_or(0);
+    let progress = record_cure_progress(env, &oracle, record, def);
 
-    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
-    let last_cure_epoch_close = record.proposed_at + def.challenge_secs;
-    let last_cure_epoch = last_cure_epoch_close / EPOCH_SECS;
-
-    let mut any_missing = false;
-    let mut any_below_threshold = false;
-    let mut epoch = first_cure_epoch;
-    while epoch < last_cure_epoch {
-        let slot = slot_for_epoch(&ring, newest_epoch, epoch);
-        match epoch_disposition(slot.as_ref(), epoch, now) {
-            EpochDisposition::NotReady => return Ok(CureOutcome::NotReady),
-            EpochDisposition::PermanentlyMissing => any_missing = true,
-            EpochDisposition::Final(peg_ratio) => {
-                if peg_ratio < def.cure_threshold {
-                    any_below_threshold = true;
-                }
-            }
-        }
-        epoch += 1;
+    if progress.any_missing || progress.any_below_threshold {
+        return Ok(CureOutcome::Declared);
     }
 
-    if any_missing || any_below_threshold {
-        Ok(CureOutcome::Declared)
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + def.challenge_secs) / EPOCH_SECS;
+    let cure_epochs = last_cure_epoch.saturating_sub(first_cure_epoch) as u32;
+    // Finding F3: `validate_definition_params` guarantees at least one
+    // cure epoch; this is a defensive second line, never reachable
+    // for a definition registered through this build.
+    if cure_epochs == 0 {
+        return Ok(CureOutcome::Declared);
+    }
+    let all_recorded = if cure_epochs >= 128 {
+        false
     } else {
+        let full_mask = (1u128 << cure_epochs) - 1;
+        progress.recorded & full_mask == full_mask
+    };
+    if all_recorded {
         Ok(CureOutcome::Cured)
+    } else {
+        Ok(CureOutcome::NotReady)
     }
 }
 

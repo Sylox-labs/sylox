@@ -22,6 +22,10 @@ pub trait RiskOracle {
     fn set_event_band(env: Env, asset: Address);
     fn clear_event_band(env: Env, asset: Address);
     fn set_event_in_progress(env: Env, asset: Address, in_progress: bool);
+    /// PR #15 review, finding F4: the real newest epoch ever posted,
+    /// independent of whether that epoch's own ring position is
+    /// currently `Empty` (overturned, not yet reposted).
+    fn newest_epoch(env: Env, asset: Address) -> Option<u64>;
 }
 
 /// The slice of `Staking`'s API (Section 12.3) that `EventRegistry`

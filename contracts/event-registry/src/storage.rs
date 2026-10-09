@@ -59,6 +59,51 @@ pub enum DataKey {
     /// which is exactly the state a fresh key with no `left_at` at all
     /// should read as.
     LeftAt(Address, EventKind, u32),
+    /// PR #15 review, finding F2: a Depeg event's own cure-window
+    /// progress recorded so far, by event id. `RiskOracle`'s ring
+    /// only holds `RING_SLOTS` epochs; a cure-window epoch that
+    /// becomes Final or permanently missing while still inside the
+    /// ring must be recorded before it rotates out, or its result is
+    /// lost and the epoch reads as missing forever after — see
+    /// `CureProgress`'s own doc comment.
+    CureProgress(u64),
+}
+
+/// PR #15 review, finding F2. Bit `i` of `recorded` is set once the
+/// cure-window epoch `first_cure_epoch + i` has been observed Final or
+/// PermanentlyMissing at least once; `any_below_threshold`/
+/// `any_missing` are the OR of every such observation so far. A `u128`
+/// bitmap comfortably covers the up-to-72 cure epochs `challenge_secs`
+/// can specify (finding F3's own bound), with headroom to spare.
+/// Deliberately never clears a bit once set: a disposition, once
+/// observed Final or PermanentlyMissing, cannot change (an epoch that
+/// is genuinely Final never reverts to Pending or Disputed, and
+/// PermanentlyMissing is a statement about elapsed time, which never
+/// un-elapses), so recording is monotonic and `checkpoint_cure` is
+/// naturally idempotent.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CureProgress {
+    pub recorded: u128,
+    pub any_below_threshold: bool,
+    pub any_missing: bool,
+}
+
+pub fn get_cure_progress(env: &Env, event_id: u64) -> CureProgress {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CureProgress(event_id))
+        .unwrap_or(CureProgress {
+            recorded: 0,
+            any_below_threshold: false,
+            any_missing: false,
+        })
+}
+
+pub fn set_cure_progress(env: &Env, event_id: u64, progress: &CureProgress) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CureProgress(event_id), progress);
 }
 
 pub fn get_config(env: &Env) -> Option<Config> {

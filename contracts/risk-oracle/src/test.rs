@@ -1883,6 +1883,44 @@ fn event_in_progress_reads_the_flag_directly_with_no_auth() {
     assert!(!fx.client.event_in_progress(&asset));
 }
 
+/// PR #15 review, finding F4: `newest_epoch` must keep reporting the
+/// real newest epoch ever written even when that epoch's own ring
+/// POSITION is currently `Empty` (overturned, not yet reposted) —
+/// unlike reading the position's own stored `.epoch`, which resets to
+/// 0 on an empty slot.
+#[test]
+fn newest_epoch_survives_an_overturn_of_the_newest_slot() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let governor_client = crate::mocks::MockGovernorClient::new(&env, &governor);
+    governor_client.set_committee(&Address::generate(&env));
+
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&asset_config(&env, &asset, &issuer));
+    post(&env, &client, &asset, 5, 9_900_000);
+    assert_eq!(client.newest_epoch(&asset), Some(5));
+
+    let disputer = Address::generate(&env);
+    client.dispute_signals(&disputer, &asset, &5, &BytesN::from_array(&env, &[9u8; 32]));
+    client.resolve_signal_dispute(&asset, &5, &false, &BytesN::from_array(&env, &[0u8; 32]));
+
+    // Epoch 5's own ring position is now Empty, but it is still the
+    // newest epoch anyone ever posted.
+    assert!(client.ring(&asset).iter().all(|slot| slot.epoch != 5));
+    assert_eq!(
+        client.newest_epoch(&asset),
+        Some(5),
+        "an overturned newest slot must not make newest_epoch regress to None or 0"
+    );
+}
+
 // -- Required error coverage: Unauthorized, NotInitialized, MathOverflow --
 
 /// `Error::Unauthorized` (3) is never returned by any production call

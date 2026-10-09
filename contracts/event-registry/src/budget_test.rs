@@ -280,3 +280,94 @@ fn budget_finalize_cure_against_a_full_challenge_window() {
     );
     assert_under_half(&estimate, "finalize (cure)");
 }
+
+/// PR #15 review, findings F2/F3: `challenge_secs` at its own new
+/// upper bound (`MAX_CURE_EPOCHS`, 72 epochs), the largest cure-window
+/// scan either `checkpoint_cure` or `finalize` can ever be asked to
+/// do in this build.
+fn depeg_definition_full_cure_window(asset: &Address) -> EventDefinition {
+    let mut def = depeg_definition(asset);
+    def.challenge_secs = 72 * EPOCH_SECS;
+    def
+}
+
+#[test]
+fn budget_checkpoint_cure_against_a_full_72_epoch_cure_window() {
+    let env = Env::default();
+    let (client, oracle) = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    oracle.add_asset(&asset_config(&env, &asset, &issuer));
+    client.register_definition(&depeg_definition_full_cure_window(&asset));
+
+    let keeper = Address::generate(&env);
+    post_failing_depeg_window(&env, &oracle, &keeper, &asset);
+    let id = client.propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let record = client.event(&id).unwrap();
+
+    // Post every epoch across the full 72-epoch cure window, above
+    // cure_threshold: the worst case for checkpoint_cure's own scan,
+    // every epoch newly decidable in a single call.
+    let challenge_secs = 72 * EPOCH_SECS;
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + challenge_secs) / EPOCH_SECS;
+    for epoch in first_cure_epoch..last_cure_epoch {
+        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
+        oracle.post_signals(
+            &keeper,
+            &asset,
+            &signal_set(&env, &keeper, epoch, 9_900_000),
+        );
+    }
+    let now = record.proposed_at + challenge_secs;
+    env.ledger()
+        .set_timestamp(now.max(env.ledger().timestamp()) + 7_200 + 1);
+
+    client.checkpoint_cure(&id);
+
+    let estimate = env.cost_estimate();
+    print_resources(
+        "checkpoint_cure, Depeg, every epoch across a full 72-epoch cure window newly decidable",
+        &estimate,
+    );
+    assert_under_half(&estimate, "checkpoint_cure");
+}
+
+#[test]
+fn budget_finalize_cure_against_a_full_72_epoch_cure_window() {
+    let env = Env::default();
+    let (client, oracle) = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    oracle.add_asset(&asset_config(&env, &asset, &issuer));
+    client.register_definition(&depeg_definition_full_cure_window(&asset));
+
+    let keeper = Address::generate(&env);
+    post_failing_depeg_window(&env, &oracle, &keeper, &asset);
+    let id = client.propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let record = client.event(&id).unwrap();
+
+    let challenge_secs = 72 * EPOCH_SECS;
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + challenge_secs) / EPOCH_SECS;
+    for epoch in first_cure_epoch..last_cure_epoch {
+        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
+        oracle.post_signals(
+            &keeper,
+            &asset,
+            &signal_set(&env, &keeper, epoch, 9_900_000),
+        );
+    }
+    let now = record.proposed_at + challenge_secs;
+    env.ledger()
+        .set_timestamp(now.max(env.ledger().timestamp()) + 7_200 + 1);
+
+    client.finalize(&id);
+
+    let estimate = env.cost_estimate();
+    print_resources(
+        "finalize, Depeg cure, every epoch across a full 72-epoch cure window Final",
+        &estimate,
+    );
+    assert_under_half(&estimate, "finalize (full cure window)");
+}
