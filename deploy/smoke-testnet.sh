@@ -95,32 +95,31 @@ else
   fail "EventRegistry.active_event_count(asset) == $out, expected 0"
 fi
 
-# -- Write: post one fresh epoch, confirm it becomes the newest --
+# -- Write: post one not-yet-posted closed epoch, confirm it reads
+#    back correctly --
 #
 # The freshest CLOSED epoch right now may already be posted (e.g.
 # deploy/post-demo-signals.sh just ran against this same asset), so
-# posting it again would fail with EpochAlreadyPosted. Pick whichever
-# is later: the freshest closed epoch, or one past whatever
-# newest_epoch already reports. If that lands on an epoch that
-# hasn't closed yet, wait for it: this is a smoke test proving
-# correctness, not a latency benchmark.
+# posting it again would fail with EpochAlreadyPosted, and the next
+# NEW epoch might not close for up to an hour: waiting for it would
+# make this smoke test impractically slow. Instead scan backward from
+# the freshest closed epoch, within the 72h backfill window, for the
+# first one `signals` reports as not yet posted, and post that one.
 
 EPOCH_SECS=3600
-current_newest="$(invoke_view "$RO_ID" newest_epoch --asset "$ASSET_ID")"
 NOW="$(date +%s)"
 freshest_closed=$(( NOW / EPOCH_SECS - 1 ))
-if [[ "$current_newest" != "null" && -n "$current_newest" ]]; then
-  FRESH_EPOCH=$(( current_newest + 1 > freshest_closed ? current_newest + 1 : freshest_closed ))
-else
-  FRESH_EPOCH="$freshest_closed"
-fi
-
-fresh_epoch_close=$(( (FRESH_EPOCH + 1) * EPOCH_SECS ))
-NOW="$(date +%s)"
-if (( fresh_epoch_close > NOW )); then
-  wait_secs=$(( fresh_epoch_close - NOW ))
-  echo "waiting ${wait_secs}s for epoch $FRESH_EPOCH to close before posting it..."
-  sleep "$wait_secs"
+FRESH_EPOCH=""
+for (( candidate = freshest_closed; candidate > freshest_closed - 72; candidate-- )); do
+  existing="$(invoke_view "$RO_ID" signals --asset "$ASSET_ID" --epoch "$candidate")"
+  if [[ "$existing" == "null" ]]; then
+    FRESH_EPOCH="$candidate"
+    break
+  fi
+done
+if [[ -z "$FRESH_EPOCH" ]]; then
+  fail "every epoch in the last 72h is already posted; cannot find an unposted epoch to test a write with"
+  FRESH_EPOCH="$freshest_closed"  # fall through so the rest of the script still runs; this path already failed above
 fi
 
 inputs_json=$(jq -nc --arg epoch "$FRESH_EPOCH" '{epoch: ($epoch|tonumber), smoke_test: true}')
