@@ -1,64 +1,103 @@
 # Sylox testnet configuration. technical-doc.md Section 22.3.
-# Contract ids are filled in by deploy.sh after each deployment step
-# (Section 22.2) and recorded in deployments/testnet.json.
+#
+# Contract ids are no longer filled in here: deploy/deploy.sh writes
+# every id, Wasm hash and address into deployments/testnet.json fresh
+# on each run instead, since testnet is wiped periodically and each
+# run deploys new contract instances. This file now holds only the
+# network endpoint and a record of parameter drift against the
+# compiled constants, kept for the next spec update.
 
 network = "testnet"
 rpc_url = "https://soroban-testnet.stellar.org"
 passphrase = "Test SDF Network ; September 2015"
 
-[contracts]
-governor = ""
-risk_oracle = ""
-event_registry = ""
-staking = ""
-treasury = ""
-market_factory = ""
-series_wasm_hash = ""
+# ---------------------------------------------------------------------
+# [params_compiled]: informational only, mirrors a real `const` in the
+# four MERGED contracts (risk-oracle, staking, treasury, event-registry).
+# These are NOT read by deploy.sh and setting them here changes
+# nothing: each is frozen at compile time in the contract that defines
+# it. Kept here so a human comparing this file to the code constants
+# doesn't have to go hunting; the const's own file:line is the actual
+# source of truth. Audited against the merged code on 2026-10-09
+# (main @ 47ce27d).
+# ---------------------------------------------------------------------
+[params_compiled]
+epoch_secs = 3_600                       # EPOCH_SECS, risk-oracle/src/lib.rs, staking/src/params.rs, event-registry/src/lib.rs (3 independent copies, by design, all agree)
+window_secs = 259_200                    # WINDOW_SECS, risk-oracle/src/lib.rs, event-registry/src/lib.rs
+signal_dispute_secs = 7_200              # SIGNAL_DISPUTE_SECS, risk-oracle/src/lib.rs, staking/src/params.rs
+signal_dispute_ruling_secs = 518_400     # SIGNAL_DISPUTE_RULING_SECS, risk-oracle/src/lib.rs. 6 days: lowered from 604_800 (7d) by PR #15 review finding F1, so the worst-case dispute timeline fits RiskOracle's own 240-epoch ring. Was MISSING from this file entirely before this audit.
+signal_dispute_bond = 10_000_000_000     # signal_dispute_bond(), risk-oracle/src/lib.rs: a private fn returning a hardcoded literal, not a named const. 1,000 TUSD-equivalent at 7 decimals.
+stale_after_epochs = 3                   # STALE_AFTER_EPOCHS, risk-oracle/src/lib.rs
+amm_tolerance_bps = 300                  # AMM_TOLERANCE_BPS, risk-oracle/src/lib.rs
+band_down_epochs = 3                     # BAND_DOWN_EPOCHS, risk-oracle/src/lib.rs
+keeper_bond = 50_000_000_000             # params::KEEPER_BOND, staking/src/params.rs. 5,000 at 7 decimals.
+keeper_slash = 10_000_000_000            # keeper_slash(), risk-oracle/src/lib.rs: a private fn with a hardcoded literal, not a named const in staking (the slash AMOUNT is owned and passed by RiskOracle.resolve_signal_dispute, the caller; staking itself has no slash-amount constant).
+keeper_max_faults = 3                    # params::KEEPER_MAX_FAULTS, staking/src/params.rs
+keeper_reward = 500_000                  # params::KEEPER_REWARD_PER_ACCEPTED_EPOCH, staking/src/params.rs. DRIFT FIXED: this file previously said 5_000_000 ("0.50 USDC"), the feat/staking ORIGINAL default. Spec v1.3 lowered it to 0.05 (500_000) for sustainable operating cost at target scale; the code has carried 500_000 since, this file didn't.
+unstake_cooldown_secs = 604_800          # params::UNSTAKE_COOLDOWN_SECS, staking/src/params.rs. RENAMED from this file's old generic "cooldown_secs": the const is specifically the voluntary-unstake cooldown, not a general protocol cooldown (no general cooldown constant exists).
+min_reporters = 3                        # params::MIN_REPORTERS, staking/src/params.rs
+reporter_stake = 10_000_000_000          # params::REPORTER_STAKE, staking/src/params.rs. 1,000 at 7 decimals.
+reporter_max_faults = 10                 # params::REPORTER_MAX_FAULTS, staking/src/params.rs
+reporter_slash_bps = 1_000               # params::REPORTER_SLASH_BPS, staking/src/params.rs. 10%.
+max_cure_epochs = 72                     # MAX_CURE_EPOCHS, event-registry/src/lib.rs. New since PR #15 review finding F3: challenge_secs must be a whole number of epochs, 1 to this bound.
 
-[tokens]
-usdc = ""
+# ---------------------------------------------------------------------
+# [params_runtime_defaults]: EventRegistry has no fallback const for
+# these three; cover_gate's own "no canonical definition registered
+# yet" fallback uses DEFAULT_DEPEG_WINDOW_SECS / DEFAULT_DEPEG_THRESHOLD
+# / DEFAULT_HALT_WINDOW_SECS (event-registry/src/lib.rs). The governing
+# value for a registered asset is always the EventDefinition field set
+# via register_definition (see [params_deploy_time] below) — these
+# three happen to share the same default values as what deploy.sh
+# passes into register_definition for the tracked asset's Depeg
+# definition, but that's this file's own deploy-time choice, not
+# something the contract enforces.
+# ---------------------------------------------------------------------
+[params_runtime_defaults]
+depeg_threshold = 9_500_000              # DEFAULT_DEPEG_THRESHOLD, event-registry/src/lib.rs. 0.95, SCALE 1e7.
+depeg_window_secs = 259_200              # DEFAULT_DEPEG_WINDOW_SECS, event-registry/src/lib.rs
+halt_window_secs = 259_200               # DEFAULT_HALT_WINDOW_SECS, event-registry/src/lib.rs. WithdrawalHalt itself is a known gap (not implemented); this default exists only for cover_gate's own endpoint-outage fallback window.
 
-[adapters]
-amm_soroswap = ""
-fx_reference = ""
-optimistic_oracle = ""
+# ---------------------------------------------------------------------
+# [params_deploy_time]: NOT compiled in anywhere. These are arguments
+# deploy.sh passes into register_definition's EventDefinition struct
+# (or, where noted, belong to a crate that isn't merged yet and so has
+# no contract to pass them to at all). Changing a value here only
+# matters the next time deploy.sh runs; it is never read by any
+# contract's own code.
+# ---------------------------------------------------------------------
+[params_deploy_time]
+# -- EventRegistry.register_definition arguments (Depeg, the tracked asset) --
+max_missing_epochs = 6                   # EventDefinition.max_missing_epochs. Of 72 window epochs, ADR-005.
+cure_threshold = 9_800_000               # EventDefinition.cure_threshold. 0.98, SCALE 1e7.
+challenge_secs = 86_400                  # EventDefinition.challenge_secs. 24h; validated as a whole number of epochs, 1-72 (max_cure_epochs above) since PR #15 review finding F3.
+ruling_deadline_secs = 1_209_600         # EventDefinition.ruling_deadline_secs. 14 days from escalation, ADR-002.
 
-# Defaults per technical-doc.md Section 23. Values are starting points to
-# revisit with testnet data; changes after launch go through the Governor.
-[params]
-epoch_secs = 3_600
-window_secs = 259_200
-signal_dispute_secs = 7_200
-signal_dispute_bond = 1_000_0000000      # 1,000 USDC, 7 decimals
-stale_after_epochs = 3
-amm_tolerance_bps = 300
-keeper_bond = 5_000_0000000
-keeper_slash = 1_000_0000000
-keeper_max_faults = 3
-keeper_reward = 5_000_000                # 0.50 USDC
-band_down_epochs = 3
+# -- Belongs to crates not yet merged (market-factory, series, Tier 2
+#    claims): no contract exists today to read any of these. Kept so
+#    the next spec update has the full list in one place, and so a
+#    future PR implementing market-factory/series has the intended
+#    defaults ready rather than needing to re-derive them.
+claim_bond = 20_000_000_000              # Tier 2 claim bond (event-registry's own doc comment references this as "Section 8.3", distinct from Tier 1's unbonded proposal path). No `claim_bond` field or constant exists anywhere yet; Tier 2 (claims) is out of scope for the merged contracts.
+challenge_multiplier = 1                 # No reference anywhere in the 4 merged crates.
+liquidity_cover_ratio = 2_500_000        # market-factory/series cover-sizing input. 0.25, SCALE 1e7. No reference in the 4 merged crates.
+max_series_per_asset = 4                 # market-factory cap. No reference in the 4 merged crates.
+min_deposit = 1_000_000_000              # series deposit floor. No reference in the 4 merged crates.
+max_quotes = 64                          # series quoting cap. No reference in the 4 merged crates.
+sale_cutoff_secs = 259_200               # series sale-window cutoff. No reference in the 4 merged crates.
+claim_window_secs = 2_592_000            # Tier 2 claim window. Do not confuse with staking's own FAULT_WINDOW_SECS (also 2_592_000 / 30d, staking/src/params.rs): same number, unrelated concept, coincidental match.
+fee_bps = 750                            # protocol fee on payouts. No reference in the 4 merged crates (Treasury's bucket model takes raw amounts, no bps fee calc anywhere yet).
+max_pause_secs = 1_209_600               # Governor pause cap. No reference in the 4 merged crates (Governor is a stub).
+grace_secs = 1_209_600                   # Governor-controlled grace period. No reference in the 4 merged crates. Not the same thing as staking's own derived KEEPER_EXIT_DELAY_SECS/REPORTER_EXIT_DELAY_SECS, which are a different "grace" concept with different values.
+
+# ---------------------------------------------------------------------
+# No `const` backs these at all, in any of the 4 merged crates, despite
+# this file's own stale header comment once claiming otherwise (the
+# comment on staking/src/params.rs module doc still lists probe_secs
+# and degraded_ms as "match exactly" the spec; no PROBE_SECS or
+# DEGRADED_MS const actually exists). Pure off-chain keeper/reporter
+# cadence parameters until a keeper/reporter-node service reads them.
+# ---------------------------------------------------------------------
+[params_no_contract_const]
 probe_secs = 900
 degraded_ms = 5_000
-min_reporters = 3
-reporter_stake = 1_000_0000000
-reporter_max_faults = 10
-reporter_slash_bps = 1_000
-depeg_threshold = 9_500_000              # 0.95, SCALE 1e7
-depeg_window_secs = 259_200
-max_missing_epochs = 6                   # of 72, ADR-005
-halt_window_secs = 259_200
-challenge_secs = 86_400
-ruling_deadline_secs = 1_209_600         # 14 days from escalation, ADR-002
-cure_threshold = 9_800_000               # 0.98, SCALE 1e7
-claim_bond = 2_000_0000000
-challenge_multiplier = 1
-cooldown_secs = 604_800
-liquidity_cover_ratio = 2_500_000        # 0.25, SCALE 1e7
-max_series_per_asset = 4
-min_deposit = 100_0000000
-max_quotes = 64
-sale_cutoff_secs = 259_200
-claim_window_secs = 2_592_000
-fee_bps = 750
-max_pause_secs = 1_209_600
-grace_secs = 1_209_600
