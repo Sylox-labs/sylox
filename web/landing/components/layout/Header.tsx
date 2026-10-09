@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import { ArrowUpRight, Menu, X } from "lucide-react";
 import { nav } from "@/content";
 import { setMobileMenuOpen } from "@/lib/motion/useMobileMenuOpen";
+import { useActiveSection } from "@/lib/motion/useActiveSection";
 
 function Logo() {
   return (
@@ -23,6 +24,12 @@ export function Header() {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
+
+  const sectionIds = useMemo(
+    () => nav.links.map((link) => link.href.replace("#", "")),
+    [],
+  );
+  const activeId = useActiveSection(sectionIds);
 
   useEffect(() => {
     setMobileMenuOpen(isMenuOpen);
@@ -152,16 +159,26 @@ export function Header() {
           </a>
 
           <nav className="hidden items-center gap-6 md:flex" aria-label="Primary">
-            {nav.links.map((link) => (
-              <a
-                key={link.href}
-                href={link.href}
-                className="group relative font-mono text-xs uppercase tracking-[0.1em] text-cyber-tin transition-colors hover:text-silo-oatmeal"
-              >
-                {link.label}
-                <span className="absolute -bottom-1 left-0 h-px w-0 bg-silo-oatmeal transition-all duration-200 group-hover:w-full" />
-              </a>
-            ))}
+            {nav.links.map((link) => {
+              const isActive = activeId === link.href.replace("#", "");
+              return (
+                <a
+                  key={link.href}
+                  href={link.href}
+                  aria-current={isActive ? "true" : undefined}
+                  className={`group relative font-mono text-xs uppercase tracking-[0.1em] transition-colors hover:text-silo-oatmeal ${
+                    isActive ? "text-silo-oatmeal" : "text-cyber-tin"
+                  }`}
+                >
+                  {link.label}
+                  <span
+                    className={`absolute -bottom-1 left-0 h-px bg-silo-oatmeal transition-all duration-200 group-hover:w-full ${
+                      isActive ? "w-full" : "w-0"
+                    }`}
+                  />
+                </a>
+              );
+            })}
             <a
               href={nav.github.href}
               target="_blank"
