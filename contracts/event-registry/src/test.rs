@@ -1240,6 +1240,71 @@ fn finalize_returns_data_not_final_for_a_late_posted_still_pending_epoch() {
     assert_eq!(fx.client.event(&id).unwrap().state, EventState::Cured);
 }
 
+/// Review item R3: a Disputed epoch in the cure window is not ready
+/// until the dispute resolves or times out (ADR-010).
+#[test]
+fn finalize_returns_data_not_final_while_a_cure_window_epoch_is_disputed() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+    post_failing_depeg_window(&env, &fx.oracle, &fx.keeper, &asset);
+    let id = fx
+        .client
+        .propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let record = fx.client.event(&id).unwrap();
+
+    let challenge_secs = 86_400u64;
+    let first_cure_epoch = record.proposed_at / EPOCH_SECS;
+    let last_cure_epoch = (record.proposed_at + challenge_secs) / EPOCH_SECS;
+    let disputed_epoch = last_cure_epoch - 1;
+    for epoch in first_cure_epoch..last_cure_epoch {
+        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
+        fx.oracle.post_signals(
+            &fx.keeper,
+            &asset,
+            &signal_set(&env, &fx.keeper, epoch, 9_900_000, 500_000_000_000),
+        );
+    }
+    // Dispute the last cure-window epoch while it is still Pending
+    // (before its own pending_until), so it never becomes Final on
+    // schedule.
+    fx.oracle.dispute_signals(
+        &Address::generate(&env),
+        &asset,
+        &disputed_epoch,
+        &BytesN::from_array(&env, &[2u8; 32]),
+    );
+
+    env.ledger()
+        .set_timestamp((record.proposed_at + challenge_secs).max(env.ledger().timestamp() + 1));
+    assert_eq!(
+        fx.client.try_finalize(&id),
+        Err(Ok(Error::DataNotFinal)),
+        "review item R3: a Disputed epoch is not ready until resolved or timed out"
+    );
+
+    // Time out the dispute (ADR-010's own silence-reads-as-keeper-wins
+    // default); the epoch becomes Final and finalize can now decide.
+    let now = env.ledger().timestamp();
+    env.ledger()
+        .set_timestamp(now + SIGNAL_DISPUTE_RULING_SECS + 1);
+    fx.oracle
+        .resolve_signal_dispute_timeout(&asset, &disputed_epoch);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+
+    fx.client.finalize(&id);
+    assert_eq!(
+        fx.client.event(&id).unwrap().state,
+        EventState::Cured,
+        "once the dispute times out the epoch is Final and above cure_threshold"
+    );
+}
+
 // -- rule --
 
 #[test]
@@ -1299,6 +1364,97 @@ fn rule_declare_false_releases_the_challenger_bond_in_full() {
         .bond(&sylox_types::BondKey::EventChallenge(id))
         .is_none());
     assert!(!fx.client.in_progress(&asset));
+}
+
+/// Review item E4: two kinds live on the same asset (Depeg,
+/// IssuerFreeze), each its own event sharing one `ActiveCount`.
+/// Rejecting one must not clear the oracle's `event_in_progress` flag
+/// while the other is still live.
+#[test]
+fn two_kinds_live_rejecting_one_leaves_event_in_progress_true() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle.add_asset(&asset_config(
+        &env,
+        &asset,
+        &issuer,
+        IssuerFlags {
+            auth_revocable: true,
+            clawback_enabled: false,
+        },
+    ));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+    fx.client
+        .register_definition(&issuer_freeze_definition(&env, &asset));
+
+    // One combined 240-epoch run: a healthy baseline (0..168), then a
+    // failing Depeg window (168..240) with an auth-revocation spike
+    // at epoch 200 (inside IssuerFreeze's own last-168-epoch window
+    // too), so both kinds trigger off the same posted data without
+    // double-posting any epoch.
+    for epoch in 0u64..240 {
+        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
+        let peg_ratio = if epoch < 168 { 9_900_000 } else { 9_000_000 };
+        let mut set = signal_set(&env, &fx.keeper, epoch, peg_ratio, 500_000_000_000);
+        if epoch == 200 {
+            set.issuer_actions = sylox_types::IssuerActions {
+                clawbacks: 1,
+                clawback_amount: 0,
+                auth_revocations: 4,
+                flag_changes: 0,
+            };
+        }
+        fx.oracle.post_signals(&fx.keeper, &asset, &set);
+    }
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
+
+    let depeg_id = fx
+        .client
+        .propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    let freeze_id = fx.client.propose_tier1(
+        &Address::generate(&env),
+        &asset,
+        &EventKind::IssuerFreeze,
+        &1,
+    );
+
+    assert_eq!(fx.client.active_event_count(&asset), 2);
+    assert!(fx.client.in_progress(&asset));
+    assert!(fx.oracle.event_in_progress(&asset));
+
+    // rule() requires Escalated; challenge the IssuerFreeze event
+    // first, then have the committee reject it.
+    fx.client.challenge(
+        &Address::generate(&env),
+        &freeze_id,
+        &BytesN::from_array(&env, &[1u8; 32]),
+    );
+    fx.client
+        .rule(&freeze_id, &false, &BytesN::from_array(&env, &[9u8; 32]));
+
+    assert_eq!(fx.client.active_event_count(&asset), 1);
+    assert!(
+        fx.client.in_progress(&asset),
+        "the Depeg event is still live"
+    );
+    assert!(
+        fx.oracle.event_in_progress(&asset),
+        "event_in_progress must stay true while any kind is still live"
+    );
+
+    fx.client.challenge(
+        &Address::generate(&env),
+        &depeg_id,
+        &BytesN::from_array(&env, &[2u8; 32]),
+    );
+    fx.client
+        .rule(&depeg_id, &false, &BytesN::from_array(&env, &[9u8; 32]));
+    assert!(!fx.client.in_progress(&asset));
+    assert!(!fx.oracle.event_in_progress(&asset));
 }
 
 #[test]
