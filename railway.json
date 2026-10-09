@@ -7,7 +7,8 @@
       "/web/shared/ui/**",
       "/package.json",
       "/package-lock.json",
-      "/railway.json"
+      "/railway.json",
+      "/railpack.json"
     ]
   },
   "deploy": {
