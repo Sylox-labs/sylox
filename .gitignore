@@ -7,7 +7,13 @@
 !.env.example
 node_modules/
 dist/
+# deploy/deploy.sh testnet writes deployments/testnet.json fresh every
+# run and it is committed (no secret key ever appears in it; see
+# deploy/deploy.sh's own header). Everything else under deployments/
+# (ad hoc local scratch, e.g. deploy/post-demo-signals.sh's own
+# inputs record) stays ignored.
 deployments/*.json
+!deployments/testnet.json
 
 # Sylox landing page (web/landing/_moodboard is reference-only, never shipped)
 web/landing/_moodboard/
