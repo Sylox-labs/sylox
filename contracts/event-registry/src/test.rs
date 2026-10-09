@@ -1149,20 +1149,18 @@ fn propose_tier1_issuer_freeze_succeeds_on_revocations_above_threshold() {
     assert!(fx.client.event(&id).is_some());
 }
 
-/// PR #25 review: `check_issuer_freeze`'s own history guard
-/// (`newest_epoch + 1 < window_epochs`, `window_epochs ==
-/// BASELINE_EPOCHS == 168`) compared an absolute epoch number to
-/// 168. Unlike `check_depeg`'s own Depeg-window loop, this function
-/// has no missing-epoch tally of its own: `clawback_sum`/
-/// `revocation_sum` just accumulate whatever real data exists in the
-/// window. On a real network (every other test in this suite starts
-/// at epoch 0, which hides this), the guard never fires regardless of
-/// how little real history the asset has, so a brand-new asset could
-/// trigger IssuerFreeze from a handful of hours of data instead of
-/// the 7-day pattern (ADR-005, Section 8.2) the check is supposed to
-/// require.
+/// PR #27 review (round 2): `check_issuer_freeze` deliberately has no
+/// minimum-history requirement, unlike `check_depeg`'s liquidity
+/// baseline. A sparse window can only undercount
+/// `clawback_sum`/`revocation_sum`, never inflate them, so there is no
+/// false-trigger risk to gate against; "not enough history to rely on
+/// this asset" is a cover-sale concern (MarketFactory's job), not a
+/// payout-trigger one. A newly tracked asset (far fewer than 168
+/// epochs of history, at a realistic epoch base) with a genuine
+/// revocation spike above `auth_revocation_threshold` must still be
+/// able to trigger IssuerFreeze.
 #[test]
-fn propose_tier1_issuer_freeze_fails_closed_with_not_enough_history_at_a_realistic_epoch() {
+fn propose_tier1_issuer_freeze_succeeds_with_fewer_than_168_epochs_of_history() {
     const REALISTIC_EPOCH_BASE: u64 = 497_000;
     let env = Env::default();
     let fx = setup(&env);
@@ -1181,9 +1179,7 @@ fn propose_tier1_issuer_freeze_fails_closed_with_not_enough_history_at_a_realist
         .register_definition(&issuer_freeze_definition(&env, &asset));
 
     // Only 24 real epochs of history, with a genuine revocation spike
-    // that would pass the threshold check on its own merits (4 >
-    // auth_revocation_threshold of 3) if the history guard let it
-    // through.
+    // (4 > auth_revocation_threshold of 3).
     for i in 0..24u64 {
         let epoch = REALISTIC_EPOCH_BASE + i;
         env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
@@ -1201,42 +1197,262 @@ fn propose_tier1_issuer_freeze_fails_closed_with_not_enough_history_at_a_realist
     let now = env.ledger().timestamp();
     env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
 
-    let result = fx.client.try_propose_tier1(
-        &Address::generate(&env),
-        &asset,
-        &EventKind::IssuerFreeze,
-        &1,
-    );
-    assert_eq!(
-        result,
-        Err(Ok(Error::Tier1CheckFailed)),
-        "24 epochs of real history at a realistic epoch base must fail closed, \
-         not pass on a revocation spike the asset hasn't had enough history to \
-         genuinely support"
-    );
-
-    // Posting up through a genuine 168 epochs of history (continuing
-    // from where the above left off, same revocation spike already
-    // recorded) must now let the check through.
-    for i in 24..168u64 {
-        let epoch = REALISTIC_EPOCH_BASE + i;
-        env.ledger().set_timestamp((epoch + 1) * EPOCH_SECS);
-        fx.oracle.post_signals(
-            &fx.keeper,
-            &asset,
-            &signal_set(&env, &fx.keeper, epoch, 10_000_000, 500_000_000_000),
-        );
-    }
-    let now = env.ledger().timestamp();
-    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
-
     let id = fx.client.propose_tier1(
         &Address::generate(&env),
         &asset,
         &EventKind::IssuerFreeze,
         &1,
     );
-    assert!(fx.client.event(&id).is_some());
+    assert!(
+        fx.client.event(&id).is_some(),
+        "a genuine revocation spike must trigger IssuerFreeze even with \
+         only 24 epochs of real history; history is a cover-sale gate, \
+         not a payout-trigger gate"
+    );
+}
+
+/// PR #27 review (round 2): `first_epoch` alone proves CALENDAR time
+/// has elapsed since the asset's first post, not that the baseline
+/// window `check_depeg` reads is actually populated. Post one
+/// baseline epoch at a realistic base, go dark for 168+ epochs, then
+/// resume with a failing 72-epoch Depeg window immediately. The
+/// `first_epoch`-based guard (`window_start_epoch < first_epoch +
+/// 168`) is satisfied by calendar time alone, but the baseline range
+/// `[baseline_start, window_start_epoch)` no longer contains that one
+/// real epoch, except right at its edge.
+#[test]
+fn propose_tier1_depeg_fails_closed_with_an_empty_baseline_after_a_168_epoch_gap() {
+    const REALISTIC_EPOCH_BASE: u64 = 497_000;
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+
+    // One real baseline epoch at the realistic base (becomes
+    // first_epoch), then total silence until the Depeg window itself
+    // starts 168 + 72 epochs later, so window_start_epoch sits at
+    // exactly first_epoch + 168 + 72 - and the baseline range
+    // [window_start_epoch - 168, window_start_epoch) contains none of
+    // it (the single real epoch, at REALISTIC_EPOCH_BASE, is 72
+    // epochs before baseline_start).
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        REALISTIC_EPOCH_BASE,
+        1,
+        9_900_000,
+        500_000_000_000,
+    );
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        REALISTIC_EPOCH_BASE + 1 + 168,
+        72,
+        9_000_000,
+        500_000_000_000,
+    );
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
+
+    let result =
+        fx.client
+            .try_propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Tier1CheckFailed)),
+        "a baseline range containing zero real epochs (the one real \
+         epoch this asset ever posted having already rotated out of \
+         [baseline_start, window_start_epoch)) must fail closed; \
+         first_epoch alone (calendar time) is not sufficient"
+    );
+}
+
+/// Sharper variant of the above: the baseline range contains exactly
+/// ONE real epoch (not zero), so `liquidity_values.is_empty()` does
+/// NOT catch it, yet 167 of the 168 baseline slots are still missing.
+/// Exercises the new `MIN_BASELINE_FINAL_EPOCHS` minimum-count gate
+/// (1 is far below the 96 required).
+#[test]
+fn propose_tier1_depeg_fails_closed_with_a_single_real_epoch_baseline_after_a_168_epoch_gap() {
+    const REALISTIC_EPOCH_BASE: u64 = 497_000;
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+
+    // One real baseline epoch at the realistic base (first_epoch),
+    // then silence until exactly 168 epochs before the Depeg window
+    // starts, so that one real epoch is the OLDEST epoch inside
+    // [baseline_start, window_start_epoch) rather than outside it.
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        REALISTIC_EPOCH_BASE,
+        1,
+        9_900_000,
+        500_000_000_000,
+    );
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        REALISTIC_EPOCH_BASE + 168,
+        72,
+        9_000_000,
+        500_000_000_000,
+    );
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
+
+    let result =
+        fx.client
+            .try_propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Tier1CheckFailed)),
+        "a baseline backed by a single real epoch out of 168 must \
+         fail closed; liquidity_values.is_empty() alone only catches \
+         the all-missing extreme, not a near-empty one"
+    );
+}
+
+/// Exact boundary of `MIN_BASELINE_FINAL_EPOCHS` (96 = 168 - 72, one
+/// full backfill window's worth of tolerated gap): a baseline with
+/// exactly 96 real epochs (the other 72 missing in the middle of the
+/// baseline, matching the system's own designed backfill tolerance)
+/// must pass. The asset's very first post is at epoch 0, so
+/// `first_epoch` = 0 and the calendar guard
+/// (`window_start_epoch >= first_epoch + 168`) is satisfied the same
+/// way every other realistic-epoch-base test in this file satisfies
+/// it, isolating this test to the minimum-count gate alone.
+#[test]
+fn propose_tier1_depeg_succeeds_with_exactly_the_minimum_baseline_final_epochs() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+
+    // Epoch 0 only (sets first_epoch), then a 72 epoch gap, then 95
+    // more real epochs (1 + 95 = 96 real baseline epochs total), then
+    // a genuinely failing 72 epoch window.
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        0,
+        1,
+        9_900_000,
+        500_000_000_000,
+    );
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        73,
+        95,
+        9_900_000,
+        500_000_000_000,
+    );
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        168,
+        72,
+        9_000_000,
+        500_000_000_000,
+    );
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
+
+    let id = fx
+        .client
+        .propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    assert!(
+        fx.client.event(&id).is_some(),
+        "exactly 96 real baseline epochs (168 - 72, one full backfill \
+         window of gap) must be enough to pass"
+    );
+}
+
+#[test]
+fn propose_tier1_depeg_fails_closed_with_one_fewer_than_the_minimum_baseline_final_epochs() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(&env, &asset));
+
+    // Epoch 0 only (sets first_epoch), then a 73 epoch gap, then 94
+    // more real epochs (1 + 94 = 95 real baseline epochs total), one
+    // fewer than the minimum.
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        0,
+        1,
+        9_900_000,
+        500_000_000_000,
+    );
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        74,
+        94,
+        9_900_000,
+        500_000_000_000,
+    );
+    post_run(
+        &env,
+        &fx.oracle,
+        &fx.keeper,
+        &asset,
+        168,
+        72,
+        9_000_000,
+        500_000_000_000,
+    );
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + SIGNAL_DISPUTE_SECS + 1);
+
+    let result =
+        fx.client
+            .try_propose_tier1(&Address::generate(&env), &asset, &EventKind::Depeg, &1);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Tier1CheckFailed)),
+        "95 real baseline epochs, one fewer than MIN_BASELINE_FINAL_EPOCHS \
+         (96), must fail closed"
+    );
 }
 
 #[test]

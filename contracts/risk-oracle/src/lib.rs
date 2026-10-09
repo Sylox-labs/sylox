@@ -1214,7 +1214,18 @@ fn recompute_score(env: &Env, asset: &Address, newest_final: u64) -> Result<(), 
     let cfg = storage::get_asset_config(env, asset).ok_or(Error::UnknownAsset)?;
     let formula = storage::get_formula(env).ok_or(Error::NotInitialized)?;
     let l_target = l_target_for(&cfg);
-    let aggregates = score::aggregate_from_ring(env, asset, newest_final, first_epoch)?;
+    // PR #27 review (round 2): aggregate_from_ring now also fails
+    // with AggregationFailed when the window is calendar-eligible but
+    // too sparse (MIN_AGGREGATE_FINAL_SLOTS). Every other "not enough
+    // history yet" condition in this function degrades to Ok(()),
+    // i.e. post_signals must never abort just because a score could
+    // not yet be computed; match that here instead of propagating the
+    // error out of post_signals via `?`.
+    let aggregates = match score::aggregate_from_ring(env, asset, newest_final, first_epoch) {
+        Ok(aggregates) => aggregates,
+        Err(Error::AggregationFailed) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let score::ScoreResult {
         score: raw,
         forced_warning,
