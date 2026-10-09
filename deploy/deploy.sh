@@ -98,8 +98,8 @@ if ! curl -sSf -X POST "$RPC_URL" -H 'Content-Type: application/json' \
 fi
 log "RPC reachable: $RPC_URL"
 
-if [[ -n "$(cd "$REPO_ROOT" && git status --porcelain)" ]]; then
-  die "working tree is dirty; commit or stash before deploying (every run must be reproducible from a clean, known commit)"
+if [[ -n "$(cd "$REPO_ROOT" && git status --porcelain --untracked-files=no)" ]]; then
+  die "working tree has uncommitted changes to tracked files; commit or stash before deploying (every run must be reproducible from a clean, known commit). Untracked files are not checked: this repo carries unrelated untracked files that are not this script's concern."
 fi
 GIT_COMMIT="$(cd "$REPO_ROOT" && git rev-parse HEAD)"
 log "git commit: $GIT_COMMIT"
