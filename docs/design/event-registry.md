@@ -11,27 +11,52 @@ Scope: `register_definition`, `propose_tier1` (Depeg, IssuerFreeze), `challenge`
 | From | To | Trigger | Who | Exact time condition |
 | --- | --- | --- | --- | --- |
 | None | Proposed | `propose_tier1` passes checks | Anyone | Checks pass now; no time gate on entry |
-| None (stale Cured/Rejected) | None | Lazy, checked inside the next `propose_tier1` for the same (asset, kind, version) | Anyone | `now >= left_at + cooldown_secs` |
+| None (Cured/Rejected, new data) | None | Lazy, checked inside the next `propose_tier1` for the same (asset, kind, version) | Anyone | The new proposal's own `window_start` is strictly after `left_at` (the time the prior event left Proposed/Escalated into Cured or Rejected); see Section 2a |
 | Proposed | Escalated | `challenge` with bond | Anyone | Inside `challenge_secs` of `proposed_at`; escalates in the SAME call, so `Challenged` is never an observed storage value, only the diagram's name for this instant |
-| Proposed | Declared | `finalize`, no challenge ever posted | Anyone | `now >= proposed_at + challenge_secs` |
-| Proposed | Cured | `finalize`, Depeg only | Anyone | `now >= proposed_at + challenge_secs` AND every epoch in the window is effectively Final AND all are `>= cure_threshold` |
+| Proposed | Declared | `finalize`, no challenge, cure window data settled (every epoch Final or permanently missing) with at least one present epoch below `cure_threshold`, or no present epoch at all | Anyone | `now >= proposed_at + challenge_secs` AND no cure-window epoch is "not ready" (Section 5) |
+| Proposed | Cured | `finalize`, Depeg only, no challenge | Anyone | `now >= proposed_at + challenge_secs` AND no cure-window epoch is "not ready" AND every PRESENT (Final) cure-window epoch is `>= cure_threshold` (Section 5) |
+| Proposed | Proposed (no transition) | `finalize` while some cure-window epoch is still "not ready" | Anyone | Returns `DataNotFinal`; callable again later (Section 5) |
 | Escalated | Declared / Rejected | `rule(declare, reason)` | Committee | Before `escalated_at + ruling_deadline_secs` |
 | Escalated | Declared (Tier 1 only) | `resolve_timeout` | Anyone | `now >= escalated_at + ruling_deadline_secs` |
-| Cured / Rejected | None | cooldown elapses | n/a (lazy, see above) | `now >= left_at + cooldown_secs` |
+| Cured / Rejected | None | a later proposal with `window_start > left_at` | Anyone (that later proposal's own caller) | See Section 2a; no time-based cooldown |
 | Declared | (terminal) | none | n/a | No function ever leaves Declared |
 
-Two implicit points this table makes explicit: (1) `Challenged` has no independent lifetime — `challenge` writes `Escalated` directly, per Section 8.1's own "no event can sit in Challenged with no clock running." (2) Cooldown is lazy: there is no sweep function; `propose_tier1` itself recognizes an expired `Cured`/`Rejected` record as `None` before running its own checks.
+Two implicit points this table makes explicit: (1) `Challenged` has no independent lifetime — `challenge` writes `Escalated` directly, per Section 8.1's own "no event can sit in Challenged with no clock running." (2) **Revised (review item D4): re-proposal is gated by new data, not a time cooldown.** There is no `cooldown_secs` and no sweep function; `propose_tier1` itself recognizes a stale `Cured`/`Rejected` record as `None`, but only once the NEW proposal's own computed `window_start` is strictly after the OLD event's `left_at` (Section 2a).
 
 ## 2. Definition versions (lead decision)
 
 `propose_tier1(caller, asset, kind, version) -> u64`. Deviates from Section 8.1/8.2/8.8 and ADR-001, which take only (asset, kind) and always the canonical version. Reason: a series pins the version canonical when it opened; a newer version can supersede that one while the series is still live, and a real failure discovered after that point must still be provable against the OLDER, still-pinned version, or Section 8.6's coverage rule can never actually pay that series out.
 
-Rules:
-- `version` must be registered (`UnknownDefinition` otherwise, which already covers "no such version").
-- `version` must not be retired: retired = a strictly newer version exists AND no live series still pins it. **Until `MarketFactory` exists (out of scope here), this can never be observed true, so every non-canonical version is treated as proposable.** Conservative in the safe direction; costs nothing but a slightly longer proposable window.
-- Not definition shopping: every nameable version was itself a real, governance-approved canonical definition at some point, under the ordinary `register_definition` checks. There is no larger space of definitions to pick from, only a wider span of time an already-approved one can still be asserted against.
+**Revised (review item D3): accepting ANY registered version was wrong — it is a free grief.** `Event` is a sticky, asset-wide band (Section 6.3) that blocks every series on the asset, not only series pinned to the proposed version. A version superseded for being too loose (for example, a Depeg definition governance tightened after finding its `depeg_threshold` too easy to trigger) would otherwise still let anyone propose a free (unbonded, Section 8.2) Tier 1 event against the ORIGINAL, looser version, forcing `Event` onto the whole asset under a rule the CURRENT definition would not have triggered under. Since Tier 1 posts no bond, nothing stops this from being tried speculatively, repeatedly, for free.
 
-`covers()` is unchanged (Section 8.6): it already compares the EVENT's own `def_version` against the series' pinned version, so this decision is what finally makes that comparison do real work for a superseded version. `current_version`/`definition` reads are unaffected.
+Corrected rules:
+- `version` must be registered (`UnknownDefinition` otherwise).
+- **`version` is accepted only if it is the current canonical version, OR is pinned by at least one live series.** The series check is routed through one function, `version_has_live_cover(asset, kind, version) -> bool`, so there is exactly one place to change when `MarketFactory` ships. Until `MarketFactory` exists (out of scope here), `version_has_live_cover` always returns `false` — so in THIS phase, `propose_tier1` only ever accepts the canonical version, exactly as the un-amended spec already specifies, and the version parameter stays in the signature inert until `MarketFactory` gives it something real to check.
+- Not definition shopping within what IS accepted: a non-canonical version only becomes proposable once a real, live series can be shown to still depend on it, never merely because it was once registered.
+
+**Asset-wide effects happen only for a canonical-version event (D3.b):** `ActiveCount(asset)` (Section 6), the `set_event_in_progress` push, and `set_event_band` are updated ONLY when the event's own `def_version` equals `current_version(asset, kind)` at the time of the relevant transition. A non-canonical event (reachable only once `MarketFactory` exists and a live series still pins an older version) affects exactly what `covers()` already scopes it to: payout for series pinned to that specific version, nothing asset-wide. Concretely:
+
+- `propose_tier1` against a non-canonical version does NOT increment `ActiveCount(asset)` and does NOT push `set_event_in_progress(asset, true)`.
+- `finalize`/`rule`/`resolve_timeout` reaching Declared for a non-canonical-version event does NOT call `set_event_band(asset)`.
+- `cover_gate(asset)`'s own `EventInProgress` check (Section 8) reads `ActiveCount(asset)` exactly as before, which, under this correction, now only ever reflects canonical-version activity — so it is unaffected by this change in behavior, only in which proposals can increment it in the first place.
+
+This also resolves a question the first draft of this note left implicit: since the only version `propose_tier1` can target in this phase is canonical, EVERY Tier 1 event in this phase IS a canonical-version event by construction, and the asset-wide/series-only distinction above is a no-op until `MarketFactory` exists — exactly like the version-acceptance rule it depends on. The design is written for the general case now so no further change to `EventRegistry` itself is needed when `MarketFactory` ships and non-canonical proposals become reachable.
+
+`covers()` is unchanged (Section 8.6): it already compares the EVENT's own `def_version` against the series' pinned version, so this decision is what finally makes that comparison do real work for a superseded version, once one becomes reachable. `current_version`/`definition` reads are unaffected.
+
+## 2a. Re-proposal after Cured or Rejected (review item D4)
+
+**A fixed `cooldown_secs` was wrong.** A 7-day cooldown after Rejected could push a genuine, ongoing failure's own proposable window (bounded by Section 8.6's own acceptance period, `expiry + window_len(kind)`) past the point a series could still be covered, so a real failure the first ruling simply got wrong could end up paying nobody, through no fault of the failure itself continuing.
+
+**Replacement rule:** after an event for (asset, kind, version) leaves Proposed/Escalated into Cured or Rejected at `left_at`, the NEXT `propose_tier1` call for the same (asset, kind, version) is accepted only if its own freshly computed `window_start` (Section 3) is strictly greater than `left_at`. No time-based gate at all; `propose_tier1` computes the new proposal's `window_start` exactly as it always would, then checks this one extra condition before accepting.
+
+**This still stops re-proposing the same data:** `window_start` for a Depeg proposal is the start of a window ending at the latest effectively-Final epoch AT THE MOMENT OF THAT CALL. The prior event's own `left_at` is necessarily at or after its own `window_start + depeg_window_secs` (it could not have been proposed, let alone resolved, before its window closed). So:
+
+- An IMMEDIATE re-proposal on unchanged data computes the identical window (no new epoch has become Final since), hence the identical `window_start`, which is `<= left_at` by construction above — rejected.
+- A re-proposal before enough NEW epochs have become Final to shift the window's own end past the old window's end cannot produce a `window_start` past `left_at` either, for the same reason: the window only advances as genuinely new Final epochs accumulate.
+- Only once enough new data has accumulated that the freshly computed window is built from epochs the FIRST proposal never evaluated does `window_start` move past `left_at` — at which point this is, correctly, no longer "the same data," whether or not the underlying failure is a literal continuation of the same real-world event. The rule cannot distinguish "a brand new depeg" from "the same depeg, still failing, now with 72 more hours of data the first ruling never saw" — and it should not try to: either way, the new proposal is backed by epochs nobody has litigated yet, which is exactly the bar that should allow a fresh look.
+
+IssuerFreeze's `window_start` (start of the earliest counted action in its own 7-day window) advances the same way, for the same reason: a stale re-proposal recomputes the identical window from identical data and is rejected; only new counted actions after `left_at` can move it.
 
 ## 3. Tier 1 data reads
 
@@ -48,8 +73,8 @@ Each check reads `RiskOracle.ring(asset)` (one call, 240 slots, oldest first) fo
 
 **IssuerFreeze**, window = 7 days ending there:
 - Sum effectively-Final epochs' `clawback_amount`/`auth_revocations`. Missing epochs contribute nothing (can only undercount, never trigger on absence, so no `max_missing_epochs`-style cap is needed here).
-- Passes if `clawback_amount_sum / supply >= freeze_pct_bps` (supply from the latest effectively-Final epoch) OR `auth_revocations_sum` above threshold, AND the counted actions are not fully excluded (Section 4).
-- `window_start` = start of the earliest effectively-Final epoch with a counted (non-excluded) action.
+- Passes if `clawback_amount_sum / supply >= freeze_pct_bps` (supply from the latest effectively-Final epoch) OR `auth_revocations_sum` above threshold. A counted action governance considers a legitimate compliance action is contested through `challenge`, not excluded from this sum (Section 4, review item D5).
+- `window_start` = start of the earliest effectively-Final epoch with a counted action.
 
 Missing data never counts as a trigger in either check: Depeg bounds it by `max_missing_epochs`, IssuerFreeze can only undercount from it. A keeper outage can make a real failure harder to prove, never easier.
 
@@ -57,24 +82,39 @@ Missing data never counts as a trigger in either check: Depeg bounds it by `max_
 
 **Definition-time gate (unchanged):** `register_definition` rejects IssuerFreeze for an asset whose `issuer_flags` has neither `auth_revocable` nor `clawback_enabled` (`FreezeImpossible`), checked once at registration, never re-checked at `propose_tier1` time.
 
-**Compliance exclusion (new; the spec names this requirement in one sentence, Section 8.2, with no mechanism defined anywhere):**
+**Revised (review item D5): no compliance-action exclusion mechanism; dropped.** The first draft of this note designed a governed `exclude_compliance_action`/`is_compliance_excluded` pair. This is removed entirely: a governor-controlled exclusion, callable right up until the moment of a proposal, is an instant, unilateral veto over an IssuerFreeze payout, the one thing this contract's whole bonded-and-timelocked design otherwise refuses to give any single party (Section 8: "every transition is permissionless to trigger, but bonded and time locked"). It would let whoever controls the governor key simply exclude the epochs a proposal is about to rely on, moments before the call, with no bond, no evidence requirement, and no public reasoning beyond a hash.
 
-```rust
-fn exclude_compliance_action(env, asset: Address, epoch: u64, reason: BytesN<32>); // auth: governor
-fn is_compliance_excluded(env, asset: Address, epoch: u64) -> bool;
-```
-
-`RingSlot.clawback_amount`/`auth_revocations` are per-EPOCH aggregate counts, not per-action records — there is no finer identifier anywhere in the oracle data model to exclude a single transaction by. This note excludes at epoch granularity: an excluded epoch's counted actions read as zero for the IssuerFreeze sum (Section 3), but the epoch itself still counts toward the window's own span (not treated as missing). `governor.require_auth()` directly, no `Governor::Action` variant (`Governor` is not built; mirrors how `Staking`/`Treasury` already check a plain `governor: Address` today). Not retroactive: it only changes what a FUTURE `propose_tier1` call sums; an event already Proposed or Escalated is unaffected (a live dispute on this exact ground goes through `challenge`/`rule` instead).
+Section 8.2's own sentence ("no governance flag marks the issuer's action as a declared compliance action") is satisfied through the path that already exists for exactly this kind of disagreement: **`challenge`**. Anyone who believes a counted clawback or revocation was a legitimate, governance-sanctioned compliance action challenges the Tier 1 proposal with evidence (the existing `evidence` argument on `challenge` is where that case, and any published compliance determination, is made); the committee rules with a published `reason_hash` under the ordinary ruling deadline (Section 8.9); on timeout, the Tier 1 default (Declared) applies, exactly as it would for any other contested Tier 1 event. This is strictly slower and more accountable than a standing exclusion flag — bonded, time-bounded, and decided by the committee rather than unilaterally by governance — and needs no new function, storage key, or error code: it is Section 8's own existing challenge/rule/timeout machinery, unchanged.
 
 ## 5. Cure (Depeg only)
+
+**Revised (review item D1): the cure window is the CHALLENGE window, not the Depeg window.** `[window_start, window_start + depeg_window_secs)` is the window that already failed the threshold check — that is literally how `propose_tier1` succeeded, so re-checking it for a cure could never pass. "Price recovers" (Section 8.1's own phrase for this transition) has to mean recovers AFTER the proposal, over the epochs that close during the time the proposal sits open and challengeable: `[proposed_at, proposed_at + challenge_secs)`. This is also the only window whose outcome is still undecided data at proposal time — the Depeg window is already fully evaluated and fixed by then.
 
 ```
 earliest_finalize_at = proposed_at + challenge_secs
 ```
 
-At that instant, `finalize` requires every epoch in `[window_start, window_start + depeg_window_secs)` to be effectively Final before deciding anything (no Pending data decides a cure). If any epoch is not yet Final, `finalize` is a no-op (no state change, no error): callable again once the gap backfills. This is the one place Section 8 does not spell out the "data not ready yet" case explicitly; a no-op is the only reading consistent with the task's own instruction that avoids both deciding on incomplete data and inventing a new error code for "try again later." In practice this is rare: `pending_until` for even the newest window epoch is only `signal_dispute_secs` (2h) past its own close, well inside `challenge_secs` (24h).
+At that instant, `finalize` requires every epoch in the CURE window (`[proposed_at, proposed_at + challenge_secs)`, by close time) to be present (not permanently missing) and effectively Final before deciding anything.
 
-Once every epoch is Final: all `>= cure_threshold` → Cured. Otherwise → Declared (the original Depeg condition already held at proposal time; an incomplete recovery does not undo that).
+**Revised (review item D2): three-way epoch state, so `finalize` cannot stall forever.** Each epoch in the cure window is exactly one of:
+
+- **Final** — effectively Final now (Section 3's own rule).
+- **Permanently missing** — not Final, and `now > epoch_close + window_secs` (the backfill window, ADR-005/Section 5.2): a keeper can never legally post this epoch again (`check_epoch_window` itself rejects any post this stale), so it will never become anything but missing.
+- **Not ready** — not Final, and still inside its own backfill window (`now <= epoch_close + window_secs`): it might still be posted and reach Final, or might still age into permanently missing; which one is not yet knowable.
+
+`finalize` proceeds (decides Cured or Declared) once NO epoch in the cure window is "not ready" — every one is either Final or permanently missing. **Permanently missing epochs never create a cure**: they are excluded from the "every epoch `>= cure_threshold`" check the same way a missing epoch is excluded from Depeg's own price comparison (Section 3), so a cure needs every PRESENT (Final) epoch in the cure window at or above `cure_threshold`, not literally every epoch that ever existed; a window with no epoch at all genuinely Final (all permanently missing) cannot cure and routes to Declared, consistent with "missing epochs never create a cure."
+
+While any epoch in the cure window is still "not ready," `finalize` returns a new error, **`DataNotFinal`**, rather than a silent no-op (so the keeper and monitor can see why `finalize` did not decide anything, instead of guessing at an apparent no-op). `finalize` is callable again later, with no bond or bookkeeping harmed by the earlier, premature call (there is nothing to settle for Tier 1's own unbonded path until a decision is actually reached).
+
+**Latest time an unchallenged event is guaranteed finalizable, as a formula:** the worst case is the LAST epoch in the cure window, closing just before `proposed_at + challenge_secs`, posted at the very latest legal instant (`epoch_close + window_secs`), whose own `pending_until = posting_time + signal_dispute_secs` is therefore the latest any epoch's effective finality can land:
+
+```
+guaranteed_finalizable_at = proposed_at + challenge_secs + window_secs + signal_dispute_secs
+```
+
+By this time, every epoch in the cure window is necessarily either Final (if ever posted, its `pending_until` cannot exceed this bound) or permanently missing (`window_secs` has elapsed past its close); there is no remaining "not ready" epoch, so `finalize` is guaranteed to decide (Cured or Declared), never `DataNotFinal`, from this instant onward. At the defaults (`challenge_secs` = 24h, `window_secs` = 72h, `signal_dispute_secs` = 2h), that is `proposed_at` + 98 hours.
+
+Once every cure-window epoch is Final or permanently missing: every PRESENT (Final) one `>= cure_threshold` → Cured. Otherwise (at least one present epoch below `cure_threshold`) → Declared (the original Depeg condition already held at proposal time; a recovery that is incomplete, or entirely unobservable because the whole window went permanently missing, does not undo that).
 
 ## 6. RiskOracle flag (lead decision)
 
@@ -86,7 +126,7 @@ One asset can have several (kind, version) events live at once, but `set_event_i
 
 New read: `active_event_count(asset) -> u32`.
 
-**Invariant E4:** after every call, `RiskOracle`'s own stored `event_in_progress(asset)` flag equals `active_event_count(asset) > 0`. `RiskOracle` exposes no direct public read of this boolean (only `set_event_in_progress` to write it); tests observe it through its one documented effect, `band(asset)` floored to at least `Distress` (Section 6.3), using an asset whose price-driven band is independently known to be below `Distress`, so the floor's own effect is unambiguous rather than masked by a coincidentally-already-high band. Tested per transition, by the property test after every op across 2 assets, and by a dedicated scenario (two kinds live, one rejected, flag stays true) — the exact case a naive boolean push would get wrong.
+**Invariant E4:** after every call, `RiskOracle`'s own stored `event_in_progress(asset)` flag equals `active_event_count(asset) > 0`. **Revised (review item D6): `RiskOracle` gains a read-only `event_in_progress(asset) -> bool`** (the one `RiskOracle` change in scope for this feature, approved by the review), so E4 is tested by reading the flag directly rather than inferring it through `band()`'s own floor side effect, which the first draft of this note relied on and which cannot distinguish the flag's own effect from a band that is already `Distress` or `Event` for unrelated, price-driven reasons. Tested per transition, by the property test after every op across 2 assets, and by a dedicated scenario (two kinds live, one rejected, flag stays true) — the exact case a naive boolean push would get wrong.
 
 ## 7. Bonds
 
@@ -110,7 +150,7 @@ Tier 1 proposers post no bond (`EventRecord.bond == 0`). Only the challenger's `
 1. `active_event_count(asset) > 0` → `EventInProgress` (reuses Section 6's own count).
 2. Any epoch, Pending OR Final, in the trailing `depeg_window_secs` below `depeg_threshold` → `RecentDepeg` (deliberately looser than the Tier 1 check itself: a buyer should not buy the instant a bad, not-yet-Final price posts).
 3. Endpoint Down/Degraded in the trailing `halt_window_secs` → `RecentEndpointOutage`.
-4. Any clawback/revocation in the last 7 days → `RecentIssuerAction`. Judgment call: this does NOT apply the Section 4 compliance exclusion — the gate warns buyers off recent issuer activity regardless of whether it is later excluded from a payout decision; a caution signal, not a ruling.
+4. Any clawback/revocation in the last 7 days → `RecentIssuerAction`.
 5. Otherwise → `Clear`.
 
 ## 9. Invariants
@@ -122,6 +162,7 @@ Tier 1 proposers post no bond (`EventRecord.bond == 0`). Only the challenger's `
 | E3 | At most one non-terminal event per (asset, kind, version) | Unit test: second `propose_tier1` while one is live returns `EventInProgress`; property test keeps a shadow map |
 | E4 | Oracle flag == (active count > 0) | Section 6 |
 | E5 | Every bond settles exactly once | Section 7 |
+| E6 | An asset's band reaches `Event` only via a Declared event on the canonical version (review item D7) | Unit test: `set_event_band` is called only from the Declared transition for a canonical-version event (Section 2's own D3.b restriction); property test asserts `band(asset) == Event` only when `has_declared(asset)` is true for some kind at its own canonical version |
 
 I13 (every live series pins the current canonical version) is unaffected: it constrains what a SERIES pins at open time, never what a PROPOSAL may target, so it coexists with Section 2's own decision. I7's prose ("committee `rule` before the ruling deadline") should gain an explicit `declare = true` qualifier once this reconciles with code; not a behavior change.
 
@@ -133,29 +174,37 @@ I13 (every live series pins the current canonical version) is unaffected: it con
 | Keeper outage creating gaps | `max_missing_epochs` tolerates a bounded gap; beyond it the proposal fails closed, never passes on absence |
 | Liquidity collapse during a real failure (must still trigger) | Liquidity floor checks only the 7-day baseline BEFORE the window, never liquidity inside it |
 | Challenger griefing a valid event | Challenger's own bond is the entire stake; losing a ruling forfeits 100% to Treasury |
-| Seller forcing a cure with a brief spike | Cure needs every epoch in the full window at or above `cure_threshold`, not a moment; one epoch still below routes to Declared |
-| Proposing against a version no series uses | No bond is risked and no payout follows unless some live series' `covers()` also matches that exact version; wastes gas, gains nothing |
+| Seller forcing a cure with a brief spike | Cure needs every epoch in the full CURE (challenge) window at or above `cure_threshold`, not a moment; one epoch still below routes to Declared |
+| A free proposal against a superseded, looser version (review item D3, D8) | `propose_tier1` accepts only the canonical version or a version pinned by a live series (via `version_has_live_cover`, currently always false with no `MarketFactory`); in this phase every proposal is canonical-only, so there is no looser, superseded definition to exploit for a free, asset-wide `Event` band |
+| Keeper outage spanning the cure window (review item D2, D8) | Every cure-window epoch resolves to Final or permanently missing by `guaranteed_finalizable_at`; a stretch of permanently-missing epochs is excluded from the cure check, not treated as cured or as blocking `finalize` forever, so an outage can at most push the outcome to Declared, never stall the event indefinitely |
+| A genuine failure starting during the old cooldown period (review item D4, D8) | There is no fixed cooldown to fall outside of: a new proposal is accepted as soon as its own freshly computed `window_start` moves past the prior event's `left_at`, which happens as soon as real, unlitigated data exists, regardless of how little time has passed |
+| The governor trying to block an IssuerFreeze payout (review item D5, D8) | There is no exclusion flag for governance to call; the only path to contest a counted action is `challenge`, bonded and ruled by the committee under the public ruling deadline, not a unilateral governor call |
+| Proposing against a version no series uses | Moot under D3: a non-canonical version is not acceptable at all unless a live series pins it, so there is no version left to propose against that nothing covers |
 | Two kinds in progress, one rejected | Exactly Section 6's own motivating case: the count stays above zero, oracle flag stays true |
 
 ## 11. Test plan
 
-Unit: every function and error path (`register_definition`'s 7 rejections; `propose_tier1` for both kinds, each branch of Section 3; `exclude_compliance_action` auth and idempotency; `challenge`/`finalize`/`rule`/`resolve_timeout` and their failure modes from Section 1, 5, 7; every Section 12.2 read including `cover_gate`'s 5 outcomes and `covers`'s 4 conditions).
+Unit: every function and error path (`register_definition`'s 7 rejections; `propose_tier1` for both kinds, each branch of Section 3, plus D3's version-acceptance rule, canonical and rejected-non-canonical; `finalize`'s 3-way epoch state and `DataNotFinal` (D2); `challenge`/`rule`/`resolve_timeout` and their failure modes from Section 1, 7; every Section 12.2 read including `cover_gate`'s 5 outcomes, `covers`'s 4 conditions, and the new `RiskOracle.event_in_progress` read (D6)).
 
-Scenario: the day-88-of-90 depeg (Section 8.6); a ruling-deadline timeout for each Tier 1 default; a definition change with a live series still on the old version, proving Section 2's own decision; two kinds live with one rejected (Section 6, 10); a compliance exclusion flipping an IssuerFreeze proposal; a cure attempted mid-backfill, then completed (Section 5).
+Scenario: the day-88-of-90 depeg (Section 8.6); a ruling-deadline timeout for each Tier 1 default; a definition change with a live series still on the old version, proving Section 2's own decision; two kinds live with one rejected (Section 6, 10); a cure attempted mid-backfill, `DataNotFinal` returned, then completed once the gap resolves (Section 5); a cure window containing a permanently-missing epoch that still cures on the present epochs (Section 5); a re-proposal of the same data immediately after Rejected, rejected, followed by a re-proposal once genuinely new data exists, accepted (Section 2a); a proposal against a superseded version with no live series pinning it, rejected (Section 2, 10); a challenged IssuerFreeze proposal where the challenger's own evidence is a compliance determination, ruled by the committee (Section 4, 10).
 
-Property (`proptest`, matching `staking`/`treasury`'s own convention): random `propose_tier1` (both kinds, random registered versions), `challenge`, `rule`, `resolve_timeout`, `register_definition`, `exclude_compliance_action`, across 2 assets and both kinds, asserting E1 to E4 after every step. E5 is structural, not fuzzed, matching how this workspace already documents rather than fuzzes its other structurally-provable invariants.
+Property (`proptest`, matching `staking`/`treasury`'s own convention): random `propose_tier1` (both kinds, random registered versions, including non-canonical ones to exercise D3's rejection), `challenge`, `rule`, `resolve_timeout`, `register_definition`, across 2 assets and both kinds, asserting E1 to E4 and E6 after every step. E5 is structural, not fuzzed, matching how this workspace already documents rather than fuzzes its other structurally-provable invariants.
 
 **Integration: confirmed, will use the real `RiskOracle`, `Staking` and `Treasury`**, matching `staking::test::integration`'s own existing convention. Full cycle: real asset, keeper posts a genuine depeg pattern, `propose_tier1` against real oracle data, unchallenged `finalize` to Declared with real `set_event_band`/`set_event_in_progress` calls observed; a separate challenged path with a real `Staking` bond, ruled by a committee address, confirming the loser's forfeited bond reaches `Treasury`'s `Slashed` bucket via a real `deposit` (ADR-012). Every balance asserted at the end.
 
 ## 12. Deviations, with reasons
 
-1. **`propose_tier1` takes an explicit `version`** (Section 2): the task's own lead decision, overriding Section 8.1/8.2/8.8 and ADR-001's "(asset, kind) only, always canonical."
-2. **Compliance-action exclusion is invented here** (Section 4): the spec names the requirement in one sentence with no mechanism; this note designs it at epoch granularity, the finest the existing `RingSlot` data supports.
-3. **`finalize` on an incomplete Depeg window is a no-op, not an error** (Section 5): the only reading consistent with "may not run until every epoch is Final" that does not also require inventing a new error code.
-4. **`ActiveCount(asset)` replaces a boolean push** (Section 6): the task's own lead decision; Section 8.1's own prose ("while ANY event... is in progress") already implied this, a plain boolean just could not express it correctly for more than one live event.
-5. **`cover_gate` does not apply the compliance exclusion** (Section 8): a judgment call, not forced by any existing rule, since the gate's spec predates this note's exclusion mechanism entirely.
-6. **I7's wording gap** (Section 9): a precision note, not a behavior change.
-7. **Retirement is a no-op until `MarketFactory` exists** (Section 2): the task's own explicit instruction.
-8. **E4 cannot be tested by reading the oracle flag directly** (Section 6): `RiskOracle` has no public read for its own `event_in_progress` boolean, only the write (`set_event_in_progress`) and its one observable effect (`band` floored to `Distress`). Not a deviation in behavior, a testing-design finding: E4's tests must control for an asset whose price-driven band would otherwise already be `Distress` or `Event`, or the floor's effect is unobservable from outside the contract.
+1. **`propose_tier1` takes an explicit `version`** (Section 2): the task's own lead decision, overriding Section 8.1/8.2/8.8 and ADR-001's "(asset, kind) only, always canonical." Narrowed by item 9 below (review item D3): accepted only if canonical or live-series-pinned, not any registered version.
+2. **The cure window is the challenge window, not the Depeg window** (Section 5, review item D1): Section 8.1's own "price recovers" can only mean recovery measured over data that postdates the proposal; the Depeg window itself is already-evaluated, fixed, failing data by the time a cure could be considered.
+3. **`finalize` on a not-yet-decidable cure window returns `DataNotFinal`, not a no-op** (Section 5, review item D2): the first draft of this note used a silent no-op. The review correctly found that an epoch in the cure window can itself age past ITS OWN backfill window (a keeper outage spanning more than `window_secs` during the challenge window is enough) and become permanently missing — a state a bare "Pending, try later" no-op has no way to distinguish from "will arrive eventually," so it would wait on a result that can never come. `DataNotFinal` is a new error code, and the three-way epoch state (Final / permanently missing / not ready) is what lets `finalize` tell the two cases apart and still decide once every epoch resolves one way or the other.
+4. **`version_has_live_cover` and canonical-only acceptance** (Section 2, review item D3): the first draft of this note treated "every non-canonical version proposable" as the SAFE default; the review correctly identified this as the dangerous direction, since `Event` is sticky and asset-wide while Tier 1 posts no bond, so a superseded, looser definition could be proposed for free. Corrected to canonical-only until `MarketFactory` can confirm a real, live pin.
+5. **Asset-wide effects gated to the canonical version** (Section 2, review item D3b): `ActiveCount`, the oracle push, and `set_event_band` now fire only for a canonical-version event; a non-canonical one (reachable only once `MarketFactory` exists) affects only the series pinned to it.
+6. **No time-based cooldown; re-proposal gated by `window_start > left_at`** (Section 2a, review item D4): the first draft of this note used a fixed `cooldown_secs`. The review correctly identified that a fixed window could push a genuinely continuing failure past a series' own acceptance period. Replaced with a data-freshness test that needs no duration constant at all.
+7. **No compliance-action exclusion mechanism** (Section 4, review item D5): the first draft of this note invented a governed `exclude_compliance_action`/`is_compliance_excluded` pair. The review correctly identified this as an unbonded, unilateral governor veto over a payout decision, exactly what the rest of this contract's design refuses to give any one party. Section 8.2's own sentence is instead satisfied by the existing `challenge`/`rule`/`resolve_timeout` path.
+8. **`ActiveCount(asset)` replaces a boolean push** (Section 6): the task's own lead decision; Section 8.1's own prose ("while ANY event... is in progress") already implied this, a plain boolean just could not express it correctly for more than one live event.
+9. **`RiskOracle` gains `event_in_progress(asset) -> bool`, a read-only function** (Section 9, review item D6): the one `RiskOracle` change this note's scope allows, approved explicitly by the review. Replaces the first draft's band-floor-based inference for testing E4.
+10. **New invariant E6** (Section 9, review item D7): an asset's band reaches `Event` only via a Declared event on the canonical version — the natural companion to item 5 above, stated as its own tested invariant rather than left implicit in the version-gating rule.
+11. **I7's wording gap** (Section 9): a precision note, not a behavior change.
+12. **Retirement is a no-op until `MarketFactory` exists** (Section 2): the task's own explicit instruction, now narrowed by item 4's own canonical-only default rather than the first draft's "every non-canonical version proposable" default.
 
 No other part of the cited source of truth required a deviation; the rest of Section 8 and 12.2 maps onto this design directly.
