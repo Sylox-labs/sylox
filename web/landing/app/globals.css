@@ -1,5 +1,12 @@
 @import "tailwindcss";
 
+/* @sylox/ui lives outside this app's own directory tree (a workspace
+   package resolved through node_modules), which Tailwind v4's automatic
+   content detection doesn't traverse into by default. Without this, any
+   utility class that's ONLY ever written inside a shared component (e.g.
+   Eyebrow's `md:text-sm`) gets silently dropped from the generated CSS. */
+@source "../../shared/ui/src";
+
 @theme inline {
   --color-slate-black: var(--color-slate-black);
   --color-silo-oatmeal: var(--color-silo-oatmeal);

@@ -1,4 +1,5 @@
 import { hero } from "@/content";
+import { Eyebrow, ButtonLink } from "@sylox/ui/components";
 
 /**
  * ProofBridge-style layout trial: full-bleed looping video occupies the
@@ -44,9 +45,7 @@ export function SimpleHero() {
         </h1>
 
         <div className="max-w-xs md:pb-3 md:text-right">
-          <p className="font-mono text-xs uppercase tracking-[0.15em] text-cyber-tin md:text-sm">
-            {panel.eyebrow}
-          </p>
+          <Eyebrow>{panel.eyebrow}</Eyebrow>
           <p className="mt-3 text-sm leading-relaxed text-cyber-tin md:text-base">
             {panel.body}
           </p>
@@ -56,17 +55,9 @@ export function SimpleHero() {
       {panel.ctas && (
         <div className="relative z-10 mt-8 flex flex-wrap gap-4">
           {panel.ctas.map((cta) => (
-            <a
-              key={cta.label}
-              href={cta.href}
-              className={
-                cta.variant === "primary"
-                  ? "rounded-full bg-risk-crimson px-6 py-3 text-sm font-medium text-slate-black transition-colors hover:bg-risk-crimson-tint"
-                  : "rounded-full border border-cement-grey px-6 py-3 text-sm font-medium text-silo-oatmeal transition-colors hover:border-silo-oatmeal"
-              }
-            >
+            <ButtonLink key={cta.label} href={cta.href} variant={cta.variant}>
               {cta.label}
-            </a>
+            </ButtonLink>
           ))}
         </div>
       )}

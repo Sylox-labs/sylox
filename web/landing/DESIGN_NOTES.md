@@ -45,4 +45,4 @@ Type splits cleanly by role: Inter carries body and UI copy, Space Mono carries 
 
 ## Display font
 
-See each hero direction's rationale comment for direction-specific notes. The chosen display stand-in is **Big Shoulders** (Google Fonts): a genuinely condensed, variable-weight (100-900) industrial grotesque, closest among the free alternatives to the licensed board reference Founders Grotesk X-Condensed. It's loaded through a single `--font-display-family` token (see `app/fonts.ts` and `app/tokens.css`) so a licensed face can replace it later with a one-line change.
+The chosen display stand-in is **Big Shoulders** (Google Fonts): a genuinely condensed, variable-weight (100-900) industrial grotesque, closest among the free alternatives to the licensed board reference Founders Grotesk X-Condensed. It's loaded through a single `--font-display-family` token (see `web/shared/ui/src/tokens/fonts.ts` and `tokens.css`) so a licensed face can replace it later with a one-line change.

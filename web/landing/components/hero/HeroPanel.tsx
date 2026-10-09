@@ -1,3 +1,5 @@
+import { Eyebrow, ButtonLink } from "@sylox/ui/components";
+
 export interface HeroCta {
   label: string;
   href: string;
@@ -42,9 +44,7 @@ export function HeroPanel({
           className="absolute inset-0 -z-10 rounded-3xl bg-[radial-gradient(ellipse_at_left,_rgba(11,12,14,0.85),_transparent_70%)] md:-inset-x-12"
           aria-hidden="true"
         />
-        <p className="font-mono text-xs uppercase tracking-[0.15em] text-cyber-tin md:text-sm">
-          {eyebrow}
-        </p>
+        <Eyebrow>{eyebrow}</Eyebrow>
         <HeadingTag className="mt-4 font-display text-4xl leading-[0.95] tracking-tight text-silo-oatmeal md:text-6xl">
           {heading}
         </HeadingTag>
@@ -54,17 +54,9 @@ export function HeroPanel({
         {ctas && (
           <div className="mt-8 flex flex-wrap gap-4">
             {ctas.map((cta) => (
-              <a
-                key={cta.label}
-                href={cta.href}
-                className={
-                  cta.variant === "primary"
-                    ? "rounded-full bg-risk-crimson px-6 py-3 text-sm font-medium text-slate-black transition-colors hover:bg-risk-crimson-tint"
-                    : "rounded-full border border-cement-grey px-6 py-3 text-sm font-medium text-silo-oatmeal transition-colors hover:border-silo-oatmeal"
-                }
-              >
+              <ButtonLink key={cta.label} href={cta.href} variant={cta.variant}>
                 {cta.label}
-              </a>
+              </ButtonLink>
             ))}
           </div>
         )}

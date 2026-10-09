@@ -1,0 +1,27 @@
+{
+  "name": "@sylox/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./tokens.css": "./src/tokens/tokens.css",
+    "./fonts": "./src/tokens/fonts.ts",
+    "./risk-bands": "./src/lib/risk-bands.ts",
+    "./contrast": "./src/lib/contrast.ts",
+    "./components": "./src/components/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "next": ">=15",
+    "react": ">=19",
+    "react-dom": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "^19",
+    "typescript": "^5",
+    "vitest": "^5.0.3"
+  }
+}

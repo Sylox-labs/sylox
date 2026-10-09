@@ -5,6 +5,7 @@ import Image from "next/image";
 import { ArrowRight } from "lucide-react";
 import { whoItsFor } from "@/content";
 import { useScrollReveal } from "@/lib/motion/useScrollReveal";
+import { Eyebrow } from "@sylox/ui/components";
 
 // One wireframe render per audience, same register as HowItWorks: a hand
 // for Holders (weighing whether to buy or sell cover), a wallet for
@@ -38,9 +39,7 @@ export function WhoItsFor() {
       className="bg-slate-black px-6 py-24 md:px-16 md:py-32"
     >
       <div ref={containerRef} className="mx-auto max-w-5xl">
-        <p data-reveal className="font-mono text-xs uppercase tracking-[0.15em] text-cyber-tin md:text-sm">
-          {whoItsFor.eyebrow}
-        </p>
+        <Eyebrow data-reveal>{whoItsFor.eyebrow}</Eyebrow>
         <h2 data-reveal className="mt-4 max-w-2xl font-display text-4xl leading-[0.95] tracking-tight text-silo-oatmeal md:text-6xl">
           {whoItsFor.heading}
         </h2>

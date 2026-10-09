@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { faq } from "@/content";
 import { useScrollReveal } from "@/lib/motion/useScrollReveal";
+import { Eyebrow } from "@sylox/ui/components";
 
 export function Faq() {
   const [openIndex, setOpenIndex] = useState<number | null>(null);
@@ -17,9 +18,7 @@ export function Faq() {
       className="bg-silo-oatmeal px-6 py-24 md:px-16 md:py-32"
     >
       <div ref={containerRef} className="mx-auto max-w-3xl">
-        <p data-reveal className="font-mono text-xs uppercase tracking-[0.15em] text-anchor-graphite md:text-sm">
-          {faq.eyebrow}
-        </p>
+        <Eyebrow tone="graphite" data-reveal>{faq.eyebrow}</Eyebrow>
         <h2 data-reveal className="mt-4 font-display text-4xl leading-[0.95] tracking-tight text-slate-black md:text-6xl">
           Questions, answered plainly.
         </h2>
