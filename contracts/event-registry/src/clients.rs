@@ -26,6 +26,11 @@ pub trait RiskOracle {
     /// independent of whether that epoch's own ring position is
     /// currently `Empty` (overturned, not yet reposted).
     fn newest_epoch(env: Env, asset: Address) -> Option<u64>;
+    /// PR #25 review: the first epoch ever posted for this asset,
+    /// needed so the Tier 1 history baselines below measure history
+    /// relative to when this asset actually started posting, not
+    /// against the newest epoch's own (always large) absolute number.
+    fn first_epoch(env: Env, asset: Address) -> Option<u64>;
 }
 
 /// The slice of `Staking`'s API (Section 12.3) that `EventRegistry`

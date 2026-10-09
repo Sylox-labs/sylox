@@ -676,10 +676,37 @@ fn fill_ring_with_constant_signal(
     peg_ratio: i128,
     liquidity: i128,
 ) {
+    fill_ring_with_constant_signal_from(
+        env, client, staking, asset, 0, epochs, peg_ratio, liquidity,
+    );
+}
+
+/// PR #25 review: same as `fill_ring_with_constant_signal`, but
+/// starting from `start_epoch` instead of always 0, so a test can
+/// exercise a realistic, unix-time-derived epoch range (hundreds of
+/// thousands) instead of only the epoch-0 case every existing test
+/// used, which hid the absolute-epoch-vs-window-length bug this
+/// review found: a comparison like `newest_final + 1 <
+/// AGGREGATE_SLOTS_7D` is trivially true near epoch 0 for the right
+/// reason (too little history) but never true on a real network
+/// (epoch numbers themselves are always far larger than any window
+/// length), for the wrong reason.
+#[allow(clippy::too_many_arguments)]
+fn fill_ring_with_constant_signal_from(
+    env: &Env,
+    client: &RiskOracleClient,
+    staking: &Address,
+    asset: &Address,
+    start_epoch: u64,
+    epochs: u64,
+    peg_ratio: i128,
+    liquidity: i128,
+) {
     let keeper = Address::generate(env);
     let staking_client = crate::mocks::MockStakingClient::new(env, staking);
     let total = epochs + 2;
-    for epoch in 0..total {
+    for i in 0..total {
+        let epoch = start_epoch + i;
         staking_client.set_aggregate(asset, &epoch, &EndpointStatus::Up);
         env.ledger().set_timestamp((epoch + 1) * 3_600);
         let mut s = signal_set(env, epoch, peg_ratio);
@@ -687,7 +714,7 @@ fn fill_ring_with_constant_signal(
         s.supply_change_bps = 0;
         client.post_signals(&keeper, asset, &s);
     }
-    client.finalize_endpoint(asset, &(epochs - 1));
+    client.finalize_endpoint(asset, &(start_epoch + epochs - 1));
 }
 
 #[test]
@@ -705,6 +732,232 @@ fn score_is_stale_with_fewer_than_168_epochs_posted() {
     );
     let score = fx.client.score(&asset);
     assert!(score.stale);
+}
+
+/// PR #25 review: `recompute_score`'s own history guard
+/// (`newest_final + 1 < AGGREGATE_SLOTS_7D`) compared an absolute
+/// epoch number to 168. On a real network epoch numbers are
+/// unix-time-derived, around 497,000 as of this fix, always far
+/// larger than 168, so that guard never actually fired; a new asset
+/// got scored from however many epochs it had posted instead of
+/// reading stale until it had a genuine 7 days (168 epochs) of its
+/// own history (review decision D2). Every test elsewhere in this
+/// suite starts at epoch 0, which hid this: near epoch 0, "newest
+/// epoch < 168" and "this asset has fewer than 168 epochs of
+/// history" happen to coincide, so the bug is invisible there. This
+/// test starts at a realistic epoch instead, where the two diverge.
+#[test]
+fn score_stays_stale_with_no_stored_score_at_a_realistic_epoch_until_168_real_epochs_exist() {
+    const REALISTIC_EPOCH_BASE: u64 = 497_000;
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    // Post one continuous run of 170 epochs (168 real + 2 so the
+    // 168th becomes effectively final via post_signals' own
+    // on-backfill finality sweep, matching
+    // fill_ring_with_constant_signal's own convention), checking the
+    // score after the 24th and after the 168th.
+    for i in 0..170u64 {
+        let epoch = REALISTIC_EPOCH_BASE + i;
+        staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s = signal_set(&env, epoch, 10_000_000);
+        s.liquidity_2pct = 500_000_000_000;
+        s.supply_change_bps = 0;
+        fx.client.post_signals(&keeper, &asset, &s);
+
+        if i == 23 {
+            // Just posted the 24th epoch (i is 0-indexed); its own
+            // finality is still 2 epochs away, but score() must
+            // already read stale with nothing stored regardless of
+            // finality, since 24 real epochs is nowhere near 168.
+            let score = fx.client.score(&asset);
+            assert!(
+                score.stale,
+                "24 epochs at a realistic epoch base must still read stale"
+            );
+            env.as_contract(&contract_id, || {
+                assert!(
+                    crate::storage::get_score(&env, &asset).is_none(),
+                    "recompute_score must never have written a score from \
+                     only 24 epochs of real history, regardless of how \
+                     large the absolute epoch number is"
+                );
+            });
+        }
+    }
+
+    let score = fx.client.score(&asset);
+    assert!(
+        !score.stale,
+        "168 epochs of real history at a realistic epoch base must produce a score"
+    );
+    env.as_contract(&contract_id, || {
+        assert!(
+            crate::storage::get_score(&env, &asset).is_some(),
+            "recompute_score must have written a score once 168 real epochs exist"
+        );
+    });
+}
+
+/// PR #27 review (round 2): `FirstEpoch` only proves CALENDAR time has
+/// elapsed since the asset's first post; it says nothing about whether
+/// the 168-epoch window `aggregate_from_ring` actually reads is
+/// populated. Post epoch F, go dark for 168+ epochs (7+ real days of
+/// silence), then post exactly one more epoch and let it finalize. The
+/// `FirstEpoch`-based guard (`newest_final + 1 < first_epoch + 168`)
+/// is satisfied by calendar time alone and does not block this, but
+/// the window `aggregate_from_ring` reads (`[newest_final+1-168,
+/// newest_final]`) no longer contains epoch F at all, so at most one
+/// of its 168 slots holds real data. This must not produce a live
+/// score from a 167/168-empty window. Exercises the new
+/// `MIN_FINAL_EPOCHS_7D` minimum-count gate in `aggregate_from_ring`.
+#[test]
+fn score_must_not_resume_from_a_single_epoch_after_a_168_epoch_gap() {
+    const REALISTIC_EPOCH_BASE: u64 = 497_000;
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    let first_epoch = REALISTIC_EPOCH_BASE;
+    staking_client.set_aggregate(&asset, &first_epoch, &EndpointStatus::Up);
+    env.ledger().set_timestamp((first_epoch + 1) * 3_600);
+    let mut s0 = signal_set(&env, first_epoch, 10_000_000);
+    s0.liquidity_2pct = 500_000_000_000;
+    s0.supply_change_bps = 0;
+    fx.client.post_signals(&keeper, &asset, &s0);
+
+    // Go dark for 170 epochs (> 168, i.e. > 7 real days), then post
+    // exactly one more epoch, promptly (no backdating, no WrongEpoch
+    // risk): this clears the FirstEpoch calendar guard
+    // (first_epoch + 170 + 1 > first_epoch + 168) while leaving the
+    // 168-epoch window almost entirely empty.
+    let resumed_epoch = first_epoch + 170;
+    staking_client.set_aggregate(&asset, &resumed_epoch, &EndpointStatus::Up);
+    env.ledger().set_timestamp((resumed_epoch + 1) * 3_600);
+    let mut s1 = signal_set(&env, resumed_epoch, 10_000_000);
+    s1.liquidity_2pct = 500_000_000_000;
+    s1.supply_change_bps = 0;
+    fx.client.post_signals(&keeper, &asset, &s1);
+
+    // Let resumed_epoch finalize (SIGNAL_DISPUTE_SECS = 2 epochs) by
+    // posting one more epoch past it; post_signals' own finality
+    // sweep then calls recompute_score(resumed_epoch).
+    let trailing_epoch = resumed_epoch + 2;
+    staking_client.set_aggregate(&asset, &trailing_epoch, &EndpointStatus::Up);
+    env.ledger().set_timestamp((trailing_epoch + 1) * 3_600);
+    let mut s2 = signal_set(&env, trailing_epoch, 10_000_000);
+    s2.liquidity_2pct = 500_000_000_000;
+    s2.supply_change_bps = 0;
+    fx.client.post_signals(&keeper, &asset, &s2);
+
+    let score = fx.client.score(&asset);
+    assert!(
+        score.stale,
+        "a 168-epoch window with only 1 real data point must not \
+         produce a live score; FirstEpoch alone (calendar time) is \
+         not sufficient, a minimum-count-of-real-epochs check is \
+         also required"
+    );
+    env.as_contract(&contract_id, || {
+        assert!(
+            crate::storage::get_score(&env, &asset).is_none(),
+            "recompute_score must never have written a score from a \
+             window with only 1 real data point out of 168"
+        );
+    });
+}
+
+/// Exact boundary of `MIN_FINAL_EPOCHS_7D` (96 = 168 - 72, one full
+/// backfill window's worth of tolerated gap): a window with exactly
+/// 96 real epochs (the other 72 missing in the middle, matching the
+/// system's own designed backfill tolerance) must produce a real
+/// score. The asset's very first post is at epoch 0, so `first_epoch`
+/// = 0 and the calendar guard is satisfied the same way as every
+/// other realistic-epoch-base test, isolating this test to the
+/// minimum-count gate alone.
+#[test]
+fn score_is_written_with_exactly_the_minimum_final_epochs_in_the_window() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    // Epoch 0 only (sets first_epoch), then a 72 epoch gap, then 95
+    // more real epochs (1 + 95 = 96 real epochs in [0, 167]), then 2
+    // trailing epochs so epoch 167 itself finalizes.
+    let post = |epoch: u64| {
+        staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s = signal_set(&env, epoch, 10_000_000);
+        s.liquidity_2pct = 500_000_000_000;
+        s.supply_change_bps = 0;
+        fx.client.post_signals(&keeper, &asset, &s);
+    };
+    post(0);
+    for epoch in 73..170u64 {
+        post(epoch);
+    }
+
+    let score = fx.client.score(&asset);
+    assert!(
+        !score.stale,
+        "exactly 96 real epochs (168 - 72, one full backfill window \
+         of gap) must be enough to produce a score"
+    );
+    env.as_contract(&contract_id, || {
+        assert!(
+            crate::storage::get_score(&env, &asset).is_some(),
+            "recompute_score must have written a score from exactly \
+             96 real epochs in the window"
+        );
+    });
+}
+
+#[test]
+fn score_stays_stale_with_one_fewer_than_the_minimum_final_epochs_in_the_window() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let contract_id = fx.client.address.clone();
+    let keeper = Address::generate(&env);
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &fx.staking);
+
+    // Epoch 0 only (sets first_epoch), then a 73 epoch gap, then 94
+    // more real epochs (1 + 94 = 95 real epochs in [0, 167]), one
+    // fewer than the minimum, then 2 trailing epochs so epoch 167
+    // itself finalizes.
+    let post = |epoch: u64| {
+        staking_client.set_aggregate(&asset, &epoch, &EndpointStatus::Up);
+        env.ledger().set_timestamp((epoch + 1) * 3_600);
+        let mut s = signal_set(&env, epoch, 10_000_000);
+        s.liquidity_2pct = 500_000_000_000;
+        s.supply_change_bps = 0;
+        fx.client.post_signals(&keeper, &asset, &s);
+    };
+    post(0);
+    for epoch in 74..170u64 {
+        post(epoch);
+    }
+
+    let score = fx.client.score(&asset);
+    assert!(
+        score.stale,
+        "95 real epochs, one fewer than MIN_FINAL_EPOCHS_7D (96), \
+         must not produce a score"
+    );
+    env.as_contract(&contract_id, || {
+        assert!(
+            crate::storage::get_score(&env, &asset).is_none(),
+            "recompute_score must never have written a score from \
+             only 95 real epochs in the window"
+        );
+    });
 }
 
 #[test]

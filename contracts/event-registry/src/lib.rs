@@ -100,6 +100,20 @@ const RING_SLOTS: u32 = 240;
 /// the same 168 epoch span, used for two different purposes.
 const BASELINE_EPOCHS: u64 = 7 * 24;
 
+/// PR #27 review (round 2): `check_depeg`'s own liquidity baseline
+/// loop below has no minimum-count check of its own, only
+/// `liquidity_values.is_empty()` (catches zero real epochs, not
+/// "mostly missing"). Do NOT reuse `max_missing_epochs`: that field
+/// tolerates gaps in the 72h Depeg WINDOW, a different, intentionally
+/// separate tolerance from this 168 epoch BASELINE. Require at least
+/// this many Final epochs within the baseline instead: one full
+/// backfill window (`WINDOW_SECS` / `EPOCH_SECS`, 72 epochs) of gap is
+/// a normal, already-supported operating pattern, so the minimum
+/// tolerates exactly one such gap and no more, rather than an
+/// arbitrary ratio.
+const MIN_BASELINE_FINAL_EPOCHS: u32 = BASELINE_EPOCHS as u32 - (WINDOW_SECS / EPOCH_SECS) as u32;
+const _: () = assert!(MIN_BASELINE_FINAL_EPOCHS > 0);
+
 /// PR #15 review, finding F3: the largest number of cure-window
 /// epochs (`challenge_secs / EPOCH_SECS`) `validate_definition_params`
 /// will accept, 72 hours' worth. Keeps `storage::CureProgress`'s own
@@ -926,8 +940,16 @@ fn check_depeg(
         return Err(Error::Tier1CheckFailed);
     }
 
-    // 7 day baseline, strictly before the window.
-    if window_start_epoch < BASELINE_EPOCHS {
+    // 7 day baseline, strictly before the window. PR #25 review:
+    // `window_start_epoch < BASELINE_EPOCHS` alone only guards the
+    // subtraction below from underflowing; on a real network
+    // `window_start_epoch` is always far larger than `BASELINE_EPOCHS`
+    // (168), so that comparison never actually requires the asset to
+    // have 168 epochs of its OWN history. Measure against
+    // `first_epoch` instead: the baseline must fall entirely within
+    // real history, not merely within absolute-epoch-number room.
+    let first_epoch = oracle.first_epoch(asset).ok_or(Error::Tier1CheckFailed)?;
+    if window_start_epoch < first_epoch + BASELINE_EPOCHS {
         return Err(Error::Tier1CheckFailed);
     }
     let baseline_start = window_start_epoch - BASELINE_EPOCHS;
@@ -938,7 +960,16 @@ fn check_depeg(
             liquidity_values.push_back(slot.unwrap().liquidity_2pct);
         }
     }
-    if liquidity_values.is_empty() {
+    // PR #27 review (round 2): `first_epoch` alone proves calendar
+    // time has elapsed since this asset's first post, not that the
+    // baseline is actually populated. A keeper could post once, go
+    // dark for 168+ epochs, then resume right before the Depeg
+    // window starts, clearing the calendar guard above while leaving
+    // the baseline almost entirely empty. `liquidity_values.is_empty()`
+    // alone only catches the all-missing extreme; see
+    // `MIN_BASELINE_FINAL_EPOCHS`'s own doc comment for why this is a
+    // distinct minimum from `max_missing_epochs`.
+    if liquidity_values.len() < MIN_BASELINE_FINAL_EPOCHS {
         return Err(Error::Tier1CheckFailed);
     }
     let median_liquidity = median(&liquidity_values);
@@ -964,6 +995,22 @@ fn check_issuer_freeze(
     let newest_epoch = oracle.newest_epoch(asset).ok_or(Error::Tier1CheckFailed)?;
     let now = env.ledger().timestamp();
 
+    // PR #27 review (round 2): deliberately no `first_epoch`/history
+    // requirement here, unlike `check_depeg`'s liquidity baseline.
+    // Unlike that baseline, a sparse window here cannot produce a
+    // FALSE trigger: `clawback_sum`/`revocation_sum` only accumulate
+    // real data that exists, so a sparse window can only undercount
+    // actions and make the trigger harder to reach, never easier.
+    // "Enough history to rely on this asset" is a cover-sale concern
+    // (MarketFactory refuses sales while score() reads stale), not a
+    // payout-trigger concern; gating a real freeze on history only
+    // hurts people who already bought cover. This guard is purely an
+    // underflow guard on `window_start_epoch`'s own subtraction below
+    // (never fires on a real network, where `newest_epoch` is always
+    // far larger than `BASELINE_EPOCHS`; it only matters for a
+    // brand-new asset in test, epoch numbers starting near 0). See
+    // propose_tier1_issuer_freeze_succeeds_with_fewer_than_168_epochs_
+    // of_history in test.rs.
     let window_epochs: u64 = BASELINE_EPOCHS;
     if newest_epoch + 1 < window_epochs {
         return Err(Error::Tier1CheckFailed);

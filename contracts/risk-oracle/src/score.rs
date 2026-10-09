@@ -22,6 +22,23 @@ pub const AGGREGATE_SLOTS_7D: u32 = 168;
 /// and `_7D` are; see the review's "Spec deviations" entry on this.
 pub const DEPEG_WINDOW_SLOTS: u32 = 72;
 
+/// PR #27 review (round 2): `first_epoch` alone proves calendar time
+/// has elapsed since this asset's first post, not that the
+/// `AGGREGATE_SLOTS_7D` window `aggregate_from_ring` reads is actually
+/// populated. A keeper could post one epoch, go dark for 168+ epochs,
+/// then resume with a single epoch, and the `first_epoch`-based guard
+/// below would not block it even though the window it reads would
+/// hold that one epoch alone. Require at least this many of the 168
+/// slots to be real (`Final`): one full backfill window
+/// (`WINDOW_SECS` / `EPOCH_SECS`, 72 epochs) of gap is a normal,
+/// already-supported operating pattern (see
+/// `check_stale_recovers_silently_then_relapses_with_a_fresh_asset_stale`),
+/// so the minimum tolerates exactly one such gap and no more, rather
+/// than an arbitrary ratio.
+pub const MIN_FINAL_EPOCHS_7D: u32 =
+    AGGREGATE_SLOTS_7D - (crate::WINDOW_SECS / crate::EPOCH_SECS) as u32;
+const _: () = assert!(MIN_FINAL_EPOCHS_7D > 0);
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Formula {
@@ -198,6 +215,16 @@ pub struct Aggregates {
 /// `storage::get_window` already does by treating a non-matching or empty
 /// slot as missing).
 ///
+/// `first_epoch` is the asset's own `storage::get_first_epoch`: the
+/// epoch its first signal was EVER posted at. PR #25 review: comparing
+/// `latest_epoch` directly against `AGGREGATE_SLOTS_7D` only guards the
+/// subtraction below from underflowing, not a real history check — on
+/// a real network every epoch number is unix-time-derived and far
+/// larger than 168, so that comparison alone never rejects a
+/// brand-new asset. The real requirement is that this asset has been
+/// posting for at least `AGGREGATE_SLOTS_7D` epochs of its OWN
+/// history, measured from `first_epoch`.
+///
 /// Every failure here is `AggregationFailed` (110), never `SanityBoundFailed`
 /// (104): the latter is about one posted `SignalSet` failing a bound check,
 /// this is about the ring not having enough history or data to score from,
@@ -207,14 +234,23 @@ pub fn aggregate_from_ring(
     env: &Env,
     asset: &Address,
     latest_epoch: u64,
+    first_epoch: u64,
 ) -> Result<Aggregates, Error> {
-    if latest_epoch + 1 < AGGREGATE_SLOTS_7D as u64 {
+    if latest_epoch + 1 < first_epoch + AGGREGATE_SLOTS_7D as u64 {
         // Not enough history yet for a 7 day baseline; treat as stale
         // rather than scoring on a partial window silently.
         return Err(Error::AggregationFailed);
     }
     let start = latest_epoch + 1 - AGGREGATE_SLOTS_7D as u64;
     let window = storage::get_window(env, asset, start, AGGREGATE_SLOTS_7D);
+
+    // PR #27 review (round 2): see `MIN_FINAL_EPOCHS_7D`'s own doc
+    // comment. `first_epoch`-based calendar time alone does not
+    // guarantee this window is populated; count it directly.
+    let final_slots = window.iter().filter(|slot| slot.is_some()).count() as u32;
+    if final_slots < MIN_FINAL_EPOCHS_7D {
+        return Err(Error::AggregationFailed);
+    }
 
     let latest = window
         .get(AGGREGATE_SLOTS_7D - 1)

@@ -115,6 +115,19 @@ pub enum DataKey {
     /// announced stale state, and clears when a fresh, non-stale
     /// epoch is scored.
     StaleAnnounced(Address),
+    /// PR #25 review: the first epoch ever successfully posted for
+    /// this asset (a global, unix-time-derived epoch number, not a
+    /// per-asset counter starting at 0). Set once, on the asset's
+    /// first successful `post_signals` call, and never moved
+    /// afterward, even if that epoch is later overturned: the point
+    /// is "when did real history for this asset begin," not "what is
+    /// the oldest epoch still present." Every "N epochs of history"
+    /// check (the 7 day score baseline, `median_liquidity`, the Tier
+    /// 1 Depeg/IssuerFreeze baselines in `EventRegistry`) must measure
+    /// against this, not against the newest epoch's own absolute
+    /// number, which is always large and unrelated to how long this
+    /// particular asset has actually been posting.
+    FirstEpoch(Address),
     Assets,
     Formula,
 }
@@ -355,6 +368,25 @@ fn get_newest_epoch(env: &Env, asset: &Address) -> Option<u64> {
 /// `is_stale`, `median_liquidity` all need the newest posted epoch).
 pub fn get_newest_epoch_pub(env: &Env, asset: &Address) -> Option<u64> {
     get_newest_epoch(env, asset)
+}
+
+/// PR #25 review: the first epoch ever successfully posted for this
+/// asset, `None` before its first `post_signals` call ever succeeds.
+pub fn get_first_epoch(env: &Env, asset: &Address) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::FirstEpoch(asset.clone()))
+}
+
+/// Sets `FirstEpoch(asset)` if and only if it is not already set.
+/// Called from `post_signals` after a genuinely new epoch is recorded;
+/// idempotent on every call after the first.
+pub fn set_first_epoch_if_unset(env: &Env, asset: &Address, epoch: u64) {
+    if get_first_epoch(env, asset).is_none() {
+        env.storage()
+            .persistent()
+            .set(&DataKey::FirstEpoch(asset.clone()), &epoch);
+    }
 }
 
 /// Review item C1/C5: the newest epoch known to be effectively final.
