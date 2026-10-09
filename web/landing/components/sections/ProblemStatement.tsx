@@ -48,8 +48,11 @@ export function ProblemStatement() {
     >
       {/* Full-bleed, no max-w-* wrapper — same pattern as How It Works'
           row block, so this spans edge to edge instead of sitting
-          centered with oatmeal gutters on both sides. */}
-      <div ref={containerRef} className="grid md:grid-cols-2 md:items-stretch">
+          centered with oatmeal gutters on both sides. 40/60 split (not an
+          even 50/50) so the video reads with real visual weight instead
+          of just filling its own half; the text column still has enough
+          width to read comfortably at md. */}
+      <div ref={containerRef} className="grid md:grid-cols-[2fr_3fr] md:items-stretch">
         <div data-reveal className="flex flex-col justify-center px-6 py-16 md:px-16 md:py-24">
           <Eyebrow tone="graphite">{problem.eyebrow}</Eyebrow>
           <h2 className="mt-4 max-w-xl font-display text-4xl leading-[0.95] tracking-tight text-slate-black md:text-5xl">
