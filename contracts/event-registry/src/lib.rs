@@ -926,8 +926,16 @@ fn check_depeg(
         return Err(Error::Tier1CheckFailed);
     }
 
-    // 7 day baseline, strictly before the window.
-    if window_start_epoch < BASELINE_EPOCHS {
+    // 7 day baseline, strictly before the window. PR #25 review:
+    // `window_start_epoch < BASELINE_EPOCHS` alone only guards the
+    // subtraction below from underflowing; on a real network
+    // `window_start_epoch` is always far larger than `BASELINE_EPOCHS`
+    // (168), so that comparison never actually requires the asset to
+    // have 168 epochs of its OWN history. Measure against
+    // `first_epoch` instead: the baseline must fall entirely within
+    // real history, not merely within absolute-epoch-number room.
+    let first_epoch = oracle.first_epoch(asset).ok_or(Error::Tier1CheckFailed)?;
+    if window_start_epoch < first_epoch + BASELINE_EPOCHS {
         return Err(Error::Tier1CheckFailed);
     }
     let baseline_start = window_start_epoch - BASELINE_EPOCHS;
@@ -962,10 +970,20 @@ fn check_issuer_freeze(
 ) -> Result<u64, Error> {
     let ring = oracle.ring(asset);
     let newest_epoch = oracle.newest_epoch(asset).ok_or(Error::Tier1CheckFailed)?;
+    let first_epoch = oracle.first_epoch(asset).ok_or(Error::Tier1CheckFailed)?;
     let now = env.ledger().timestamp();
 
+    // PR #25 review: unlike `check_depeg`, this window has no
+    // missing-epoch tally of its own (`clawback_sum`/`revocation_sum`
+    // below just accumulate whatever real data exists), so this guard
+    // is the ONLY thing standing between a brand-new asset and a
+    // 7-day-pattern check computed from however few epochs it has
+    // actually posted. Must measure against `first_epoch`, not
+    // `newest_epoch` alone, which is always far larger than
+    // `BASELINE_EPOCHS` on a real network regardless of this asset's
+    // own history.
     let window_epochs: u64 = BASELINE_EPOCHS;
-    if newest_epoch + 1 < window_epochs {
+    if newest_epoch + 1 < first_epoch + window_epochs {
         return Err(Error::Tier1CheckFailed);
     }
     let window_start_epoch = newest_epoch + 1 - window_epochs;

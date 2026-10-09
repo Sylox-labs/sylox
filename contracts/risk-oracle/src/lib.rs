@@ -217,6 +217,7 @@ impl RiskOracle {
         s.endpoint = StakingClient::new(&env, &config.staking).aggregate(&asset, &s.epoch);
 
         storage::set_signals(&env, &asset, s.epoch, &s);
+        storage::set_first_epoch_if_unset(&env, &asset, s.epoch);
 
         let pending_until = now + SIGNAL_DISPUTE_SECS;
         let wrote = storage::write_ring_slot(&env, &asset, s.epoch, &s, pending_until);
@@ -584,6 +585,18 @@ impl RiskOracle {
         storage::get_newest_epoch_pub(&env, &asset)
     }
 
+    /// PR #25 review: read-only, no auth. The first epoch ever
+    /// successfully posted for this asset. `EventRegistry`'s own
+    /// Tier 1 Depeg and IssuerFreeze history baselines need this for
+    /// the same reason `RiskOracle`'s own score and `median_liquidity`
+    /// do: the newest epoch's own absolute number is always far
+    /// larger than any window length on a real network, so it alone
+    /// can never tell a brand-new asset from one with years of
+    /// history. `None` before the asset's first posting.
+    pub fn first_epoch(env: Env, asset: Address) -> Option<u64> {
+        storage::get_first_epoch(&env, &asset)
+    }
+
     /// technical-doc.md Section 12.1, 6.2. `set_formula` rejects any
     /// weight set that does not sum to 10,000.
     pub fn set_formula(
@@ -747,7 +760,15 @@ impl RiskOracle {
         let Some(newest) = storage::get_newest_epoch_pub(&env, &asset) else {
             return 0;
         };
-        if newest + 1 < MEDIAN_WINDOW_SLOTS as u64 {
+        // PR #25 review: `newest` alone is always far larger than
+        // `MEDIAN_WINDOW_SLOTS` on a real network (unix-time-derived
+        // epoch numbers), so this must be measured against how long
+        // THIS asset has actually been posting, not against the
+        // absolute epoch number.
+        let Some(first) = storage::get_first_epoch(&env, &asset) else {
+            return 0;
+        };
+        if newest + 1 < first + MEDIAN_WINDOW_SLOTS as u64 {
             return 0;
         }
         let start = newest + 1 - MEDIAN_WINDOW_SLOTS as u64;
@@ -1170,18 +1191,30 @@ fn recompute_score(env: &Env, asset: &Address, newest_final: u64) -> Result<(), 
         // announces the transition from there.
         return Ok(());
     }
-    if newest_final + 1 < AGGREGATE_SLOTS_7D as u64 {
+    // PR #25 review: comparing `newest_final` directly against
+    // `AGGREGATE_SLOTS_7D` only guards the subtraction below from
+    // underflowing; it is not a real history check. On a real
+    // network, epoch numbers are unix-time-derived (around 497,000 as
+    // of this fix), always far larger than 168, so that comparison
+    // never fires and a brand-new asset gets scored from however many
+    // epochs it has actually posted, not the 168 (7 days) review
+    // decision D2 requires. The real check is against how long THIS
+    // asset has actually been posting, tracked by `FirstEpoch`.
+    let Some(first_epoch) = storage::get_first_epoch(env, asset) else {
+        return Ok(()); // Never posted; nothing to score.
+    };
+    if newest_final + 1 < first_epoch + AGGREGATE_SLOTS_7D as u64 {
         // Not enough history yet for the 7 day baseline every component
         // needs (Section 6.5); review decision D2: a new asset with
-        // fewer than 168 epochs reads as stale, by design, documented
-        // here and in the PR report.
+        // fewer than 168 epochs of its OWN history reads as stale, by
+        // design, documented here and in the PR report.
         return Ok(());
     }
 
     let cfg = storage::get_asset_config(env, asset).ok_or(Error::UnknownAsset)?;
     let formula = storage::get_formula(env).ok_or(Error::NotInitialized)?;
     let l_target = l_target_for(&cfg);
-    let aggregates = score::aggregate_from_ring(env, asset, newest_final)?;
+    let aggregates = score::aggregate_from_ring(env, asset, newest_final, first_epoch)?;
     let score::ScoreResult {
         score: raw,
         forced_warning,
