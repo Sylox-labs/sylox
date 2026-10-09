@@ -96,10 +96,33 @@ else
 fi
 
 # -- Write: post one fresh epoch, confirm it becomes the newest --
+#
+# The freshest CLOSED epoch right now may already be posted (e.g.
+# deploy/post-demo-signals.sh just ran against this same asset), so
+# posting it again would fail with EpochAlreadyPosted. Pick whichever
+# is later: the freshest closed epoch, or one past whatever
+# newest_epoch already reports. If that lands on an epoch that
+# hasn't closed yet, wait for it: this is a smoke test proving
+# correctness, not a latency benchmark.
 
-NOW="$(date +%s)"
 EPOCH_SECS=3600
-FRESH_EPOCH=$(( NOW / EPOCH_SECS - 1 ))
+current_newest="$(invoke_view "$RO_ID" newest_epoch --asset "$ASSET_ID")"
+NOW="$(date +%s)"
+freshest_closed=$(( NOW / EPOCH_SECS - 1 ))
+if [[ "$current_newest" != "null" && -n "$current_newest" ]]; then
+  FRESH_EPOCH=$(( current_newest + 1 > freshest_closed ? current_newest + 1 : freshest_closed ))
+else
+  FRESH_EPOCH="$freshest_closed"
+fi
+
+fresh_epoch_close=$(( (FRESH_EPOCH + 1) * EPOCH_SECS ))
+NOW="$(date +%s)"
+if (( fresh_epoch_close > NOW )); then
+  wait_secs=$(( fresh_epoch_close - NOW ))
+  echo "waiting ${wait_secs}s for epoch $FRESH_EPOCH to close before posting it..."
+  sleep "$wait_secs"
+fi
+
 inputs_json=$(jq -nc --arg epoch "$FRESH_EPOCH" '{epoch: ($epoch|tonumber), smoke_test: true}')
 inputs_hash="$(printf '%s' "$inputs_json" | shasum -a 256 | cut -d' ' -f1)"
 signal_set="{\"epoch\":$FRESH_EPOCH,\"posted_at\":0,\"peg_ratio\":\"10000000\",\"peg_ratio_p10\":\"9990000\",\"liquidity_2pct\":\"500000000000\",\"redemption_net\":\"0\",\"supply\":\"10000000000000\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
@@ -107,7 +130,7 @@ signal_set="{\"epoch\":$FRESH_EPOCH,\"posted_at\":0,\"peg_ratio\":\"10000000\",\
 post_out="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
   post_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --s "$signal_set" 2>&1)"
 if [[ $? -ne 0 ]]; then
-  fail "post_signals for a fresh epoch failed: $post_out"
+  fail "post_signals for epoch $FRESH_EPOCH failed: $post_out"
 else
   out="$(invoke_view "$RO_ID" newest_epoch --asset "$ASSET_ID")"
   if [[ "$out" == "$FRESH_EPOCH" ]]; then
