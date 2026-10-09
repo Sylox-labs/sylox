@@ -95,47 +95,67 @@ else
   fail "EventRegistry.active_event_count(asset) == $out, expected 0"
 fi
 
-# -- Write: post one not-yet-posted closed epoch, confirm it reads
-#    back correctly --
+# -- Write: post one not-yet-posted epoch, confirm it reads back --
 #
-# The freshest CLOSED epoch right now may already be posted (e.g.
-# deploy/post-demo-signals.sh just ran against this same asset), so
-# posting it again would fail with EpochAlreadyPosted, and the next
-# NEW epoch might not close for up to an hour: waiting for it would
-# make this smoke test impractically slow. Instead scan backward from
-# the freshest closed epoch, within the 72h backfill window, for the
-# first one `signals` reports as not yet posted, and post that one.
+# "Post one fresh epoch and confirm it appears as the newest epoch"
+# is straightforward only when the tracked asset isn't already
+# caught up to the current hour. Right after
+# deploy/post-demo-signals.sh, it usually is: the freshest closed
+# epoch is already posted, and the next NEW one won't close for up
+# to an hour, which would make this smoke test impractically slow to
+# wait for. So: if there's a genuinely fresh (newer than
+# newest_epoch, already closed) epoch available, post that one and
+# confirm it becomes the newest, exactly as asked. Otherwise, fall
+# back to scanning backward for the newest already-closed epoch that
+# is NOT yet posted, and confirm that one round-trips correctly via
+# `signals` instead, since it proves the same write path without an
+# unbounded wait.
 
 EPOCH_SECS=3600
+current_newest="$(invoke_view "$RO_ID" newest_epoch --asset "$ASSET_ID")"
 NOW="$(date +%s)"
 freshest_closed=$(( NOW / EPOCH_SECS - 1 ))
+
 FRESH_EPOCH=""
-for (( candidate = freshest_closed; candidate > freshest_closed - 72; candidate-- )); do
-  existing="$(invoke_view "$RO_ID" signals --asset "$ASSET_ID" --epoch "$candidate")"
-  if [[ "$existing" == "null" ]]; then
-    FRESH_EPOCH="$candidate"
-    break
-  fi
-done
-if [[ -z "$FRESH_EPOCH" ]]; then
-  fail "every epoch in the last 72h is already posted; cannot find an unposted epoch to test a write with"
-  FRESH_EPOCH="$freshest_closed"  # fall through so the rest of the script still runs; this path already failed above
+EXPECT_NEWEST=0
+if [[ "$current_newest" == "null" || -z "$current_newest" || "$current_newest" -lt "$freshest_closed" ]]; then
+  FRESH_EPOCH="$freshest_closed"
+  EXPECT_NEWEST=1
+else
+  for (( candidate = freshest_closed; candidate > freshest_closed - 72; candidate-- )); do
+    existing="$(invoke_view "$RO_ID" signals --asset "$ASSET_ID" --epoch "$candidate")"
+    if [[ "$existing" == "null" ]]; then
+      FRESH_EPOCH="$candidate"
+      break
+    fi
+  done
 fi
 
-inputs_json=$(jq -nc --arg epoch "$FRESH_EPOCH" '{epoch: ($epoch|tonumber), smoke_test: true}')
-inputs_hash="$(printf '%s' "$inputs_json" | shasum -a 256 | cut -d' ' -f1)"
-signal_set="{\"epoch\":$FRESH_EPOCH,\"posted_at\":0,\"peg_ratio\":\"10000000\",\"peg_ratio_p10\":\"9990000\",\"liquidity_2pct\":\"500000000000\",\"redemption_net\":\"0\",\"supply\":\"10000000000000\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
-
-post_out="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
-  post_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --s "$signal_set" 2>&1)"
-if [[ $? -ne 0 ]]; then
-  fail "post_signals for epoch $FRESH_EPOCH failed: $post_out"
+if [[ -z "$FRESH_EPOCH" ]]; then
+  fail "every epoch in the last 72h is already posted; cannot find an unposted epoch to test a write with"
 else
-  out="$(invoke_view "$RO_ID" newest_epoch --asset "$ASSET_ID")"
-  if [[ "$out" == "$FRESH_EPOCH" ]]; then
-    pass "a freshly posted epoch ($FRESH_EPOCH) appears as newest_epoch"
+  inputs_json=$(jq -nc --arg epoch "$FRESH_EPOCH" '{epoch: ($epoch|tonumber), smoke_test: true}')
+  inputs_hash="$(printf '%s' "$inputs_json" | shasum -a 256 | cut -d' ' -f1)"
+  signal_set="{\"epoch\":$FRESH_EPOCH,\"posted_at\":0,\"peg_ratio\":\"10000000\",\"peg_ratio_p10\":\"9990000\",\"liquidity_2pct\":\"500000000000\",\"redemption_net\":\"0\",\"supply\":\"10000000000000\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
+
+  post_out="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
+    post_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --s "$signal_set" 2>&1)"
+  if [[ $? -ne 0 ]]; then
+    fail "post_signals for epoch $FRESH_EPOCH failed: $post_out"
+  elif (( EXPECT_NEWEST )); then
+    out="$(invoke_view "$RO_ID" newest_epoch --asset "$ASSET_ID")"
+    if [[ "$out" == "$FRESH_EPOCH" ]]; then
+      pass "a freshly posted epoch ($FRESH_EPOCH) appears as newest_epoch"
+    else
+      fail "posted epoch $FRESH_EPOCH but newest_epoch reports $out"
+    fi
   else
-    fail "posted epoch $FRESH_EPOCH but newest_epoch reports $out"
+    out="$(invoke_view "$RO_ID" signals --asset "$ASSET_ID" --epoch "$FRESH_EPOCH")"
+    if [[ "$out" == *"\"epoch\":$FRESH_EPOCH"* ]]; then
+      pass "a freshly posted epoch ($FRESH_EPOCH, a backfilled gap since the asset was already caught up to now) reads back correctly"
+    else
+      fail "posted epoch $FRESH_EPOCH but signals(asset, $FRESH_EPOCH) does not reflect it: $out"
+    fi
   fi
 fi
 
