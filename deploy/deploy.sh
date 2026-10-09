@@ -152,10 +152,24 @@ DEPLOYER_ADDR="$("$STELLAR_BIN" keys address "$DEPLOYER")"
 
 log "[4/7] TUSD test collateral"
 
-TUSD_ID="$("$STELLAR_BIN" contract asset deploy --asset "$TUSD_CODE:$ISSUER_ADDR" \
-  --source-account "$DEPLOYER" --network testnet 2>&1 | tail -1)"
-[[ "$TUSD_ID" =~ ^C[A-Z0-9]{55}$ ]] || die "unexpected TUSD deploy output: $TUSD_ID"
-log "TUSD contract: $TUSD_ID"
+# The SAC's contract id is deterministic (derived from asset code +
+# issuer, not a salt): re-running this script between two testnet
+# wipes, with the same reused issuer identity, asks to deploy the
+# SAME address twice. `stellar contract id asset` always returns that
+# address without deploying anything; only fall through to a real
+# `contract asset deploy` if that address doesn't already exist
+# on-chain (an "already exists" failure on deploy is then expected
+# and not fatal, matching the derived id).
+TUSD_ID="$("$STELLAR_BIN" contract id asset --asset "$TUSD_CODE:$ISSUER_ADDR" --network testnet)"
+if deploy_out="$("$STELLAR_BIN" contract asset deploy --asset "$TUSD_CODE:$ISSUER_ADDR" \
+     --source-account "$DEPLOYER" --network testnet 2>&1)"; then
+  log "TUSD contract deployed: $TUSD_ID"
+elif echo "$deploy_out" | grep -qi "already exists\|ExistingValue"; then
+  log "TUSD contract already exists at the derived address: $TUSD_ID"
+else
+  die "TUSD deploy failed:
+$deploy_out"
+fi
 
 ensure_trustline() {
   local holder="$1"
