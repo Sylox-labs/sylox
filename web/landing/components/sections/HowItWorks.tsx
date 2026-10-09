@@ -4,6 +4,7 @@ import { useRef } from "react";
 import Image from "next/image";
 import { howItWorks } from "@/content";
 import { useScrollReveal } from "@/lib/motion/useScrollReveal";
+import { Eyebrow } from "@sylox/ui/components";
 
 // One wireframe render per part, each a loose visual metaphor rather than
 // a literal diagram: an eye for the Oracle's continuous watching, a wax
@@ -28,9 +29,9 @@ export function HowItWorks() {
       className="bg-silo-oatmeal"
     >
       <div ref={containerRef} className="px-6 pb-16 pt-24 md:px-16 md:pb-24 md:pt-32">
-        <p data-reveal className="font-mono text-xs uppercase tracking-[0.15em] text-anchor-graphite md:text-sm">
+        <Eyebrow tone="graphite" data-reveal>
           {howItWorks.eyebrow}
-        </p>
+        </Eyebrow>
         <h2 data-reveal className="mt-4 max-w-3xl font-display text-4xl leading-[0.95] tracking-tight text-slate-black md:text-6xl">
           {howItWorks.heading}
         </h2>

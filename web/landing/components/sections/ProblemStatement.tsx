@@ -5,6 +5,7 @@ import { Volume2, VolumeX } from "lucide-react";
 import { problem } from "@/content";
 import { useInViewport } from "@/lib/motion/useInViewport";
 import { useScrollReveal } from "@/lib/motion/useScrollReveal";
+import { Eyebrow } from "@sylox/ui/components";
 
 /**
  * Full-bleed two-column row, no max-w-* on the outer grid (same pattern as
@@ -50,9 +51,7 @@ export function ProblemStatement() {
           centered with oatmeal gutters on both sides. */}
       <div ref={containerRef} className="grid md:grid-cols-2 md:items-stretch">
         <div data-reveal className="flex flex-col justify-center px-6 py-16 md:px-16 md:py-24">
-          <p className="font-mono text-xs uppercase tracking-[0.15em] text-anchor-graphite md:text-sm">
-            {problem.eyebrow}
-          </p>
+          <Eyebrow tone="graphite">{problem.eyebrow}</Eyebrow>
           <h2 className="mt-4 max-w-xl font-display text-4xl leading-[0.95] tracking-tight text-slate-black md:text-5xl">
             {problem.heading}
           </h2>

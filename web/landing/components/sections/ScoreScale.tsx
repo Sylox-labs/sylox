@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { scoreScale } from "@/content";
-import { RISK_BANDS, type RiskBandName } from "@/lib/risk-bands";
+import { RISK_BANDS, type RiskBandName } from "@sylox/ui/risk-bands";
+import { Eyebrow } from "@sylox/ui/components";
 
 const SAMPLE_SCORES: Record<RiskBandName, number | "EVENT"> = {
   normal: 12,
@@ -98,9 +99,7 @@ export function ScoreScale() {
       className="bg-slate-black px-6 py-24 md:px-16 md:py-32"
     >
       <div className="mx-auto max-w-5xl">
-        <p className="font-mono text-xs uppercase tracking-[0.15em] text-cyber-tin md:text-sm">
-          {scoreScale.eyebrow}
-        </p>
+        <Eyebrow>{scoreScale.eyebrow}</Eyebrow>
         <h2 className="mt-4 font-display text-3xl leading-[0.95] tracking-tight text-silo-oatmeal md:text-5xl">
           {scoreScale.heading}
         </h2>

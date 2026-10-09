@@ -1,0 +1,8 @@
+{
+  "name": "sylox",
+  "private": true,
+  "workspaces": [
+    "web/landing",
+    "web/shared/ui"
+  ]
+}
