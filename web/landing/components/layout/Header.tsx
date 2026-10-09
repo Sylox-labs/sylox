@@ -192,12 +192,6 @@ export function Header() {
           </nav>
 
           <div className="flex items-center gap-4">
-            <a
-              href="#early-access"
-              className="hidden rounded-full bg-risk-crimson px-5 py-2 text-sm font-medium text-slate-black transition-colors hover:bg-risk-crimson-tint md:inline-block"
-            >
-              {nav.cta}
-            </a>
             <button
               ref={menuButtonRef}
               type="button"
@@ -260,15 +254,6 @@ export function Header() {
         >
           {nav.github.label}
           <ArrowUpRight className="h-5 w-5" aria-hidden="true" />
-        </a>
-        <a
-          href="#early-access"
-          data-menu-item
-          tabIndex={isMenuOpen ? 0 : -1}
-          className="mt-4 inline-block rounded-full bg-risk-crimson px-5 py-3 text-center text-sm font-medium text-slate-black"
-          onClick={() => setIsMenuOpen(false)}
-        >
-          {nav.cta}
         </a>
       </div>
     </>

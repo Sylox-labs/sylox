@@ -25,7 +25,6 @@ export const nav = {
     label: "GitHub",
     href: "https://github.com/Sylox-labs",
   },
-  cta: "Get early access",
 };
 
 export const hero = {
@@ -39,9 +38,8 @@ export const hero = {
       heading: "Know your issuer before it fails.",
       body: "Sylox gives every anchor issued asset on Stellar a public risk score, and a market to protect yourself if the issuer behind it breaks.",
       ctas: [
-        { label: "Get early access", href: "#early-access", variant: "primary" },
         { label: "Read the spec", href: "https://github.com/Sylox-labs", variant: "secondary" },
-      ],
+      ] as HeroCta[],
       _source: "brief §7.2 panel 1",
     },
     {
@@ -166,16 +164,15 @@ export const status = {
   body: "Sylox is in development. Here is the honest state of things.",
   items: [
     { label: "Protocol specification", tag: "PUBLISHED" },
-    { label: "Risk Oracle contract", tag: "IN DEVELOPMENT" },
-    {
-      label: "Credit Event Registry and Protection Markets contracts",
-      tag: "NEXT",
-    },
-    { label: "Testnet with real mainnet data", tag: "PLANNED" },
+    { label: "Risk Oracle contract", tag: "BUILT AND TESTED" },
+    { label: "Credit Event Registry contract", tag: "BUILT AND TESTED" },
+    { label: "Staking and Treasury contracts", tag: "BUILT AND TESTED" },
+    { label: "Testnet deployment", tag: "IN PROGRESS" },
+    { label: "Protection Markets contracts", tag: "NEXT" },
     { label: "Security audit", tag: "BEFORE MAINNET" },
     { label: "Protection markets on mainnet", tag: "AFTER LEGAL REVIEW" },
   ],
-  _source: "brief §7.9; roadmap per prd.md §15.2",
+  _source: "brief §7.9; roadmap per prd.md §15.2; updated 2026-10-09 to reflect actual build state",
 };
 
 export const faq = {
@@ -233,21 +230,6 @@ export const openSource = {
   ],
   link: { label: "View the code on GitHub", href: "https://github.com/Sylox-labs" },
   _source: "brief §7.8; license per prd.md §17.3",
-};
-
-export const finalCta = {
-  heading: "Security infrastructure for a fragmented world.",
-  body: "Get early access to the feed, the testnet, and the first protection markets.",
-  roles: [
-    "Wallet",
-    "Lending protocol",
-    "Anchor",
-    "Treasury or fintech",
-    "Market maker",
-    "Other",
-  ],
-  submitLabel: "Get early access",
-  _source: "brief §7.11",
 };
 
 export const footer = {
