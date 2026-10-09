@@ -1,43 +1,56 @@
 "use client";
 
-import { useRef } from "react";
+import { useMemo, useRef } from "react";
 import { status } from "@/content";
 import { useScrollReveal } from "@/lib/motion/useScrollReveal";
 
-// Each status gets a genuinely distinct chip treatment, not a uniform dot:
-// solid fills for the two states that have actually happened (done, or
-// actively underway), a bordered chip for everything still ahead.
-const TAG_CHIP: Record<string, string> = {
-  PUBLISHED: "border border-slate-black bg-slate-black text-silo-oatmeal",
-  "IN DEVELOPMENT": "border border-risk-crimson bg-risk-crimson text-slate-black",
-  NEXT: "border border-anchor-graphite text-anchor-graphite",
-  PLANNED: "border border-anchor-graphite text-anchor-graphite",
-  "BEFORE MAINNET": "border border-anchor-graphite text-anchor-graphite",
-  "AFTER LEGAL REVIEW": "border border-anchor-graphite text-anchor-graphite",
+type ItemState = "done" | "active" | "future";
+
+function stateOf(tag: string): ItemState {
+  if (tag === "IN PROGRESS") return "active";
+  if (tag === "NEXT" || tag === "BEFORE MAINNET" || tag === "AFTER LEGAL REVIEW") return "future";
+  return "done";
+}
+
+const MARKER: Record<ItemState, string> = {
+  done: "bg-slate-black",
+  active: "bg-risk-crimson",
+  future: "border border-cement-grey/60",
 };
 
-// Desktop's timeline dot is small — a plain fill color reads better there
-// than the bordered-chip treatment the mobile cards use.
-const TAG_DOT: Record<string, string> = {
-  PUBLISHED: "bg-slate-black",
-  "IN DEVELOPMENT": "bg-risk-crimson",
-  NEXT: "bg-cement-grey",
-  PLANNED: "bg-cement-grey",
-  "BEFORE MAINNET": "bg-cement-grey",
-  "AFTER LEGAL REVIEW": "bg-cement-grey",
+const LABEL: Record<ItemState, string> = {
+  done: "text-slate-black",
+  active: "text-slate-black",
+  future: "text-anchor-graphite/60",
+};
+
+const TAG: Record<ItemState, string> = {
+  done: "text-anchor-graphite",
+  active: "text-risk-crimson",
+  future: "text-anchor-graphite/50",
 };
 
 /**
- * On mobile: big stacked index cards, one per milestone, each full width
- * with its own number treated as giant ghost type bleeding off the card
- * edge (same device as How It Works' panels) and the status rendered as
- * a real colored chip, not a small dot — six confident statements in
- * sequence, not a checklist. Desktop keeps the horizontal timeline,
- * which has room to read as a line without needing this per-card weight.
+ * A build log, not a roadmap graphic: one continuous list of one-line
+ * entries (marker + index + label + tag), identical shape at every
+ * viewport — no separate mobile treatment, no dots-and-connecting-line
+ * timeline, no per-item card. A single giant "done/total" statement on
+ * the left is the one hero-scale moment, echoing the big-numeral device
+ * used elsewhere on the page (How It Works, the old ghost numerals) but
+ * spent once here rather than repeated per item. Light section: with
+ * How It Works and Who It's For locked to dark (their wireframe renders
+ * assume a near-black ground), Status sits between them as the light
+ * section required to keep the whole page's background strictly
+ * alternating rather than running three-plus dark sections in a row.
  */
 export function Status() {
   const containerRef = useRef<HTMLDivElement>(null);
   useScrollReveal(containerRef);
+
+  const doneCount = useMemo(
+    () => status.items.filter((item) => stateOf(item.tag) === "done").length,
+    [],
+  );
 
   return (
     <section
@@ -45,73 +58,61 @@ export function Status() {
       data-theme="light"
       className="bg-silo-oatmeal px-6 py-24 md:px-16 md:py-32"
     >
-      <div ref={containerRef} className="mx-auto max-w-5xl">
-        <p data-reveal className="font-mono text-xs uppercase tracking-[0.15em] text-anchor-graphite md:text-sm">
-          {status.eyebrow}
-        </p>
-        <h2
-          data-reveal
-          className="mt-4 max-w-2xl font-display text-4xl leading-[0.95] tracking-tight text-slate-black md:text-6xl"
-        >
-          {status.heading}
-        </h2>
-        <p data-reveal className="mt-4 max-w-md text-base leading-relaxed text-anchor-graphite md:text-lg">
-          {status.body}
-        </p>
+      <div
+        ref={containerRef}
+        className="mx-auto grid max-w-5xl gap-12 md:grid-cols-[1fr_1.3fr] md:gap-20"
+      >
+        <div>
+          <p data-reveal className="font-mono text-xs uppercase tracking-[0.15em] text-anchor-graphite md:text-sm">
+            {status.eyebrow}
+          </p>
+          <h2
+            data-reveal
+            className="mt-4 font-display text-4xl leading-[0.95] tracking-tight text-slate-black md:text-6xl"
+          >
+            {status.heading}
+          </h2>
+          <p data-reveal className="mt-4 max-w-sm text-base leading-relaxed text-anchor-graphite md:text-lg">
+            {status.body}
+          </p>
 
-        {/* Mobile: stacked index cards. */}
-        <div className="mt-16 flex flex-col gap-4 md:hidden">
-          {status.items.map((item, i) => (
-            <div
-              key={item.label}
-              data-reveal
-              className="relative overflow-hidden rounded-sm border border-cement-grey/40 bg-silo-oatmeal p-6"
-            >
-              <span
-                aria-hidden="true"
-                className="pointer-events-none absolute -right-3 -top-6 select-none font-mono text-8xl font-bold leading-none text-cement-grey/15"
+          <div data-reveal className="mt-12 md:mt-20">
+            <div className="font-display text-7xl leading-none tracking-tight text-slate-black md:text-8xl">
+              {doneCount}
+              <span className="text-cement-grey">/{status.items.length}</span>
+            </div>
+            <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.15em] text-anchor-graphite/70 md:text-xs">
+              Steps shipped
+            </p>
+          </div>
+        </div>
+
+        <div data-reveal className="divide-y divide-cement-grey/30 border-t border-cement-grey/30 md:mt-2">
+          {status.items.map((item, i) => {
+            const state = stateOf(item.tag);
+            return (
+              <div
+                key={item.label}
+                className="flex items-baseline gap-4 py-5 md:gap-6 md:py-6"
               >
-                {String(i + 1).padStart(2, "0")}
-              </span>
-              <div className="relative">
                 <span
-                  className={`inline-block rounded-full px-3 py-1 font-mono text-[10px] font-medium uppercase tracking-wide ${
-                    TAG_CHIP[item.tag] ?? "border border-anchor-graphite text-anchor-graphite"
-                  }`}
+                  aria-hidden="true"
+                  className={`h-2 w-2 shrink-0 translate-y-[-0.1em] rounded-full ${MARKER[state]}`}
+                />
+                <span className="w-6 shrink-0 font-mono text-xs text-cement-grey">
+                  {String(i + 1).padStart(2, "0")}
+                </span>
+                <p className={`flex-1 text-base leading-snug md:text-lg ${LABEL[state]}`}>
+                  {item.label}
+                </p>
+                <span
+                  className={`shrink-0 whitespace-nowrap font-mono text-[10px] uppercase tracking-wide md:text-xs ${TAG[state]}`}
                 >
                   {item.tag}
                 </span>
-                <p className="mt-4 max-w-[80%] font-display text-2xl leading-[1.05] text-slate-black">
-                  {item.label}
-                </p>
               </div>
-            </div>
-          ))}
-        </div>
-
-        {/* Desktop: horizontal timeline. */}
-        <div data-reveal className="mt-20 hidden md:flex">
-          {status.items.map((item, i) => (
-            <div
-              key={item.label}
-              className="relative flex flex-1 flex-col gap-4 px-4 first:pl-0 last:pr-0"
-            >
-              <div className="flex items-center gap-2">
-                <span
-                  className={`h-2.5 w-2.5 shrink-0 rounded-full ${TAG_DOT[item.tag] ?? "bg-cement-grey"}`}
-                  aria-hidden="true"
-                />
-                <div className="h-px flex-1 bg-cement-grey/50" aria-hidden="true" />
-              </div>
-              <span className="font-mono text-[10px] uppercase tracking-wide text-anchor-graphite/70">
-                {String(i + 1).padStart(2, "0")}
-              </span>
-              <p className="text-base leading-snug text-slate-black">{item.label}</p>
-              <span className="font-mono text-xs uppercase tracking-wide text-anchor-graphite">
-                {item.tag}
-              </span>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </section>

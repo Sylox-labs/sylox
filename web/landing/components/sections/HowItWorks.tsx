@@ -24,19 +24,24 @@ export function HowItWorks() {
   return (
     <section
       id="how-it-works"
-      data-theme="dark"
-      className="bg-slate-black"
+      data-theme="light"
+      className="bg-silo-oatmeal"
     >
       <div ref={containerRef} className="px-6 pb-16 pt-24 md:px-16 md:pb-24 md:pt-32">
-        <p data-reveal className="font-mono text-xs uppercase tracking-[0.15em] text-cyber-tin md:text-sm">
+        <p data-reveal className="font-mono text-xs uppercase tracking-[0.15em] text-anchor-graphite md:text-sm">
           {howItWorks.eyebrow}
         </p>
-        <h2 data-reveal className="mt-4 max-w-3xl font-display text-4xl leading-[0.95] tracking-tight text-silo-oatmeal md:text-6xl">
+        <h2 data-reveal className="mt-4 max-w-3xl font-display text-4xl leading-[0.95] tracking-tight text-slate-black md:text-6xl">
           {howItWorks.heading}
         </h2>
       </div>
 
-      <div className="border-t border-cement-grey/20">
+      {/* Each row stays dark regardless of the section's own (now light)
+          theme — the text half is pinned to bg-slate-black explicitly
+          rather than inheriting it, and the image half is already a
+          near-black render baked into the file, so every pixel in this
+          block reads dark exactly as designed either way. */}
+      <div className="border-t border-cement-grey/20" data-theme="dark">
         {howItWorks.cards.map((card, i) => {
           const panel = PANELS[i];
           const imageFirst = i % 2 === 1;
@@ -47,7 +52,7 @@ export function HowItWorks() {
             >
               <div
                 data-reveal
-                className={`flex flex-col justify-center px-6 py-16 md:px-16 md:py-24 ${imageFirst ? "md:order-2" : ""}`}
+                className={`flex flex-col justify-center bg-slate-black px-6 py-16 md:px-16 md:py-24 ${imageFirst ? "md:order-2" : ""}`}
               >
                 <span className="font-mono text-xs text-cement-grey">
                   {String(i + 1).padStart(2, "0")}
