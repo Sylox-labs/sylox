@@ -31,3 +31,9 @@ A leftover `web/landing/railway.json` from the pre-workspace setup (old `NIXPACK
 ### Why there's also a root-level `railpack.json`
 
 Clearing Root Directory has a second consequence: Railway's builder (Railpack) now scans the *entire* repo to auto-detect what kind of project this is, and the repo root also has `rust-toolchain.toml` for the Soroban contracts. Railpack picked Rust over Node, built a Rust-only environment with no npm installed at all, and the build failed with `npm: not found`. `railpack.json` at the repo root (`{"provider": "node"}`) forces the Node provider explicitly instead of relying on auto-detection, which Railpack's own build log confirms (`Using provider Node from config`).
+
+### `railway.json` is the source of truth, not the dashboard
+
+The Railway dashboard's own "Custom Build Command," "Custom Start Command," and "Watch Paths" fields are a separate, per-service override that takes precedence over `railway.json` whenever both are set. They don't sync with the file. A start command typed into the dashboard while diagnosing an earlier version of this deploy silently kept overriding `railway.json` after the file was fixed and pushed, so the build succeeded but the service still crash-looped on the old command until the dashboard field was corrected too.
+
+If you change a build/deploy setting, change it in `railway.json` and commit it. If the dashboard already has that field filled in, update it to match (or clear it, so it falls back to the file) in the same change, rather than leaving two different values for the same setting in two different places.
