@@ -3,11 +3,13 @@ import { eventRegistryClient } from "./contracts/event-registry";
 import { assetDisplayName } from "./contracts/token";
 import { riskBandFor } from "./band";
 import type { RiskBand } from "@sylox/ui/risk-bands";
-import type { RingSlot, SlotState } from "./contracts/risk-oracle";
+import type { RingSlot, SlotState, SubEpoch } from "./contracts/risk-oracle";
 import type { CoverGate, EventKind } from "./contracts/event-registry";
 
 export const PEG_RATIO_SCALE = 10_000_000; // i128, scale 1e7 (RiskOracle's own doc comment on peg_ratio).
 const EPOCH_SECS = 3600; // technical-doc.md Section 23: epoch_secs is frozen at 3600 (1 hour) for v1.
+const AGGREGATE_SLOTS_7D = 168; // contracts/risk-oracle/src/score.rs's AGGREGATE_SLOTS_7D - the 7-day score baseline (review decision D2), same constant lib.rs's own scoring gate checks against first_epoch.
+const SIGNAL_DISPUTE_SECS = 7_200; // contracts/staking/src/params.rs's SIGNAL_DISPUTE_SECS (2h) - the dispute window an hour must clear before Pending can be promoted to Final; also re-declared locally in contracts/risk-oracle/src/lib.rs with the same value.
 
 /** A Result<T, {message}> from a generated client, normalized to a plain outcome. */
 type SectionResult<T> = { status: "ok"; value: T } | { status: "error"; message: string };
@@ -44,13 +46,7 @@ export interface AssetHeader {
    * verdict. Showing that band would read as "this asset is healthy",
    * which is not something the contract has actually determined yet.
    *
-   * No count of confirmed-vs-required history is shown alongside this -
-   * the 7-day baseline length (168) is a Rust constant
-   * (score.rs's AGGREGATE_SLOTS_7D), not something any contract read
-   * exposes, and approximating it client-side risked a number that could
-   * disagree with the contract's own check. A future `history_status`
-   * read returning the contract's own numbers is the right fix,
-   * tracked for a later contracts change - not approximated here.
+   * See `scoringStart` below for when a real score might arrive.
    */
   band: RiskBand | null;
   /** 0-100, or null when the contract has no score yet (same `epoch === 0` condition as `band`). */
@@ -58,7 +54,33 @@ export interface AssetHeader {
   stale: boolean;
   eventInProgress: boolean;
   eventDeclared: boolean;
+  /**
+   * When a real score might first appear, for the "no score yet" state
+   * only (null once `score` is non-null - nothing left to predict).
+   * `lib.rs`'s own scoring gate (`fn score`, re-review item D2) requires
+   * `newest_final >= first_epoch + AGGREGATE_SLOTS_7D - 1` - 168 FINAL
+   * hours from this asset's own first posted epoch, the 7-day baseline
+   * every score component needs (technical-doc.md Section 6.5), not a
+   * fixed 168 hours of wall-clock time. `(first_epoch + 168h) +
+   * SIGNAL_DISPUTE_SECS` is the EARLIEST that could happen (every hour
+   * finalizing exactly on schedule, no disputes, no backfills): the
+   * 168th hour itself only becomes Final after clearing its own
+   * SIGNAL_DISPUTE_SECS dispute window (contracts/staking/src/params.rs),
+   * so the real 168th-hour-Final moment can land later than this. Never
+   * shown as a promise - see `formatScoringStart` in
+   * `AssetPageClient.tsx`, which always renders this with "around"
+   * wording, never a bare date.
+   */
+  scoringStart: ScoringStart;
 }
+
+export type ScoringStart =
+  // first_epoch() resolved to None (never posted) or the read itself
+  // failed - both read the same to a visitor ("not scored yet"), and
+  // matches tryFetchFirstEpoch's own fallback below (never distinguish
+  // "never posted" from "couldn't tell" - see its own doc comment).
+  | { status: "unknown" }
+  | { status: "pending"; earliestUnixSecs: number }; // (first_epoch + 168h) + SIGNAL_DISPUTE_SECS, in Unix seconds - always rendered with "around"/"earliest" wording, never as a guaranteed date.
 
 function codeFromDisplayName(name: string, asset: string): string {
   const [code] = name.split(":");
@@ -89,6 +111,13 @@ async function fetchHeader(
 
   const config = configTx.result;
 
+  // Only worth asking when there's no real score yet - once a score
+  // exists, nothing is left to predict (scoringStart is shown only in
+  // the "no score yet" UI state).
+  const scoringStart = hasRealScore
+    ? { status: "unknown" as const } // Unused in this branch - the UI never reads scoringStart once score is non-null.
+    : await fetchScoringStart(oracle, asset);
+
   return {
     asset,
     code: codeFromDisplayName(name, asset),
@@ -98,7 +127,30 @@ async function fetchHeader(
     stale,
     eventInProgress: inProgressTx.result,
     eventDeclared: hasRealScore && riskScore.band.tag === "Event",
+    scoringStart,
   };
+}
+
+/**
+ * The earliest a real score could appear - see AssetHeader.scoringStart's
+ * own doc comment for the full "earliest, not a promise" reasoning.
+ *
+ * Hour `first_epoch + AGGREGATE_SLOTS_7D - 1` (the 168th hour, 0-indexed
+ * from first_epoch) is the LAST hour the scoring gate needs to be Final;
+ * it only reaches Final after clearing its own SIGNAL_DISPUTE_SECS
+ * dispute window, so the earliest moment is that hour's own posting time
+ * (`first_epoch + AGGREGATE_SLOTS_7D` hours, i.e. the START of the next
+ * hour after it) plus SIGNAL_DISPUTE_SECS, not a bare `+ 168h`.
+ */
+export async function fetchScoringStart(
+  oracle: ReturnType<typeof riskOracleClient>,
+  asset: string,
+): Promise<ScoringStart> {
+  const firstEpoch = await tryFetchFirstEpoch(oracle, asset);
+  if (firstEpoch === undefined) return { status: "unknown" };
+  const earliestUnixSecs =
+    (Number(firstEpoch) + AGGREGATE_SLOTS_7D) * EPOCH_SECS + SIGNAL_DISPUTE_SECS;
+  return { status: "pending", earliestUnixSecs };
 }
 
 // ---------------------------------------------------------------------------
@@ -179,32 +231,30 @@ export async function fetchConfirmed(
   return { confirmed, latestPending };
 }
 
-/**
- * The v1.5 spec's live(asset) -> Option<(SubEpoch, SignalSet, SlotState)>
- * sub-epoch read isn't on the deployed RiskOracle contract yet (it's
- * being built on a separate branch). This typed interface matches that
- * exact signature so swapping in the real binding later is a one-line
- * change in fetchLive() below, not a redesign of this screen. Until
- * then this always resolves "not deployed" rather than returning any
- * mock numbers, so nothing fake ever reaches the screen.
- */
-export interface SubEpoch {
-  hour: bigint;
-  sub: number;
-}
-
 export type LiveValue =
-  | { status: "not-deployed" }
   | { status: "none" }
-  | { status: "value"; subEpoch: SubEpoch; pegRatio: number; slotState: SlotState["tag"] };
+  | {
+      status: "value";
+      subEpoch: SubEpoch;
+      pegRatio: number;
+      slotState: SlotState["tag"];
+      /** `SignalSet.posted_at`, Ledger timestamp in Unix seconds - for "how old it is" display. */
+      postedAt: number;
+    };
 
-async function fetchLive(_asset: string): Promise<LiveValue> {
-  // Swap this body for a real `riskOracleClient().live({ asset })` call
-  // (signature: live(asset) -> Option<(SubEpoch, SignalSet, SlotState)>)
-  // once that method exists on the deployed contract. Nothing else on
-  // this screen needs to change - LiveValue's "value" case already
-  // matches the real return shape.
-  return { status: "not-deployed" };
+/** technical-doc.md Section 5.9/12.1 (v1.5): the newest POSTED sub-epoch's Pending/challengeable data, distinct from `latest()`'s hourly-only Final/Pending semantics. Never used for `require_holding` or any other payout-adjacent valuation. */
+export async function fetchLive(oracle: ReturnType<typeof riskOracleClient>, asset: string): Promise<LiveValue> {
+  const tx = await oracle.live({ asset });
+  const result = tx.result;
+  if (result === undefined) return { status: "none" };
+  const [subEpoch, signals, slotState] = result;
+  return {
+    status: "value",
+    subEpoch,
+    pegRatio: Number(signals.peg_ratio) / PEG_RATIO_SCALE,
+    slotState: slotState.tag,
+    postedAt: Number(signals.posted_at),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +285,20 @@ export interface PegHistoryPoint {
    * behavior) rather than guessing which ones aren't.
    */
   tracked: boolean;
+  /**
+   * `RingSlot.provisional_sub_coverage` passthrough. `lib.rs`'s own
+   * `refresh_waiting_hour` sets this on EVERY hour still waiting on its
+   * sub-epochs, not only disputed ones - it is set for a Pending slot (N
+   * of 12 sub-epochs posted, none yet disputed) exactly as much as for a
+   * Disputed one (N of 12 undisputed sub-epochs still posted, 0 included
+   * when every posted sub-epoch is currently disputed). `null` for an
+   * hourly-fallback-path hour or a never-posted one. Final hours stay as
+   * they are today - this never affects `pegRatio`/`state` above, only
+   * whether the chart marks the hour provisional, and the exact wording
+   * (Pending vs. Disputed, N > 0 vs. N = 0) comes from pairing this with
+   * `state` - see `PegHistoryChart.tsx`'s own tooltip logic.
+   */
+  provisionalSubCoverage: number | null;
 }
 
 export interface EffectiveRingSlot extends RingSlot {
@@ -355,6 +419,7 @@ export async function fetchPegHistory(
     // itself checks; this screen holds the same rule for what it draws).
     pegRatio: slot.effectiveState === "Final" ? Number(slot.peg_ratio) / PEG_RATIO_SCALE : null,
     tracked: firstEpoch === undefined ? true : slot.epoch >= firstEpoch,
+    provisionalSubCoverage: slot.provisional_sub_coverage ?? null,
   }));
 }
 
@@ -552,7 +617,7 @@ export async function fetchAssetPageData(asset: string): Promise<AssetPageData> 
     await Promise.all([
       section(() => fetchHeader(oracle, asset)),
       section(() => fetchConfirmed(oracle, asset)),
-      section(() => fetchLive(asset)),
+      section(() => fetchLive(oracle, asset)),
       section(() => fetchPegHistory(oracle, asset)),
       section(() => fetchFailureDefinitions(registry, asset)),
       section(() => fetchCoverGate(oracle, registry, asset)),

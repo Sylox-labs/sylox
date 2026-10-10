@@ -4,9 +4,11 @@ import {
   fetchPegHistory,
   fetchConfirmed,
   fetchCoverGate,
+  fetchLive,
+  fetchScoringStart,
   PEG_RATIO_SCALE,
 } from "./asset-data";
-import type { RingSlot, SlotState } from "./contracts/risk-oracle";
+import type { RingSlot, SlotState, SignalSet } from "./contracts/risk-oracle";
 import type { CoverGate } from "./contracts/event-registry";
 
 const RING_SLOTS = 240;
@@ -463,5 +465,127 @@ describe("fetchCoverGate", () => {
     const status = await fetchCoverGate(oracle, registry, "ASSET");
 
     expect(status.gate).toBe("Clear");
+  });
+});
+
+function fakeSignalSet(overrides: Partial<SignalSet> = {}): SignalSet {
+  return {
+    endpoint: { tag: "Unknown", values: undefined },
+    epoch: BigInt(0),
+    inputs_hash: Buffer.alloc(32),
+    issuer_actions: { auth_revocations: 0, clawback_amount: BigInt(0), clawbacks: 0, flag_changes: 0 },
+    liquidity_2pct: BigInt(0),
+    peg_ratio: BigInt(0),
+    peg_ratio_p10: BigInt(0),
+    posted_at: BigInt(0),
+    poster: "GPOSTER",
+    redemption_net: BigInt(0),
+    supply: BigInt(0),
+    supply_change_bps: 0,
+    ...overrides,
+  };
+}
+
+describe("fetchLive", () => {
+  it("returns 'none' when live() resolves to None", async () => {
+    const oracle = { live: async () => ({ result: undefined }) } as unknown as Parameters<
+      typeof fetchLive
+    >[0];
+
+    const value = await fetchLive(oracle, "ASSET");
+
+    expect(value).toEqual({ status: "none" });
+  });
+
+  it("maps a Some result to peg ratio, sub-epoch, slot state, and posted_at", async () => {
+    const oracle = {
+      live: async () => ({
+        result: [
+          { hour: BigInt(497_606), sub: 7 },
+          fakeSignalSet({ peg_ratio: BigInt(9_995_000), posted_at: BigInt(1_000_000) }),
+          { tag: "Pending", values: undefined },
+        ] as const,
+      }),
+    } as unknown as Parameters<typeof fetchLive>[0];
+
+    const value = await fetchLive(oracle, "ASSET");
+
+    expect(value.status).toBe("value");
+    if (value.status !== "value") throw new Error("expected 'value'");
+    expect(value.subEpoch).toEqual({ hour: BigInt(497_606), sub: 7 });
+    expect(value.pegRatio).toBeCloseTo(0.9995, 5);
+    expect(value.slotState).toBe("Pending");
+    expect(value.postedAt).toBe(1_000_000);
+  });
+});
+
+describe("fetchScoringStart", () => {
+  it("says 'unknown' when first_epoch() resolves to None", async () => {
+    const oracle = { first_epoch: async () => ({ result: undefined }) } as unknown as Parameters<
+      typeof fetchScoringStart
+    >[0];
+
+    const start = await fetchScoringStart(oracle, "ASSET");
+
+    expect(start).toEqual({ status: "unknown" });
+  });
+
+  it("says 'unknown' when first_epoch() throws", async () => {
+    const oracle = {
+      first_epoch: async () => {
+        throw new Error("unreachable");
+      },
+    } as unknown as Parameters<typeof fetchScoringStart>[0];
+
+    const start = await fetchScoringStart(oracle, "ASSET");
+
+    expect(start).toEqual({ status: "unknown" });
+  });
+
+  it("computes (first_epoch + 168h) + SIGNAL_DISPUTE_SECS for the real USDC test case (first_epoch=497606 -> 2026-10-14T16:00:00Z)", async () => {
+    const oracle = {
+      first_epoch: async () => ({ result: BigInt(497_606) }),
+    } as unknown as Parameters<typeof fetchScoringStart>[0];
+
+    const start = await fetchScoringStart(oracle, "ASSET");
+
+    expect(start.status).toBe("pending");
+    if (start.status !== "pending") throw new Error("expected 'pending'");
+    expect(new Date(start.earliestUnixSecs * 1000).toISOString()).toBe("2026-10-14T16:00:00.000Z");
+  });
+});
+
+describe("fetchPegHistory provisionalSubCoverage", () => {
+  it("passes through provisional_sub_coverage for a Pending hour on the sub-epoch path", async () => {
+    const newestEpoch = BigInt(500_000);
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    ringSlots[RING_SLOTS - 1] = {
+      ...pendingSlot(newestEpoch, 0.998, BigInt(9_999_999_999)),
+      provisional_sub_coverage: 5,
+    };
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([[newestEpoch.toString(), "Pending"]]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+
+    const history = await fetchPegHistory(oracle, "ASSET");
+    const newestPoint = history[history.length - 1];
+
+    expect(newestPoint.state).toBe("Pending");
+    expect(newestPoint.provisionalSubCoverage).toBe(5);
+  });
+
+  it("leaves provisionalSubCoverage null for a Final hour", async () => {
+    const newestEpoch = BigInt(500_000);
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    ringSlots[RING_SLOTS - 1] = finalSlot(newestEpoch, 1.0);
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([[newestEpoch.toString(), "Final"]]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+
+    const history = await fetchPegHistory(oracle, "ASSET");
+    const newestPoint = history[history.length - 1];
+
+    expect(newestPoint.state).toBe("Final");
+    expect(newestPoint.provisionalSubCoverage).toBeNull();
   });
 });

@@ -33,6 +33,7 @@ const baseHeader: AssetHeader = {
   stale: false,
   eventInProgress: false,
   eventDeclared: false,
+  scoringStart: { status: "unknown" },
 };
 
 function okData(overrides: Partial<AssetPageData> = {}): AssetPageData {
@@ -45,7 +46,7 @@ function okData(overrides: Partial<AssetPageData> = {}): AssetPageData {
         latestPending: null,
       },
     },
-    live: { status: "ok", value: { status: "not-deployed" } },
+    live: { status: "ok", value: { status: "none" } },
     pegHistory: { status: "ok", value: [] },
     failureDefinitions: { status: "ok", value: [] },
     coverGate: { status: "ok", value: { gate: "Clear", label: "Cover can be sold." } },
@@ -108,20 +109,51 @@ describe("AssetPageClient", () => {
     expect(heading).toHaveTextContent("USDC");
   });
 
-  it("shows 'Not scored yet' with an explanation instead of a fake band, when there is no real score", async () => {
+  it("shows 'Not scored yet' with an explanation instead of a fake band, when there is no real score and first_epoch is unknown", async () => {
     fetchAssetPageData.mockResolvedValue(
-      okData({ header: { status: "ok", value: { ...baseHeader, band: null, score: null } } }),
+      okData({
+        header: {
+          status: "ok",
+          value: { ...baseHeader, band: null, score: null, scoringStart: { status: "unknown" } },
+        },
+      }),
     );
     renderAssetPage(baseHeader.asset);
 
     expect(await screen.findByText("Not scored yet")).toBeInTheDocument();
-    expect(screen.getByText(/not enough confirmed history yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/^not scored yet\.$/i)).toBeInTheDocument();
     // Never a leftover "Normal" (or any other) band badge alongside it.
     expect(screen.queryByText("Normal")).not.toBeInTheDocument();
     // Never a redundant dash + "score" row underneath - the badge and
     // explanation above already say there's no score.
     expect(screen.queryByText("score")).not.toBeInTheDocument();
     expect(screen.queryByText("—")).not.toBeInTheDocument();
+  });
+
+  it("shows the earliest scoring date, worded as 'around', when first_epoch is known", async () => {
+    // The real USDC test case: first_epoch=497606 -> earliest scoring
+    // moment 2026-10-14T16:00:00Z ((497606 + 168) * 3600 + 7200 seconds,
+    // the 2h SIGNAL_DISPUTE_SECS the 168th hour needs to clear before
+    // going Final).
+    const earliestUnixSecs = (497606 + 168) * 3600 + 7200;
+    fetchAssetPageData.mockResolvedValue(
+      okData({
+        header: {
+          status: "ok",
+          value: {
+            ...baseHeader,
+            band: null,
+            score: null,
+            scoringStart: { status: "pending", earliestUnixSecs },
+          },
+        },
+      }),
+    );
+    renderAssetPage(baseHeader.asset);
+
+    expect(
+      await screen.findByText(/scoring starts around 2026-10-14 16:00 utc/i),
+    ).toBeInTheDocument();
   });
 
   it("falls back to a shortened address when there is no home domain", async () => {
@@ -181,10 +213,35 @@ describe("AssetPageClient", () => {
     expect(screen.getByText(/can still be challenged until 14:30 utc/i)).toBeInTheDocument();
   });
 
-  it("shows 'Live updates coming soon' rather than any mock live number", async () => {
+  it("shows 'No live update yet' when live() resolves to None", async () => {
     fetchAssetPageData.mockResolvedValue(okData());
     renderAssetPage(baseHeader.asset);
-    expect(await screen.findByText(/live updates coming soon/i)).toBeInTheDocument();
+    expect(await screen.findByText(/no live update yet/i)).toBeInTheDocument();
+  });
+
+  it("shows the sub-epoch, peg ratio, slot state, and age when live() resolves to Some", async () => {
+    const postedAt = Math.floor(Date.now() / 1000) - 120; // 2 minutes ago
+    fetchAssetPageData.mockResolvedValue(
+      okData({
+        live: {
+          status: "ok",
+          value: {
+            status: "value",
+            subEpoch: { hour: BigInt(497606), sub: 7 },
+            pegRatio: 0.9995,
+            slotState: "Pending",
+            postedAt,
+          },
+        },
+      }),
+    );
+    renderAssetPage(baseHeader.asset);
+
+    expect(await screen.findByText("Live (challengeable)")).toBeInTheDocument();
+    expect(screen.getByText("0.9995")).toBeInTheDocument();
+    expect(screen.getByText(/hour 497606, sub-epoch 7/i)).toBeInTheDocument();
+    expect(screen.getByText(/pending/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 min ago/i)).toBeInTheDocument();
   });
 
   it("renders failure definitions as plain sentences", async () => {
@@ -281,10 +338,10 @@ describe("AssetPageClient", () => {
 
   it("never renders a missing or pending hour as a zero value in the chart", async () => {
     const pegHistory: PegHistoryPoint[] = [
-      { timestamp: 0, epoch: BigInt(0), state: "Final", pegRatio: 1.0, tracked: true },
-      { timestamp: 3600, epoch: BigInt(1), state: "Pending", pegRatio: null, tracked: true },
-      { timestamp: 7200, epoch: BigInt(2), state: "Empty", pegRatio: null, tracked: true },
-      { timestamp: 10800, epoch: BigInt(3), state: "Final", pegRatio: 0.999, tracked: true },
+      { timestamp: 0, epoch: BigInt(0), state: "Final", pegRatio: 1.0, tracked: true, provisionalSubCoverage: null },
+      { timestamp: 3600, epoch: BigInt(1), state: "Pending", pegRatio: null, tracked: true, provisionalSubCoverage: null },
+      { timestamp: 7200, epoch: BigInt(2), state: "Empty", pegRatio: null, tracked: true, provisionalSubCoverage: null },
+      { timestamp: 10800, epoch: BigInt(3), state: "Final", pegRatio: 0.999, tracked: true, provisionalSubCoverage: null },
     ];
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
     renderAssetPage(baseHeader.asset);
@@ -307,10 +364,10 @@ describe("AssetPageClient", () => {
 
   it("shows a 'history starts when the asset was added' note and excludes untracked hours from the legend", async () => {
     const pegHistory: PegHistoryPoint[] = [
-      { timestamp: 0, epoch: BigInt(0), state: "Empty", pegRatio: null, tracked: false },
-      { timestamp: 3600, epoch: BigInt(1), state: "Empty", pegRatio: null, tracked: false },
-      { timestamp: 7200, epoch: BigInt(2), state: "Final", pegRatio: 1.0, tracked: true },
-      { timestamp: 10800, epoch: BigInt(3), state: "Empty", pegRatio: null, tracked: true },
+      { timestamp: 0, epoch: BigInt(0), state: "Empty", pegRatio: null, tracked: false, provisionalSubCoverage: null },
+      { timestamp: 3600, epoch: BigInt(1), state: "Empty", pegRatio: null, tracked: false, provisionalSubCoverage: null },
+      { timestamp: 7200, epoch: BigInt(2), state: "Final", pegRatio: 1.0, tracked: true, provisionalSubCoverage: null },
+      { timestamp: 10800, epoch: BigInt(3), state: "Empty", pegRatio: null, tracked: true, provisionalSubCoverage: null },
     ];
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
     renderAssetPage(baseHeader.asset);
@@ -326,8 +383,8 @@ describe("AssetPageClient", () => {
 
   it("shows no 'history starts' note when every hour is tracked", async () => {
     const pegHistory: PegHistoryPoint[] = [
-      { timestamp: 0, epoch: BigInt(0), state: "Final", pegRatio: 1.0, tracked: true },
-      { timestamp: 3600, epoch: BigInt(1), state: "Empty", pegRatio: null, tracked: true },
+      { timestamp: 0, epoch: BigInt(0), state: "Final", pegRatio: 1.0, tracked: true, provisionalSubCoverage: null },
+      { timestamp: 3600, epoch: BigInt(1), state: "Empty", pegRatio: null, tracked: true, provisionalSubCoverage: null },
     ];
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
     renderAssetPage(baseHeader.asset);
@@ -338,8 +395,8 @@ describe("AssetPageClient", () => {
 
   it("shows start and end date labels under the chart", async () => {
     const pegHistory: PegHistoryPoint[] = [
-      { timestamp: Date.UTC(2026, 8, 29) / 1000, epoch: BigInt(0), state: "Final", pegRatio: 1.0, tracked: true },
-      { timestamp: Date.UTC(2026, 9, 9) / 1000, epoch: BigInt(1), state: "Final", pegRatio: 1.0, tracked: true },
+      { timestamp: Date.UTC(2026, 8, 29) / 1000, epoch: BigInt(0), state: "Final", pegRatio: 1.0, tracked: true, provisionalSubCoverage: null },
+      { timestamp: Date.UTC(2026, 9, 9) / 1000, epoch: BigInt(1), state: "Final", pegRatio: 1.0, tracked: true, provisionalSubCoverage: null },
     ];
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
     renderAssetPage(baseHeader.asset);
