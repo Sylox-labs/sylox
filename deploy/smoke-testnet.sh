@@ -25,6 +25,28 @@ ADMIN_ADDR="$(jq -r '.identities.admin' "$RECORD")"
 KEEPER_ADDR="$(jq -r '.identities.keeper' "$RECORD")"
 ASSET_ID="$(jq -r '.tracked_asset.contract_id' "$RECORD")"
 
+# Order matters (deploy/README.md): deploy/post-demo-signals.sh must
+# run BEFORE this script, never after. Review finding (this session):
+# the write check further below posts one epoch as a side effect when
+# the asset has no history yet, which would otherwise become the
+# asset's first-ever post. `FirstEpoch` is set once, from whichever
+# epoch is posted first (storage::set_first_epoch_if_unset), and never
+# moves after that; score()'s own 7 day history requirement counts
+# forward from it (Section 6.5). Running this script first would
+# silently anchor that 7 day clock to whatever the newest epoch
+# happened to be at THIS moment, not to the oldest epoch the backfill
+# is about to post, needlessly delaying when the asset starts scoring.
+# Refuse outright rather than let that happen again.
+first_epoch="$(stellar contract invoke --id "$RO_ID" --source-account "$ADMIN_ADDR" --network testnet --send=no -- first_epoch --asset "$ASSET_ID" 2>&1)"
+if [[ "$first_epoch" != [0-9]* ]]; then
+  echo "FATAL: $ASSET_ID has no posting history yet (first_epoch: $first_epoch)." >&2
+  echo "Run deploy/post-demo-signals.sh testnet BEFORE this script, never after:" >&2
+  echo "this script's own write check would otherwise become the asset's first" >&2
+  echo "post and anchor its 7 day scoring clock to the wrong epoch. See" >&2
+  echo "deploy/README.md." >&2
+  exit 1
+fi
+
 FAILED=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAILED=1; }

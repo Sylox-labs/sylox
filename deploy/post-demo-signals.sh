@@ -26,12 +26,25 @@
 #
 # Usage: deploy/post-demo-signals.sh testnet [epochs]
 #   epochs: how many of the most recently closed epochs to post,
-#           oldest first. Default 24. Capped by the 72h backfill
-#           window (window_secs): posting more than 72 epochs back
-#           from now would be rejected by RiskOracle's own
-#           check_epoch_window.
+#           oldest first. Default 24. Capped at 71, one less than the
+#           72h backfill window (window_secs): this script takes real
+#           wall-clock minutes to run, and every post below recomputes
+#           "now" and the newest closed epoch fresh rather than reusing
+#           a value computed once at the start, so the OLDEST epoch
+#           requested must still have at least one epoch of slack left
+#           in the 72h window by the time its own turn comes, or it
+#           could slide out from under it mid-run. Review finding (this
+#           session): a 72-epoch request has no such slack at all.
+#
+# Order matters (deploy/README.md): run this BEFORE deploy/smoke-
+# testnet.sh. smoke-testnet.sh's own write-check posts one epoch as a
+# side effect if the asset has no history yet, which would otherwise
+# claim FirstEpoch for whatever epoch happens to be newest at that
+# moment, not the oldest one this script is about to backfill
+# (FirstEpoch is write-once; see deploy/README.md and PR #35's own
+# review for why this matters for when an asset starts scoring).
 
-set -euo pipefail
+set -uo pipefail
 
 NETWORK="${1:-}"
 EPOCHS="${2:-24}"
@@ -39,8 +52,8 @@ if [[ "$NETWORK" != "testnet" ]]; then
   echo "usage: $0 testnet [epochs]" >&2
   exit 1
 fi
-if ! [[ "$EPOCHS" =~ ^[0-9]+$ ]] || (( EPOCHS < 1 || EPOCHS > 72 )); then
-  echo "epochs must be an integer between 1 and 72 (the backfill window)" >&2
+if ! [[ "$EPOCHS" =~ ^[0-9]+$ ]] || (( EPOCHS < 1 || EPOCHS > 71 )); then
+  echo "epochs must be an integer between 1 and 71 (one less than the 72h backfill window, so the oldest requested epoch always has slack left; see this script's own header comment)" >&2
   exit 1
 fi
 
@@ -60,13 +73,21 @@ ASSET_ID="$(jq -r '.tracked_asset.contract_id' "$RECORD")"
 
 log() { echo "==> $*"; }
 
-NOW="$(date +%s)"
-# The newest epoch SAFELY closed right now: epoch_close = (e+1)*EPOCH_SECS
-# must be <= NOW, so the newest usable e is floor(NOW/EPOCH_SECS) - 1.
-NEWEST_CLOSED_EPOCH=$(( NOW / EPOCH_SECS - 1 ))
-FIRST_EPOCH=$(( NEWEST_CLOSED_EPOCH - EPOCHS + 1 ))
+# Review finding (this session): the ORIGINAL version of this script
+# computed NOW and NEWEST_CLOSED_EPOCH once, here, then reused those
+# stale values for the rest of the run. A 71-epoch backfill takes real
+# wall-clock minutes to post; by the time the later iterations ran,
+# enough real time had passed that an epoch the script still believed
+# was safely in the past had not actually closed yet (or, for the
+# sub-epoch path, had drifted past its own tighter close-time check),
+# aborting the whole run partway with WrongEpoch. Every iteration below
+# now recomputes "now" and the newest closed epoch fresh, immediately
+# before its own post, instead of trusting a value computed at the top.
+NOW_AT_START="$(date +%s)"
+NEWEST_CLOSED_AT_START=$(( NOW_AT_START / EPOCH_SECS - 1 ))
+FIRST_EPOCH=$(( NEWEST_CLOSED_AT_START - EPOCHS + 1 ))
 
-log "Posting $EPOCHS synthetic demo epochs [$FIRST_EPOCH, $NEWEST_CLOSED_EPOCH] for $ASSET_ID"
+log "Posting up to $EPOCHS synthetic demo epochs starting at $FIRST_EPOCH for $ASSET_ID"
 log "These are SYNTHETIC values, not real USDC market observations."
 
 INPUTS_FILE="$REPO_ROOT/deployments/testnet-demo-signals-inputs.json"
@@ -98,8 +119,11 @@ post_hourly() {
 
   local signal_set="{\"epoch\":$epoch,\"posted_at\":0,\"peg_ratio\":\"$peg_ratio\",\"peg_ratio_p10\":\"$peg_ratio_p10\",\"liquidity_2pct\":\"$LIQUIDITY\",\"redemption_net\":\"0\",\"supply\":\"$SUPPLY\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
 
-  "$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
-    post_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --s "$signal_set" >/dev/null
+  if ! "$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
+    post_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --s "$signal_set" >/dev/null; then
+    log "epoch $epoch FAILED via the hourly path (not a skip; see FATAL below)"
+    return 1
+  fi
   log "epoch $epoch posted via the hourly path (peg_ratio $(awk -v p="$peg_ratio" 'BEGIN { printf "%.4f", p/10000000 }'))"
 }
 
@@ -128,27 +152,57 @@ post_sub_epochs() {
 
     local signal_set="{\"epoch\":$epoch,\"posted_at\":0,\"peg_ratio\":\"$peg_ratio\",\"peg_ratio_p10\":\"$peg_ratio_p10\",\"liquidity_2pct\":\"$LIQUIDITY\",\"redemption_net\":\"0\",\"supply\":\"$SUPPLY\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
 
-    "$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
-      post_sub_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --hour "$epoch" --sub "$sub" --s "$signal_set" >/dev/null
+    if ! "$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
+      post_sub_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --hour "$epoch" --sub "$sub" --s "$signal_set" >/dev/null; then
+      log "epoch $epoch sub $sub FAILED via the sub-epoch path (not a skip; see FATAL below)"
+      return 1
+    fi
   done
   log "epoch $epoch posted via the sub-epoch path ($SUBS_PER_HOUR sub-epochs at ${SUB_EPOCH_SECS}s)"
 }
 
-for (( epoch = FIRST_EPOCH; epoch <= NEWEST_CLOSED_EPOCH; epoch++ )); do
+FIRST_POSTED=""
+LAST_POSTED=""
+POSTED_COUNT=0
+SKIPPED_COUNT=0
+
+# Recomputed fresh each iteration (review finding above): a hot
+# backfill loop can take real minutes to reach its later epochs, so
+# "now" and "newest closed epoch" by the time THIS epoch's turn comes
+# are not the same as they were when the script started.
+for (( epoch = FIRST_EPOCH; epoch <= NEWEST_CLOSED_AT_START; epoch++ )); do
+  NOW="$(date +%s)"
+  NEWEST_CLOSED_NOW=$(( NOW / EPOCH_SECS - 1 ))
+  if (( epoch > NEWEST_CLOSED_NOW )); then
+    log "epoch $epoch is not closed yet (newest closed right now is $NEWEST_CLOSED_NOW); skipping, not aborting"
+    SKIPPED_COUNT=$(( SKIPPED_COUNT + 1 ))
+    continue
+  fi
+
   epoch_close=$(( (epoch + 1) * EPOCH_SECS ))
   noise=$(( (epoch % 7) - 3 ))
   peg_ratio=$(( 10000000 + noise * 1000 ))
   peg_ratio_p10=$(( peg_ratio - 2000 ))
 
   if (( NOW - epoch_close <= SUB_BACKFILL_SECS )); then
-    post_sub_epochs "$epoch"
+    post_sub_epochs "$epoch" || { echo "FATAL: epoch $epoch failed via the sub-epoch path (a real error, not a timing skip)" >&2; exit 1; }
   else
-    post_hourly "$epoch" "$peg_ratio" "$peg_ratio_p10"
+    post_hourly "$epoch" "$peg_ratio" "$peg_ratio_p10" || { echo "FATAL: epoch $epoch failed via the hourly path (a real error, not a timing skip)" >&2; exit 1; }
   fi
+
+  [[ -z "$FIRST_POSTED" ]] && FIRST_POSTED="$epoch"
+  LAST_POSTED="$epoch"
+  POSTED_COUNT=$(( POSTED_COUNT + 1 ))
 done
 
 log "Inputs written to $INPUTS_FILE"
+if [[ -n "$FIRST_POSTED" ]]; then
+  log "Posted $POSTED_COUNT epoch(s), [$FIRST_POSTED, $LAST_POSTED]; skipped $SKIPPED_COUNT not-yet-closed epoch(s)."
+else
+  log "Posted 0 epochs; skipped $SKIPPED_COUNT not-yet-closed epoch(s). Nothing to read back."
+fi
 
+NOW="$(date +%s)"
 PENDING_UNTIL=$(( NOW + 7200 ))  # SIGNAL_DISPUTE_SECS
 log "Every epoch just posted is Pending; becomes Final once now >= posted_at + signal_dispute_secs (2h)."
 log "Finality for this batch is due at $(date -u -r "$PENDING_UNTIL" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$PENDING_UNTIL" +%Y-%m-%dT%H:%M:%SZ) UTC. This script does not wait for it."

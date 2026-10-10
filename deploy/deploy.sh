@@ -320,4 +320,4 @@ cat > "$RECORD" <<EOF
 EOF
 log "deployment record written: $RECORD"
 
-log "Done. Run deploy/smoke-testnet.sh to verify, deploy/post-demo-signals.sh testnet to post demo data."
+log "Done. Run deploy/post-demo-signals.sh testnet 71 to backfill demo data, THEN deploy/smoke-testnet.sh to verify (see deploy/README.md: smoke-testnet.sh refuses to run before there is posting history, and running it first would anchor the asset's 7 day scoring clock to the wrong epoch)."
