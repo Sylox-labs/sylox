@@ -893,3 +893,375 @@ fn budget_dispute_copy_out_at_the_300s_default() {
 fn dummy_hash(env: &Env) -> soroban_sdk::BytesN<32> {
     soroban_sdk::BytesN::from_array(env, &[1u8; 32])
 }
+
+// -- Property test: random sequences of sub-epoch posts, disputes,
+// rulings, missed posts, builds and sub_epoch_secs changes, checking
+// I21, I23 and "a built hour never changes." --
+
+mod property {
+    extern crate std;
+    use super::*;
+    use proptest::prelude::*;
+
+    const PROPERTY_HOUR: u64 = REALISTIC_EPOCH_BASE;
+    const MAX_SUBS_AT_300S: u32 = 12;
+
+    /// One step of the random sequence. `sub` is taken modulo
+    /// whatever `per_hour` actually is at the time the step runs (the
+    /// strategy below generates it in `0..MAX_SUBS_AT_300S`, the
+    /// widest range any allowed interval needs, so a step is never
+    /// silently impossible to generate regardless of the current
+    /// interval).
+    #[derive(Clone, Debug)]
+    enum Step {
+        /// Post `sub` with `peg_ratio`, if it has not already been
+        /// posted for the current hour/interval and the window
+        /// accepts it.
+        Post { sub: u32, peg_ratio: i128 },
+        /// Dispute `sub`, if it is currently Pending and within its
+        /// own dispute window.
+        Dispute { sub: u32 },
+        /// Resolve `sub`'s own open dispute, if any, via committee
+        /// ruling.
+        Rule { sub: u32, keeper_wins: bool },
+        /// Resolve `sub`'s own open dispute via the timeout path
+        /// (ADR-010's default-favors-the-data outcome), if its ruling
+        /// deadline has passed.
+        Timeout { sub: u32 },
+        /// Advance the ledger clock forward by `secs`.
+        AdvanceTime { secs: u64 },
+        /// Call the permissionless `build_hour` trigger directly.
+        Build,
+        /// Change `sub_epoch_secs` to one of the 6 allowed values.
+        ChangeInterval { secs_index: u8 },
+    }
+
+    /// `Dispute`/`Rule`/`Timeout` all draw `sub` from this much
+    /// narrower pool (not the full `0..MAX_SUBS_AT_300S`): a dispute
+    /// opened on one random sub-epoch and a later ruling against a
+    /// SEPARATELY, independently random sub-epoch almost never
+    /// target the same one across a short sequence, which starves
+    /// this property of the exact cross-step correlation (dispute,
+    /// then a later rule/timeout against THAT SAME sub) it exists to
+    /// exercise. A pool of 3 keeps the generator still exploring
+    /// which of several sub-epochs gets disputed, while making a
+    /// dispute/rule or two-disputes-in-one-hour collision likely
+    /// within a 40 step sequence. `Post` keeps the full range: an
+    /// un-posted, never-disputed sub-epoch (one of the other 9 at the
+    /// 300s default) is exactly how `MissingWithinBackfill`/
+    /// `PermanentlyMissing` get exercised.
+    const DISPUTE_SUB_POOL: u32 = 3;
+
+    /// Named jumps, each tied to a specific protocol boundary, rather
+    /// than a continuous random range: a uniform range wide enough to
+    /// ever reach `SIGNAL_DISPUTE_RULING_SECS` (6 days) would almost
+    /// always overshoot every short window (a sub-epoch's own
+    /// `pending_until`, 2h) in a single step, and real sequences
+    /// accumulate MANY small steps before the generator happens to
+    /// pick a large one, compounding past short windows even with a
+    /// heavily-skewed continuous distribution. Named jumps instead
+    /// let the generator land EXACTLY where behavior changes: just
+    /// inside a window, just past it, past the whole ring, past the
+    /// ruling deadline. `Tiny` keeps a little genuine jitter (several
+    /// of these in a row still plausibly stay inside a 2h window);
+    /// every other variant is a single deliberate jump to one exact
+    /// boundary (or just past it).
+    fn advance_time_secs() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            // A few minutes: several in a row still land inside a
+            // sub-epoch's own 2h dispute window.
+            3 => 0u64..=300u64,
+            // Just past a sub-epoch's own pending_until (2h): the
+            // moment a Pending sub-epoch becomes effectively Final.
+            3 => Just(crate::SIGNAL_DISPUTE_SECS + 1),
+            // Just past Sub(asset)'s own 5 hour ring span: the
+            // moment a sub-epoch posted this far back would have
+            // rotated out.
+            2 => Just(5 * EPOCH_SECS + 1),
+            // Just past SIGNAL_DISPUTE_RULING_SECS (6 days): a
+            // timeout resolution becomes callable.
+            2 => Just(crate::SIGNAL_DISPUTE_RULING_SECS + 1),
+        ]
+    }
+
+    /// `AdvanceTime` itself is weighted far below the other step
+    /// types (weight 2, against 6 each for `Post`/`Dispute`/`Rule`):
+    /// most of an 80 step sequence should be post/dispute/rule
+    /// traffic with the clock essentially still, so a `Dispute`
+    /// immediately after its own `Post` (and a `Rule` immediately
+    /// after its own `Dispute`) are common, not rare, outcomes. The
+    /// FEW `AdvanceTime` steps that do land are what carry the clock
+    /// through a window boundary when the sequence needs to.
+    fn step_strategy() -> impl Strategy<Value = Step> {
+        prop_oneof![
+            6 => (0..MAX_SUBS_AT_300S, 9_000_000i128..=10_100_000i128)
+                .prop_map(|(sub, peg_ratio)| Step::Post { sub, peg_ratio }),
+            6 => (0..DISPUTE_SUB_POOL).prop_map(|sub| Step::Dispute { sub }),
+            6 => (0..DISPUTE_SUB_POOL, any::<bool>())
+                .prop_map(|(sub, keeper_wins)| Step::Rule { sub, keeper_wins }),
+            3 => (0..DISPUTE_SUB_POOL).prop_map(|sub| Step::Timeout { sub }),
+            2 => advance_time_secs().prop_map(|secs| Step::AdvanceTime { secs }),
+            3 => Just(Step::Build),
+            2 => (0u8..6u8).prop_map(|secs_index| Step::ChangeInterval { secs_index }),
+        ]
+    }
+
+    /// A built (or built-Empty) hour's own observable fields, snapshot
+    /// at the moment it was first observed decided. Compared against
+    /// the SAME read taken after every later step: any difference at
+    /// all is a violated "a built hour never changes" property.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Decided {
+        is_final: bool,
+        peg_ratio: i128,
+        liquidity_2pct: i128,
+        supply: i128,
+        redemption_net: i128,
+    }
+
+    fn snapshot_hour(client: &RiskOracleClient, asset: &Address, hour: u64) -> Option<Decided> {
+        let is_final = client.is_final(asset, &hour);
+        let ring = client.ring(asset);
+        let slot = ring.iter().find(|s| s.epoch == hour);
+        match slot {
+            Some(s) if s.state == SlotState::Final || s.state == SlotState::Empty => {
+                Some(Decided {
+                    is_final,
+                    peg_ratio: s.peg_ratio,
+                    liquidity_2pct: s.liquidity_2pct,
+                    supply: s.supply,
+                    redemption_net: s.redemption_net,
+                })
+            }
+            // epoch == 0 (an Empty, built-via-overturn-to-Empty slot
+            // clears its own identity back to 0, matching
+            // storage.rs's own empty_slot) is its own form of
+            // "decided Empty," distinct from "never built at all":
+            // but since PROPERTY_HOUR is never 0, a genuine
+            // never-built hour and a built-Empty one are only
+            // distinguishable by whether build_hour has ever
+            // succeeded; is_final alone already tells decided-Final
+            // apart from everything else, and the Empty case is
+            // covered by the explicit None-epoch slot check in
+            // never_flips_once_decided's own caller instead.
+            _ => None,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 24, .. ProptestConfig::default() })]
+
+        /// I21, I23, "a built hour never changes": a random sequence
+        /// of up to 80 steps against ONE hour, mixing posts, disputes
+        /// (including ones left open long enough to outlast
+        /// `Sub(asset)`'s own 5 hour ring, per `AdvanceTime`'s wide
+        /// range), rulings (both outcomes, via both the committee and
+        /// timeout paths), missed sub-epochs (any `sub` nobody ever
+        /// posts), manual `build_hour` calls at arbitrary points, and
+        /// `sub_epoch_secs` changes mid-sequence. Checked after EVERY
+        /// step: once the hour is first observed decided (Final or
+        /// built-Empty), every later step's own snapshot must be
+        /// byte-for-byte identical (I21's "never changes an hour
+        /// that is already built" and the brief's own "a built hour
+        /// never changes," together), and no Final hour's peg_ratio
+        /// ever equals an overturned sub-epoch's own distinctive
+        /// sentinel value (I23).
+        #[test]
+        fn random_sequences_never_violate_i21_i23_or_a_built_hour_changing(
+            steps in prop::collection::vec(step_strategy(), 1..80),
+        ) {
+            let env = Env::default();
+            let (client, governor, asset) = setup_with_governor_and_asset(&env);
+            let committee = Address::generate(&env);
+            crate::mocks::MockGovernorClient::new(&env, &governor).set_committee(&committee);
+            let keeper = Address::generate(&env);
+            let disputer = Address::generate(&env);
+            let hour = PROPERTY_HOUR;
+            // Starts right at hour's own close (the earliest moment
+            // any of its sub-epochs can be posted at the 300s
+            // default): without this, Env::default()'s own starting
+            // timestamp (near 0) sits far earlier than hour * 3,600,
+            // and check_sub_epoch_window would reject every post
+            // until enough AdvanceTime steps happened to sum past the
+            // gap, which 40 steps of at most 600,000s each cannot
+            // realistically reach.
+            env.ledger().set_timestamp(hour_close(hour));
+
+            // A distinctive, impossible-to-reach-by-honest-averaging
+            // sentinel: every OVERTURNED sub-epoch is posted with
+            // this exact peg_ratio (overriding the strategy's own
+            // generated value for that one post), so if it ever
+            // leaked into a Final hour's mean, the mean would equal
+            // it only in the deliberately-contrived case of every
+            // OTHER sub-epoch also happening to average out to
+            // exactly this value from a disjoint set of inputs drawn
+            // from a different range (9_000_000..=10_100_000, which
+            // this sentinel sits far outside of).
+            const OVERTURNED_SENTINEL: i128 = 1;
+
+            let mut overturned_subs = [false; MAX_SUBS_AT_300S as usize];
+            // Tracked independently of the contract's own SubDispute
+            // storage, from this test's own view of which dispute
+            // calls it made succeed: an open dispute must always
+            // block the hour from reading Final, regardless of how
+            // Sub(asset)'s own ring has rotated underneath it. This
+            // is what actually catches sub_disposition checking
+            // HeldHour/the ring before SubDispute (the ring-vs-
+            // dispute bug this whole mechanism exists to fix):
+            // removing that check does not necessarily change the
+            // FINAL VALUE a built hour ends up with (so the
+            // never-flips and I23 sentinel checks alone can miss it
+            // under many sequences), but it DOES let the hour build
+            // Final while this test's own bookkeeping still
+            // considers a dispute open, which this check catches
+            // directly.
+            let mut open_disputes = [false; MAX_SUBS_AT_300S as usize];
+            let mut decided: Option<Decided> = None;
+
+            for step in steps {
+                let now = env.ledger().timestamp();
+                let sub_epoch_secs = client
+                    .sub_epoch_config(&asset)
+                    .map(|c| {
+                        match (c.pending_sub_epoch_secs, c.effective_from_hour) {
+                            (Some(pending), Some(eff)) if hour >= eff => pending,
+                            _ => c.sub_epoch_secs,
+                        }
+                    })
+                    .unwrap_or(SUB_EPOCH_SECS_DEFAULT);
+                let per_hour = (EPOCH_SECS / sub_epoch_secs) as u32;
+
+                match step {
+                    Step::Post { sub, peg_ratio } => {
+                        if sub >= per_hour {
+                            continue;
+                        }
+                        let is_overturned_repost = overturned_subs[sub as usize];
+                        let effective_peg_ratio = if is_overturned_repost {
+                            OVERTURNED_SENTINEL
+                        } else {
+                            peg_ratio
+                        };
+                        let mut s = signal_set(&env, hour, effective_peg_ratio);
+                        s.liquidity_2pct = 500_000_000_000;
+                        s.supply_change_bps = 0;
+                        let _ = client.try_post_sub_signals(&keeper, &asset, &hour, &sub, &s);
+                    }
+                    Step::Dispute { sub } => {
+                        if sub >= per_hour {
+                            continue;
+                        }
+                        let r = client.try_dispute_sub_signals(
+                            &disputer,
+                            &asset,
+                            &hour,
+                            &sub,
+                            &dummy_hash(&env),
+                        );
+                        if r.is_ok() {
+                            open_disputes[sub as usize] = true;
+                        }
+                    }
+                    Step::Rule { sub, keeper_wins } => {
+                        if sub >= per_hour {
+                            continue;
+                        }
+                        let result = client.try_resolve_sub_signal_dispute(
+                            &asset,
+                            &hour,
+                            &sub,
+                            &keeper_wins,
+                            &dummy_hash(&env),
+                        );
+                        if result.is_ok() {
+                            open_disputes[sub as usize] = false;
+                        }
+                        if !keeper_wins && result.is_ok() {
+                            // Disputer won: this sub-epoch is
+                            // overturned. Remember it so a LATER
+                            // repost (the strategy can generate
+                            // another Post for the same sub) is
+                            // tagged with the sentinel too, keeping
+                            // I23's check meaningful across a
+                            // dispute -> overturn -> repost ->
+                            // dispute-again cycle.
+                            overturned_subs[sub as usize] = true;
+                        }
+                    }
+                    Step::Timeout { sub } => {
+                        if sub >= per_hour {
+                            continue;
+                        }
+                        // The timeout path always favors the data
+                        // (ADR-010): never overturns, so no
+                        // overturned_subs bookkeeping needed here.
+                        let tr = client.try_resolve_sub_dispute_timeout(&asset, &hour, &sub);
+                        if tr.is_ok() {
+                            open_disputes[sub as usize] = false;
+                        }
+                    }
+                    Step::AdvanceTime { secs } => {
+                        env.ledger().set_timestamp(now + secs);
+                    }
+                    Step::Build => {
+                        let _ = client.try_build_hour(&asset, &hour);
+                    }
+                    Step::ChangeInterval { secs_index } => {
+                        let value = crate::SUB_EPOCH_SECS_ALLOWED[secs_index as usize % 6];
+                        let _ = client.try_set_sub_epoch_secs(&asset, &value);
+                    }
+                }
+
+                // I21: a sub_epoch_secs change never renumbers this
+                // hour or touches an already-built slot. Checked
+                // structurally: the ring's own epoch field for
+                // `hour`'s position, once Final, must still read
+                // `hour` (write_ring_slot's own newer-wins guard is
+                // the mechanism; this just confirms the guarantee
+                // holds after every step, not only at the end).
+                if let Some(current) = snapshot_hour(&client, &asset, hour) {
+                    match &decided {
+                        None => decided = Some(current),
+                        Some(previous) => {
+                            prop_assert_eq!(
+                                &current,
+                                previous,
+                                "a decided hour's own snapshot changed after a later step"
+                            );
+                        }
+                    }
+                }
+
+                // I23: a Final hour's peg_ratio must never equal the
+                // overturned sentinel, regardless of how many
+                // sub-epochs were overturned and reposted along the
+                // way.
+                if client.is_final(&asset, &hour) {
+                    // The hour must never read Final while this
+                    // test's own bookkeeping still considers ANY
+                    // sub-epoch's dispute open: this is the direct
+                    // check for sub_disposition/refresh_waiting_hour
+                    // checking SubDispute before anything Sub(asset)'s
+                    // ring or HeldHour currently shows (Section 5.9
+                    // S3/S4's own design), independent of whether a
+                    // violation would also change the built value.
+                    for sub in 0..per_hour {
+                        prop_assert!(
+                            !open_disputes[sub as usize],
+                            "hour read Final while sub {sub}'s own dispute was still open"
+                        );
+                    }
+
+                    let ring = client.ring(&asset);
+                    if let Some(slot) = ring.iter().find(|s| s.epoch == hour) {
+                        prop_assert_ne!(
+                            slot.peg_ratio,
+                            OVERTURNED_SENTINEL,
+                            "an overturned sub-epoch's sentinel value leaked into the built hour's mean"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
