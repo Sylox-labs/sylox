@@ -8,7 +8,9 @@ export const metadata: Metadata = {
   description: "Testnet. See an issuer's risk, provide cover, buy cover, and claim.",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({
+  children,
+}: Readonly<{ children: React.ReactNode }>) {
   return (
     <html
       lang="en"
