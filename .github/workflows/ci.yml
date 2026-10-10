@@ -148,3 +148,45 @@ jobs:
         run: npm run build -w web/landing
       - name: Build web/app
         run: npm run build -w web/app
+
+  deploy-sylox-app:
+    name: deploy sylox-app to Railway
+    runs-on: ubuntu-latest
+    # Only a real push to main, never a PR (a PR branch's build should
+    # never reach production), and only once every existing check has
+    # passed - a broken contract build or a failing Rust test on main
+    # blocks this exactly like it blocks everything else.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [fmt, clippy, test, build-contracts, web]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2 # Only need this commit and its parent, to diff against for the path filter below.
+      # The workflow's own path filter, not Railway's - see the
+      # service's README (web/app/README.md's "Deployment" section)
+      # for why: Railway's watch-path evaluation has been observed
+      # skipping deploys that genuinely touched a watched path (a
+      # confirmed bug, reported to Railway support), so this job
+      # decides for itself whether anything deploy-relevant changed,
+      # independent of whatever Railway's own check concludes.
+      - name: Check whether anything deploy-relevant changed
+        id: changes
+        run: |
+          changed=$(git diff --name-only HEAD^ HEAD)
+          echo "Changed files:"
+          echo "$changed"
+          if echo "$changed" | grep -qE '^(web/app/|web/shared/|deployments/|package\.json$|package-lock\.json$)'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install the Railway CLI
+        if: steps.changes.outputs.relevant == 'true'
+        run: npm install -g @railway/cli
+      - name: Deploy sylox-app
+        if: steps.changes.outputs.relevant == 'true'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          echo "Deploying commit ${{ github.sha }} to sylox-app"
+          railway up --service sylox-app --ci
