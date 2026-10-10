@@ -99,3 +99,17 @@ contract's own `EpochAlreadyPosted`/`HourAlreadyPosted` guards make
 the loser a harmless, logged skip either way), but it makes a single
 run's own log confusing to read. Finish a backfill and smoke test
 fully before starting `--live`, same as the deploy order above.
+
+`--live` only ever targets the one tracked asset in `deployments/
+testnet.json`. DEMOUSD (`deploy/demo-asset.sh`, `deploy/demo-asset-
+trigger.sh`) is deliberately NOT in the loop: its own `IssuerFreeze`
+check has no history minimum (see `deploy/demo-asset-trigger.sh`'s own
+header comment), so nothing needs its hours to keep advancing once the
+triggering signal is posted. This means DEMOUSD reads as stale once
+its last posted hour ages out (`stale_after_epochs`, Section 5.5) —
+expected, and harmless for a one-shot IssuerFreeze demo. A cure demo
+would be different: Depeg's own cure path (`checkpoint_cure`,
+`finalize`'s `cure_outcome`) reads the asset's ring going forward
+through the challenge window, so that would need DEMOUSD (or whichever
+asset demos it) added to `--live`, extended to target more than one
+asset at a time, which it does not do today.
