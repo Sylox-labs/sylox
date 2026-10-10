@@ -3,6 +3,7 @@
 import { useMemo, useRef } from "react";
 import { status } from "@/content";
 import { useScrollReveal } from "@/lib/motion/useScrollReveal";
+import { Eyebrow } from "@sylox/ui/components";
 
 type ItemState = "done" | "active" | "future";
 
@@ -63,9 +64,7 @@ export function Status() {
         className="mx-auto grid max-w-5xl gap-12 md:grid-cols-[1fr_1.3fr] md:gap-20"
       >
         <div>
-          <p data-reveal className="font-mono text-xs uppercase tracking-[0.15em] text-anchor-graphite md:text-sm">
-            {status.eyebrow}
-          </p>
+          <Eyebrow tone="graphite" data-reveal>{status.eyebrow}</Eyebrow>
           <h2
             data-reveal
             className="mt-4 font-display text-4xl leading-[0.95] tracking-tight text-slate-black md:text-6xl"

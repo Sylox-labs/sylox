@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
-import { inter, spaceMono, bigShoulders } from "./fonts";
+import { inter, spaceMono, bigShoulders } from "@sylox/ui/fonts";
 import { MotionBootstrap } from "@/lib/motion/MotionBootstrap";
-import "./tokens.css";
+import "@sylox/ui/tokens.css";
 import "./globals.css";
 
 const siteUrl = "https://sylox.xyz";

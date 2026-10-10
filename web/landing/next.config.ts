@@ -6,6 +6,7 @@ const nextConfig: NextConfig = {
     unoptimized: true,
   },
   agentRules: false,
+  transpilePackages: ["@sylox/ui"],
 };
 
 export default nextConfig;
