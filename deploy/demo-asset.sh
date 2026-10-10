@@ -126,18 +126,34 @@ fi
 # a single revocation, if posted, is already enough on its own) are
 # deliberately low: this is a demo asset meant to prove the trigger
 # fires at all, not a realistic production threshold.
+#
+# challenge_secs = 3600 (1 hour, CHALLENGE_SECS_MIN_EPOCHS, the
+# shortest allowed) is deliberate and DEMOUSD-only: a demo event needs
+# `finalize` reachable quickly, not the 24h challenge window USDC's
+# own Depeg definition uses. Never change USDC's definitions to match;
+# this short window exists so a demo can be walked through in an hour,
+# not because it reflects a real challenge period.
 
-log "[5/5] EventRegistry.register_definition (IssuerFreeze)"
+log "[5/5] EventRegistry.register_definition (IssuerFreeze, challenge_secs=3600)"
 current_version="$("$STELLAR_BIN" contract invoke --id "$ER_ID" --source-account "$ADMIN_ADDR" --network testnet --send=no -- current_version --asset "$DEMO_ID" --kind '"IssuerFreeze"' 2>&1)"
+needs_registration=1
 if [[ "$current_version" =~ ^[1-9][0-9]*$ ]]; then
-  log "IssuerFreeze definition already registered for DEMOUSD (version $current_version)"
-else
-  demo_def="{\"asset\":\"$DEMO_ID\",\"kind\":\"IssuerFreeze\",\"version\":0,\"reference\":\"Usd\",\"depeg_threshold\":\"0\",\"depeg_window_secs\":0,\"max_missing_epochs\":0,\"cure_threshold\":\"0\",\"freeze_pct_bps\":100,\"auth_revocation_threshold\":0,\"mint_spike_bps\":0,\"halt_window_secs\":0,\"challenge_secs\":86400,\"ruling_deadline_secs\":1209600}"
+  existing_def="$("$STELLAR_BIN" contract invoke --id "$ER_ID" --source-account "$ADMIN_ADDR" --network testnet --send=no -- definition --asset "$DEMO_ID" --kind '"IssuerFreeze"' --version "$current_version" 2>&1)"
+  existing_challenge_secs="$(echo "$existing_def" | jq -r '.challenge_secs // empty' 2>/dev/null)"
+  if [[ "$existing_challenge_secs" == "3600" ]]; then
+    log "IssuerFreeze definition already registered for DEMOUSD at challenge_secs=3600 (version $current_version)"
+    needs_registration=0
+  else
+    log "IssuerFreeze version $current_version exists at challenge_secs=${existing_challenge_secs:-unknown}, not 3600; registering a new canonical version"
+  fi
+fi
+if (( needs_registration )); then
+  demo_def="{\"asset\":\"$DEMO_ID\",\"kind\":\"IssuerFreeze\",\"version\":0,\"reference\":\"Usd\",\"depeg_threshold\":\"0\",\"depeg_window_secs\":0,\"max_missing_epochs\":0,\"cure_threshold\":\"0\",\"freeze_pct_bps\":100,\"auth_revocation_threshold\":0,\"mint_spike_bps\":0,\"halt_window_secs\":0,\"challenge_secs\":3600,\"ruling_deadline_secs\":1209600}"
   if ! def_out="$("$STELLAR_BIN" contract invoke --id "$ER_ID" --source-account "$ADMIN" --network testnet -- register_definition --def "$demo_def" 2>&1)"; then
     die "register_definition(DEMOUSD, IssuerFreeze) failed:
 $def_out"
   fi
-  log "EventRegistry.register_definition: IssuerFreeze registered for DEMOUSD (freeze_pct_bps=100, auth_revocation_threshold=0)"
+  log "EventRegistry.register_definition: IssuerFreeze registered for DEMOUSD (freeze_pct_bps=100, auth_revocation_threshold=0, challenge_secs=3600)"
 fi
 
 cat > "$DEMO_RECORD" <<EOF

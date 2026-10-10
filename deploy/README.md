@@ -113,3 +113,17 @@ would be different: Depeg's own cure path (`checkpoint_cure`,
 through the challenge window, so that would need DEMOUSD (or whichever
 asset demos it) added to `--live`, extended to target more than one
 asset at a time, which it does not do today.
+
+## DEMOUSD's 1 hour challenge window
+
+`deploy/demo-asset.sh` registers DEMOUSD's `IssuerFreeze` definition
+with `challenge_secs = 3600` (1 hour, `CHALLENGE_SECS_MIN_EPOCHS`, the
+shortest allowed), not the 24 hour window USDC's own `Depeg`
+definition uses. This is deliberate and DEMOUSD-only, so `finalize`
+becomes reachable within an hour of `propose_tier1` rather than a full
+day; it exists purely so a demo can be walked through quickly, not
+because it reflects a real challenge period. `checkpoint_cure` is not
+relevant here regardless of `challenge_secs`: it explicitly rejects
+any non-`Depeg` event (`WrongState`), so `finalize` is the only call
+that moves an `IssuerFreeze` event forward. Never change USDC's own
+definitions to match this short window.
