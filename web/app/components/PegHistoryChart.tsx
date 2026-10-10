@@ -19,6 +19,24 @@ function formatAxisDate(timestampSecs: number): string {
 }
 
 /**
+ * `refresh_waiting_hour` (contracts/risk-oracle/src/lib.rs) sets
+ * `provisional_sub_coverage` on every hour still waiting on its
+ * sub-epochs, Pending or Disputed alike - the wording here follows the
+ * slot's own effective state, not just the coverage count: a Pending
+ * hour is still accumulating sub-epochs normally, while a Disputed hour
+ * has had at least one sub-epoch challenged (and can have zero
+ * undisputed ones left).
+ */
+function provisionalTooltip(state: PegHistoryPoint["state"], coverage: number): string {
+  if (state === "Disputed") {
+    return coverage > 0
+      ? `Under dispute. Based on ${coverage} of 12 undisputed sub-epochs.`
+      : "Under dispute. No undisputed sub-epochs yet.";
+  }
+  return `Provisional. Based on ${coverage} of 12 sub-epochs so far.`;
+}
+
+/**
  * Hand-rolled SVG line chart: no charting library. Nothing else in this
  * app or web/landing already depends on one (confirmed before adding
  * this), and the one thing this chart actually needs - breaking the
@@ -140,7 +158,9 @@ export function PegHistoryChart({ points, depegThreshold }: PegHistoryChartProps
   // bottom of the chart with a native SVG tooltip (no existing
   // hover/tooltip infrastructure here to extend; <title> is the
   // smallest correct way to attach one).
-  const provisionalPoints = trackedPoints.filter((p) => p.provisionalSubCoverage !== null);
+  const provisionalPoints = trackedPoints.filter(
+    (p): p is PegHistoryPoint & { provisionalSubCoverage: number } => p.provisionalSubCoverage !== null,
+  );
 
   return (
     <div>
@@ -212,9 +232,7 @@ export function PegHistoryChart({ points, depegThreshold }: PegHistoryChartProps
             r={3}
             fill="var(--color-cyber-tin)"
           >
-            <title>
-              Waiting on a dispute. Based on {p.provisionalSubCoverage} of 12 sub-epochs.
-            </title>
+            <title>{provisionalTooltip(p.state, p.provisionalSubCoverage)}</title>
           </circle>
         ))}
       </svg>

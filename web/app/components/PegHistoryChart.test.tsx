@@ -66,7 +66,7 @@ describe("PegHistoryChart", () => {
     expect(opacity).toBeLessThanOrEqual(0.15);
   });
 
-  it("marks a provisional (Pending, sub-epoch-covered) hour with a tooltip, leaving Final hours unmarked", () => {
+  it("marks a Pending hour still waiting on its sub-epochs with a 'Provisional' tooltip, leaving Final hours unmarked", () => {
     const points = [
       point({ epoch: BigInt(0), state: "Final", pegRatio: 1.0, provisionalSubCoverage: null }),
       point({
@@ -82,7 +82,45 @@ describe("PegHistoryChart", () => {
     const markers = container.querySelectorAll("circle");
     expect(markers).toHaveLength(1);
     expect(markers[0].querySelector("title")?.textContent).toMatch(
-      /waiting on a dispute\. based on 5 of 12 sub-epochs\./i,
+      /^provisional\. based on 5 of 12 sub-epochs so far\.$/i,
+    );
+  });
+
+  it("marks a Disputed hour with undisputed sub-epochs left as 'Under dispute. Based on N of 12 undisputed sub-epochs.'", () => {
+    const points = [
+      point({ epoch: BigInt(0), state: "Final", pegRatio: 1.0, provisionalSubCoverage: null }),
+      point({
+        epoch: BigInt(1),
+        state: "Disputed",
+        pegRatio: null,
+        provisionalSubCoverage: 3,
+      }),
+    ];
+    const { container } = render(<PegHistoryChart points={points} depegThreshold={null} />);
+
+    const markers = container.querySelectorAll("circle");
+    expect(markers).toHaveLength(1);
+    expect(markers[0].querySelector("title")?.textContent).toMatch(
+      /^under dispute\. based on 3 of 12 undisputed sub-epochs\.$/i,
+    );
+  });
+
+  it("marks a Disputed hour with zero undisputed sub-epochs as 'Under dispute. No undisputed sub-epochs yet.'", () => {
+    const points = [
+      point({ epoch: BigInt(0), state: "Final", pegRatio: 1.0, provisionalSubCoverage: null }),
+      point({
+        epoch: BigInt(1),
+        state: "Disputed",
+        pegRatio: null,
+        provisionalSubCoverage: 0,
+      }),
+    ];
+    const { container } = render(<PegHistoryChart points={points} depegThreshold={null} />);
+
+    const markers = container.querySelectorAll("circle");
+    expect(markers).toHaveLength(1);
+    expect(markers[0].querySelector("title")?.textContent).toMatch(
+      /^under dispute\. no undisputed sub-epochs yet\.$/i,
     );
   });
 

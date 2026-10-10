@@ -132,8 +132,10 @@ describe("AssetPageClient", () => {
 
   it("shows the earliest scoring date, worded as 'around', when first_epoch is known", async () => {
     // The real USDC test case: first_epoch=497606 -> earliest scoring
-    // moment 2026-10-14T14:00:00Z (497606 * 3600 + 168 * 3600 seconds).
-    const earliestUnixSecs = 497606 * 3600 + 168 * 3600;
+    // moment 2026-10-14T16:00:00Z ((497606 + 168) * 3600 + 7200 seconds,
+    // the 2h SIGNAL_DISPUTE_SECS the 168th hour needs to clear before
+    // going Final).
+    const earliestUnixSecs = (497606 + 168) * 3600 + 7200;
     fetchAssetPageData.mockResolvedValue(
       okData({
         header: {
@@ -150,7 +152,7 @@ describe("AssetPageClient", () => {
     renderAssetPage(baseHeader.asset);
 
     expect(
-      await screen.findByText(/scoring starts around 2026-10-14 14:00 utc/i),
+      await screen.findByText(/scoring starts around 2026-10-14 16:00 utc/i),
     ).toBeInTheDocument();
   });
 

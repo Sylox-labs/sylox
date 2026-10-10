@@ -542,7 +542,7 @@ describe("fetchScoringStart", () => {
     expect(start).toEqual({ status: "unknown" });
   });
 
-  it("computes first_epoch + 168h for the real USDC test case (first_epoch=497606 -> 2026-10-14T14:00:00Z)", async () => {
+  it("computes (first_epoch + 168h) + SIGNAL_DISPUTE_SECS for the real USDC test case (first_epoch=497606 -> 2026-10-14T16:00:00Z)", async () => {
     const oracle = {
       first_epoch: async () => ({ result: BigInt(497_606) }),
     } as unknown as Parameters<typeof fetchScoringStart>[0];
@@ -551,7 +551,7 @@ describe("fetchScoringStart", () => {
 
     expect(start.status).toBe("pending");
     if (start.status !== "pending") throw new Error("expected 'pending'");
-    expect(new Date(start.earliestUnixSecs * 1000).toISOString()).toBe("2026-10-14T14:00:00.000Z");
+    expect(new Date(start.earliestUnixSecs * 1000).toISOString()).toBe("2026-10-14T16:00:00.000Z");
   });
 });
 

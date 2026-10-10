@@ -9,6 +9,7 @@ import type { CoverGate, EventKind } from "./contracts/event-registry";
 export const PEG_RATIO_SCALE = 10_000_000; // i128, scale 1e7 (RiskOracle's own doc comment on peg_ratio).
 const EPOCH_SECS = 3600; // technical-doc.md Section 23: epoch_secs is frozen at 3600 (1 hour) for v1.
 const AGGREGATE_SLOTS_7D = 168; // contracts/risk-oracle/src/score.rs's AGGREGATE_SLOTS_7D - the 7-day score baseline (review decision D2), same constant lib.rs's own scoring gate checks against first_epoch.
+const SIGNAL_DISPUTE_SECS = 7_200; // contracts/staking/src/params.rs's SIGNAL_DISPUTE_SECS (2h) - the dispute window an hour must clear before Pending can be promoted to Final; also re-declared locally in contracts/risk-oracle/src/lib.rs with the same value.
 
 /** A Result<T, {message}> from a generated client, normalized to a plain outcome. */
 type SectionResult<T> = { status: "ok"; value: T } | { status: "error"; message: string };
@@ -60,13 +61,15 @@ export interface AssetHeader {
    * `newest_final >= first_epoch + AGGREGATE_SLOTS_7D - 1` - 168 FINAL
    * hours from this asset's own first posted epoch, the 7-day baseline
    * every score component needs (technical-doc.md Section 6.5), not a
-   * fixed 168 hours of wall-clock time. `first_epoch + 168h` is the
-   * EARLIEST that could happen (every hour finalizing exactly on
-   * schedule, no disputes, no backfills) - an hour only becomes Final
-   * after its own dispute window elapses (`SIGNAL_DISPUTE_SECS`), so the
-   * real 168th-hour-Final moment can land later than this. Never shown
-   * as a promise - see `formatScoringStart` in `AssetPageClient.tsx`,
-   * which always renders this with "around" wording, never a bare date.
+   * fixed 168 hours of wall-clock time. `(first_epoch + 168h) +
+   * SIGNAL_DISPUTE_SECS` is the EARLIEST that could happen (every hour
+   * finalizing exactly on schedule, no disputes, no backfills): the
+   * 168th hour itself only becomes Final after clearing its own
+   * SIGNAL_DISPUTE_SECS dispute window (contracts/staking/src/params.rs),
+   * so the real 168th-hour-Final moment can land later than this. Never
+   * shown as a promise - see `formatScoringStart` in
+   * `AssetPageClient.tsx`, which always renders this with "around"
+   * wording, never a bare date.
    */
   scoringStart: ScoringStart;
 }
@@ -77,7 +80,7 @@ export type ScoringStart =
   // matches tryFetchFirstEpoch's own fallback below (never distinguish
   // "never posted" from "couldn't tell" - see its own doc comment).
   | { status: "unknown" }
-  | { status: "pending"; earliestUnixSecs: number }; // first_epoch + 168h, in Unix seconds - always rendered with "around"/"earliest" wording, never as a guaranteed date.
+  | { status: "pending"; earliestUnixSecs: number }; // (first_epoch + 168h) + SIGNAL_DISPUTE_SECS, in Unix seconds - always rendered with "around"/"earliest" wording, never as a guaranteed date.
 
 function codeFromDisplayName(name: string, asset: string): string {
   const [code] = name.split(":");
@@ -128,14 +131,25 @@ async function fetchHeader(
   };
 }
 
-/** `first_epoch + AGGREGATE_SLOTS_7D hours` as the earliest a real score could appear - see AssetHeader.scoringStart's own doc comment for the full "earliest, not a promise" reasoning. */
+/**
+ * The earliest a real score could appear - see AssetHeader.scoringStart's
+ * own doc comment for the full "earliest, not a promise" reasoning.
+ *
+ * Hour `first_epoch + AGGREGATE_SLOTS_7D - 1` (the 168th hour, 0-indexed
+ * from first_epoch) is the LAST hour the scoring gate needs to be Final;
+ * it only reaches Final after clearing its own SIGNAL_DISPUTE_SECS
+ * dispute window, so the earliest moment is that hour's own posting time
+ * (`first_epoch + AGGREGATE_SLOTS_7D` hours, i.e. the START of the next
+ * hour after it) plus SIGNAL_DISPUTE_SECS, not a bare `+ 168h`.
+ */
 export async function fetchScoringStart(
   oracle: ReturnType<typeof riskOracleClient>,
   asset: string,
 ): Promise<ScoringStart> {
   const firstEpoch = await tryFetchFirstEpoch(oracle, asset);
   if (firstEpoch === undefined) return { status: "unknown" };
-  const earliestUnixSecs = Number(firstEpoch) * EPOCH_SECS + AGGREGATE_SLOTS_7D * 3600;
+  const earliestUnixSecs =
+    (Number(firstEpoch) + AGGREGATE_SLOTS_7D) * EPOCH_SECS + SIGNAL_DISPUTE_SECS;
   return { status: "pending", earliestUnixSecs };
 }
 
@@ -272,12 +286,17 @@ export interface PegHistoryPoint {
    */
   tracked: boolean;
   /**
-   * `RingSlot.provisional_sub_coverage` passthrough - set only while this
-   * hour is on the sub-epoch posting path and still Pending/Disputed (0 to
-   * 12 of the hour's sub-epochs have posted so far); `null` for an
+   * `RingSlot.provisional_sub_coverage` passthrough. `lib.rs`'s own
+   * `refresh_waiting_hour` sets this on EVERY hour still waiting on its
+   * sub-epochs, not only disputed ones - it is set for a Pending slot (N
+   * of 12 sub-epochs posted, none yet disputed) exactly as much as for a
+   * Disputed one (N of 12 undisputed sub-epochs still posted, 0 included
+   * when every posted sub-epoch is currently disputed). `null` for an
    * hourly-fallback-path hour or a never-posted one. Final hours stay as
    * they are today - this never affects `pegRatio`/`state` above, only
-   * whether the chart marks the hour provisional.
+   * whether the chart marks the hour provisional, and the exact wording
+   * (Pending vs. Disputed, N > 0 vs. N = 0) comes from pairing this with
+   * `state` - see `PegHistoryChart.tsx`'s own tooltip logic.
    */
   provisionalSubCoverage: number | null;
 }
