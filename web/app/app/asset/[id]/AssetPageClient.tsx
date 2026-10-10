@@ -129,6 +129,13 @@ function HeaderSection({ data }: { data: AssetPageData }) {
   );
 }
 
+function formatChallengeDeadline(pendingUntil: bigint): string {
+  const date = new Date(Number(pendingUntil) * 1000);
+  const hh = String(date.getUTCHours()).padStart(2, "0");
+  const mm = String(date.getUTCMinutes()).padStart(2, "0");
+  return `${hh}:${mm} UTC`;
+}
+
 function ConfirmedLiveSection({ data }: { data: AssetPageData }) {
   return (
     <div>
@@ -141,15 +148,26 @@ function ConfirmedLiveSection({ data }: { data: AssetPageData }) {
             <div className="mt-3">
               <SectionError message={data.confirmed.message} />
             </div>
-          ) : data.confirmed.value === null ? (
-            <p className="mt-3 font-mono text-sm text-cyber-tin">No confirmed value yet.</p>
           ) : (
-            <div className="mt-3 flex items-baseline gap-4">
-              <span className="font-mono text-2xl text-silo-oatmeal" data-numeric>
-                {data.confirmed.value.pegRatio.toFixed(4)}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-wide text-cyber-tin">peg</span>
-            </div>
+            <>
+              {data.confirmed.value.confirmed === null ? (
+                <p className="mt-3 font-mono text-sm text-cyber-tin">No confirmed value yet.</p>
+              ) : (
+                <div className="mt-3 flex items-baseline gap-4">
+                  <span className="font-mono text-2xl text-silo-oatmeal" data-numeric>
+                    {data.confirmed.value.confirmed.pegRatio.toFixed(4)}
+                  </span>
+                  <span className="font-mono text-xs uppercase tracking-wide text-cyber-tin">peg</span>
+                </div>
+              )}
+              {data.confirmed.value.latestPending !== null && (
+                <p className="mt-3 border-t border-cement-grey/30 pt-3 font-mono text-xs text-cyber-tin">
+                  Latest hour: {data.confirmed.value.latestPending.pegRatio.toFixed(4)} peg, can
+                  still be challenged until{" "}
+                  {formatChallengeDeadline(data.confirmed.value.latestPending.pendingUntil)}.
+                </p>
+              )}
+            </>
           )}
         </Card>
 

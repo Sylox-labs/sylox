@@ -1,0 +1,262 @@
+import { describe, expect, it } from "vitest";
+import { fetchEffectiveRing, fetchPegHistory, fetchConfirmed, PEG_RATIO_SCALE } from "./asset-data";
+import type { RingSlot, SlotState } from "./contracts/risk-oracle";
+
+const RING_SLOTS = 240;
+const EPOCH_SECS = 3600;
+
+const EMPTY_ENDPOINT = { tag: "Unknown", values: undefined } as const;
+
+function emptySlot(): RingSlot {
+  return {
+    epoch: BigInt(0),
+    state: { tag: "Empty", values: undefined },
+    pending_until: BigInt(0),
+    peg_ratio: BigInt(0),
+    liquidity_2pct: BigInt(0),
+    redemption_net: BigInt(0),
+    supply: BigInt(0),
+    supply_change_bps: 0,
+    clawback_amount: BigInt(0),
+    auth_revocations: 0,
+    endpoint: EMPTY_ENDPOINT,
+  };
+}
+
+function finalSlot(epoch: bigint, pegRatio: number): RingSlot {
+  return {
+    ...emptySlot(),
+    epoch,
+    state: { tag: "Final", values: undefined },
+    pending_until: BigInt(0),
+    peg_ratio: BigInt(Math.round(pegRatio * PEG_RATIO_SCALE)),
+  };
+}
+
+function pendingSlot(epoch: bigint, pegRatio: number, pendingUntil: bigint): RingSlot {
+  return {
+    ...emptySlot(),
+    epoch,
+    state: { tag: "Pending", values: undefined },
+    pending_until: pendingUntil,
+    peg_ratio: BigInt(Math.round(pegRatio * PEG_RATIO_SCALE)),
+  };
+}
+
+/**
+ * A fake oracle exposing just the two methods fetchEffectiveRing calls,
+ * built from a window of real slots keyed by epoch (a Map, so a sparse
+ * "partly filled ring" - the exact case the engineer asked be covered -
+ * is just the epochs that are present).
+ */
+function fakeOracle(opts: {
+  ringSlots: RingSlot[]; // oldest-first, length RING_SLOTS - what `ring()` returns.
+  effectiveByEpoch: Map<string, SlotState["tag"]>; // what `effective_window` would report, keyed by epoch.toString().
+}) {
+  return {
+    ring: async () => ({ result: opts.ringSlots }),
+    effective_window: async ({
+      start_epoch,
+      count,
+    }: {
+      asset: string;
+      start_epoch: bigint;
+      count: number;
+    }) => {
+      const result = [];
+      for (let i = 0; i < count; i++) {
+        const epoch = start_epoch + BigInt(i);
+        const tag = opts.effectiveByEpoch.get(epoch.toString());
+        result.push(tag ? ({ tag, values: undefined } as SlotState) : undefined);
+      }
+      return { result };
+    },
+    score: async () => ({
+      result: {
+        isErr: () => false,
+        unwrap: () => ({
+          epoch: BigInt(1),
+          score: 5,
+          band: { tag: "Normal", values: undefined },
+          formula_version: 1,
+          stale: false,
+        }),
+      },
+    }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+}
+
+describe("fetchEffectiveRing", () => {
+  it("derives the time axis from the newest epoch, not from an Empty slot's stored epoch (0)", async () => {
+    // A ring with only the last 3 slots ever written - the other 237 are
+    // the storage default, epoch: 0. Using slot.epoch directly for the
+    // axis would put 237 points in 1970; this must not happen.
+    const newestEpoch = BigInt(500_000);
+    const ringSlots: RingSlot[] = [];
+    for (let i = 0; i < RING_SLOTS; i++) {
+      ringSlots.push(emptySlot());
+    }
+    // Place three real slots at the newest 3 positions (array is oldest-first).
+    ringSlots[RING_SLOTS - 3] = finalSlot(newestEpoch - BigInt(2), 1.0);
+    ringSlots[RING_SLOTS - 2] = finalSlot(newestEpoch - BigInt(1), 0.999);
+    ringSlots[RING_SLOTS - 1] = finalSlot(newestEpoch, 1.0001);
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([
+      [(newestEpoch - BigInt(2)).toString(), "Final"],
+      [(newestEpoch - BigInt(1)).toString(), "Final"],
+      [newestEpoch.toString(), "Final"],
+    ]);
+
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+    const ring = await fetchEffectiveRing(oracle, "ASSET");
+
+    expect(ring).toHaveLength(RING_SLOTS);
+
+    // No slot's derived epoch is 0 or anywhere near 1970 - every position,
+    // written or not, gets a real epoch on the continuous axis.
+    for (const slot of ring) {
+      expect(slot.epoch).toBeGreaterThan(BigInt(0));
+    }
+
+    // The axis is contiguous and ends at the newest epoch.
+    expect(ring[ring.length - 1].epoch).toBe(newestEpoch);
+    expect(ring[0].epoch).toBe(newestEpoch - BigInt(RING_SLOTS - 1));
+    for (let i = 1; i < ring.length; i++) {
+      expect(ring[i].epoch).toBe(ring[i - 1].epoch + BigInt(1));
+    }
+
+    // The 3 genuinely-written slots land at their correct derived epoch.
+    expect(ring[ring.length - 1].peg_ratio).toBe(ringSlots[RING_SLOTS - 1].peg_ratio);
+    expect(ring[ring.length - 1].effectiveState).toBe("Final");
+  });
+
+  it("promotes a Pending slot past its own pending_until to effectively Final", async () => {
+    const newestEpoch = BigInt(500_000);
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    // Stored as Pending, but effective_window (the contract's own
+    // now >= pending_until rule) says it's actually Final now.
+    ringSlots[RING_SLOTS - 1] = pendingSlot(newestEpoch, 0.998, BigInt(1000));
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([[newestEpoch.toString(), "Final"]]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+
+    const history = await fetchPegHistory(oracle, "ASSET");
+    const newestPoint = history[history.length - 1];
+
+    // The raw stored state was Pending, but the effective state (what the
+    // chart and the legend use) is Final - this is the whole point of
+    // using effective_window instead of state.tag raw.
+    expect(newestPoint.state).toBe("Final");
+    expect(newestPoint.pegRatio).toBeCloseTo(0.998, 5);
+  });
+
+  it("keeps a genuinely Pending slot (now < pending_until) as a gap, never a fake 0", async () => {
+    const newestEpoch = BigInt(500_000);
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    ringSlots[RING_SLOTS - 1] = pendingSlot(newestEpoch, 0.998, BigInt(9_999_999_999));
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([[newestEpoch.toString(), "Pending"]]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+
+    const history = await fetchPegHistory(oracle, "ASSET");
+    const newestPoint = history[history.length - 1];
+
+    expect(newestPoint.state).toBe("Pending");
+    expect(newestPoint.pegRatio).toBeNull();
+  });
+
+  it("assigns every Empty slot a real, contiguous epoch even in a sparsely filled ring", async () => {
+    // A partly filled ring: only epoch (newest - 50) and newest are real;
+    // everything else in between and before is still Empty.
+    const newestEpoch = BigInt(10_000);
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    ringSlots[RING_SLOTS - 51] = finalSlot(newestEpoch - BigInt(50), 1.0);
+    ringSlots[RING_SLOTS - 1] = finalSlot(newestEpoch, 1.0);
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([
+      [(newestEpoch - BigInt(50)).toString(), "Final"],
+      [newestEpoch.toString(), "Final"],
+    ]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+
+    const ring = await fetchEffectiveRing(oracle, "ASSET");
+
+    const emptySlots = ring.filter((s) => s.effectiveState === "Empty");
+    expect(emptySlots.length).toBe(RING_SLOTS - 2);
+    for (const slot of emptySlots) {
+      expect(slot.epoch).toBeGreaterThan(BigInt(0));
+    }
+    // Still one epoch apart from its neighbors - no gap or jump in the axis.
+    expect(ring[0].epoch).toBe(newestEpoch - BigInt(RING_SLOTS - 1));
+  });
+});
+
+describe("fetchPegHistory timestamps", () => {
+  it("uses the derived epoch (not the raw stored one) for the timestamp axis", async () => {
+    const newestEpoch = BigInt(500_000);
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    ringSlots[RING_SLOTS - 1] = finalSlot(newestEpoch, 1.0);
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([[newestEpoch.toString(), "Final"]]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+
+    const history = await fetchPegHistory(oracle, "ASSET");
+    const newestPoint = history[history.length - 1];
+
+    expect(newestPoint.timestamp).toBe(Number(newestEpoch) * EPOCH_SECS);
+    // Not anywhere near 1970 (timestamp 0).
+    expect(history[0].timestamp).toBeGreaterThan(0);
+  });
+});
+
+describe("fetchConfirmed", () => {
+  it("uses the newest EFFECTIVELY final slot's peg value, not latest()", async () => {
+    const newestEpoch = BigInt(500_000);
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    // Second-newest is Final; newest is still genuinely Pending.
+    ringSlots[RING_SLOTS - 2] = finalSlot(newestEpoch - BigInt(1), 0.9995);
+    ringSlots[RING_SLOTS - 1] = pendingSlot(newestEpoch, 0.97, BigInt(9_999_999_999));
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([
+      [(newestEpoch - BigInt(1)).toString(), "Final"],
+      [newestEpoch.toString(), "Pending"],
+    ]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+
+    const { confirmed, latestPending } = await fetchConfirmed(oracle, "ASSET");
+
+    expect(confirmed).not.toBeNull();
+    expect(confirmed!.epoch).toBe(newestEpoch - BigInt(1));
+    expect(confirmed!.pegRatio).toBeCloseTo(0.9995, 5);
+
+    expect(latestPending).not.toBeNull();
+    expect(latestPending!.epoch).toBe(newestEpoch);
+    expect(latestPending!.pegRatio).toBeCloseTo(0.97, 5);
+    expect(latestPending!.pendingUntil).toBe(BigInt(9_999_999_999));
+  });
+
+  it("promotes a Pending-past-deadline newest slot into Confirmed, with no separate latestPending", async () => {
+    const newestEpoch = BigInt(500_000);
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    ringSlots[RING_SLOTS - 1] = pendingSlot(newestEpoch, 0.998, BigInt(1000));
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([[newestEpoch.toString(), "Final"]]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+
+    const { confirmed, latestPending } = await fetchConfirmed(oracle, "ASSET");
+
+    expect(confirmed).not.toBeNull();
+    expect(confirmed!.epoch).toBe(newestEpoch);
+    expect(latestPending).toBeNull();
+  });
+
+  it("returns null for both when the ring has no real slots yet", async () => {
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch: new Map() });
+
+    const { confirmed, latestPending } = await fetchConfirmed(oracle, "ASSET");
+
+    expect(confirmed).toBeNull();
+    expect(latestPending).toBeNull();
+  });
+});

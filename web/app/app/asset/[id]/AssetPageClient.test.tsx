@@ -31,7 +31,10 @@ function okData(overrides: Partial<AssetPageData> = {}): AssetPageData {
     header: { status: "ok", value: baseHeader },
     confirmed: {
       status: "ok",
-      value: { epoch: BigInt(100), pegRatio: 0.9998, score: 12, band: normalBand },
+      value: {
+        confirmed: { epoch: BigInt(100), pegRatio: 0.9998, score: 12, band: normalBand },
+        latestPending: null,
+      },
     },
     live: { status: "ok", value: { status: "not-deployed" } },
     pegHistory: { status: "ok", value: [] },
@@ -104,9 +107,33 @@ describe("AssetPageClient", () => {
   });
 
   it("shows 'no confirmed value yet' instead of a fake number", async () => {
-    fetchAssetPageData.mockResolvedValue(okData({ confirmed: { status: "ok", value: null } }));
+    fetchAssetPageData.mockResolvedValue(
+      okData({ confirmed: { status: "ok", value: { confirmed: null, latestPending: null } } }),
+    );
     render(<AssetPageClient asset={baseHeader.asset} />);
     expect(await screen.findByText(/no confirmed value yet/i)).toBeInTheDocument();
+  });
+
+  it("shows the latest pending hour separately, with its real challenge deadline", async () => {
+    fetchAssetPageData.mockResolvedValue(
+      okData({
+        confirmed: {
+          status: "ok",
+          value: {
+            confirmed: { epoch: BigInt(99), pegRatio: 0.9998, score: 12, band: normalBand },
+            latestPending: {
+              epoch: BigInt(100),
+              pegRatio: 0.991,
+              pendingUntil: BigInt(Date.UTC(2026, 0, 1, 14, 30) / 1000),
+            },
+          },
+        },
+      }),
+    );
+    render(<AssetPageClient asset={baseHeader.asset} />);
+
+    expect(await screen.findByText(/latest hour: 0\.9910 peg/i)).toBeInTheDocument();
+    expect(screen.getByText(/can still be challenged until 14:30 utc/i)).toBeInTheDocument();
   });
 
   it("shows 'Live updates coming soon' rather than any mock live number", async () => {
@@ -184,7 +211,7 @@ describe("AssetPageClient", () => {
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
     render(<AssetPageClient asset={baseHeader.asset} />);
 
-    const svg = await screen.findByRole("img", { name: /2 of 4 hours confirmed/i });
+    const svg = await screen.findByRole("img", { name: /2 confirmed, 1 pending, 1 missing of 4 hours/i });
     expect(svg).toBeInTheDocument();
 
     // Two known points, zero gaps drawn through: exactly two disconnected

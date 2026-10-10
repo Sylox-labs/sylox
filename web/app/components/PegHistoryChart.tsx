@@ -26,16 +26,24 @@ const PAD_Y = 16;
  * screens need genuinely complex charts (zoom, multiple series,
  * tooltips) that this hand-rolled approach can't reasonably grow into.
  *
- * Every point whose pegRatio is null (Empty/Pending/Disputed - see
- * lib/asset-data.ts's fetchPegHistory) is a real gap: the line breaks
- * there, nothing is drawn, and it is never treated as a 0 value. A
- * missing or still-contested hour must never render as a fake depeg
- * dip (this is the single thing to check first in review).
+ * Every point whose pegRatio is null (effectively Empty/Pending/Disputed
+ * - see lib/asset-data.ts's fetchEffectiveRing/fetchPegHistory, which
+ * promote a Pending slot to Final once its own pending_until has
+ * passed, via RiskOracle.effective_window) is a real gap: the line
+ * breaks there, nothing is drawn, and it is never treated as a 0
+ * value. A missing or still-contested hour must never render as a
+ * fake depeg dip (this is the single thing to check first in review).
  */
 export function PegHistoryChart({ points, depegThreshold }: PegHistoryChartProps) {
   const known = points.filter(
     (p): p is PegHistoryPoint & { pegRatio: number } => p.pegRatio !== null,
   );
+  // state is already the EFFECTIVE state (see fetchEffectiveRing in
+  // lib/asset-data.ts) - a Pending hour past its own pending_until
+  // counts as confirmed here too, matching known/pegRatio above.
+  const confirmedCount = known.length;
+  const pendingCount = points.filter((p) => p.state === "Pending" || p.state === "Disputed").length;
+  const missingCount = points.filter((p) => p.state === "Empty").length;
 
   if (known.length === 0) {
     return (
@@ -95,7 +103,7 @@ export function PegHistoryChart({ points, depegThreshold }: PegHistoryChartProps
         viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         className="h-auto w-full"
         role="img"
-        aria-label={`Peg value over the stored history, ${known.length} of ${points.length} hours confirmed`}
+        aria-label={`Peg value over the stored history, ${confirmedCount} confirmed, ${pendingCount} pending, ${missingCount} missing of ${points.length} hours`}
       >
         {thresholdY !== null && (
           <line
@@ -119,7 +127,9 @@ export function PegHistoryChart({ points, depegThreshold }: PegHistoryChartProps
         ))}
       </svg>
       <div className="mt-2 flex items-center justify-between font-mono text-[10px] uppercase tracking-wide text-cyber-tin">
-        <span>{known.length} of {points.length} hours confirmed</span>
+        <span>
+          {confirmedCount} confirmed · {pendingCount} pending · {missingCount} missing
+        </span>
         {depegThreshold !== null && (
           <span className="flex items-center gap-1.5 text-risk-crimson-tint">
             <span className="inline-block h-px w-3 border-t border-dashed border-risk-crimson" />

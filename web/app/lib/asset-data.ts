@@ -96,14 +96,29 @@ export interface ConfirmedValue {
   band: RiskBand;
 }
 
-async function fetchConfirmed(
+/**
+ * The newest hour that is still genuinely Pending (now < pending_until):
+ * posted, but still inside its dispute window, so not yet Confirmed. Shown
+ * separately from Confirmed rather than folded into it - ADR-008 only
+ * treats a slot as effectively final once its own pending_until has passed,
+ * and this screen holds the same line between "settled" and "can still be
+ * challenged."
+ */
+export interface LatestPendingHour {
+  epoch: bigint;
+  pegRatio: number;
+  /** Ledger timestamp after which this hour becomes Confirmed - from the slot's own pending_until, never a placeholder. */
+  pendingUntil: bigint;
+}
+
+export async function fetchConfirmed(
   oracle: ReturnType<typeof riskOracleClient>,
   asset: string,
-): Promise<ConfirmedValue | null> {
-  const [latestTx, scoreTx] = await Promise.all([oracle.latest({ asset }), oracle.score({ asset })]);
-
-  const latest = latestTx.result;
-  if (!latest) return null;
+): Promise<{ confirmed: ConfirmedValue | null; latestPending: LatestPendingHour | null }> {
+  const [ring, scoreTx] = await Promise.all([
+    fetchEffectiveRing(oracle, asset),
+    oracle.score({ asset }),
+  ]);
 
   const scoreResult = scoreTx.result;
   if (scoreResult.isErr()) {
@@ -111,12 +126,40 @@ async function fetchConfirmed(
   }
   const riskScore = scoreResult.unwrap();
 
-  return {
-    epoch: latest.epoch,
-    pegRatio: Number(latest.peg_ratio) / PEG_RATIO_SCALE,
-    score: riskScore.score,
-    band: riskBandFor(riskScore.band),
-  };
+  // Walk newest-to-oldest (the ring is returned oldest-first) for the
+  // newest slot that is effectively Final - this is the hour "score" and
+  // "band" above were actually computed from (RiskOracle.score() is
+  // itself defined off the newest Final epoch, see lib.rs's score() doc
+  // comment), so pairing them here is pairing like with like, not reusing
+  // latest() which can point at a still-Pending hour.
+  let confirmed: ConfirmedValue | null = null;
+  for (let i = ring.length - 1; i >= 0; i--) {
+    const slot = ring[i];
+    if (slot.effectiveState === "Final") {
+      confirmed = {
+        epoch: slot.epoch,
+        pegRatio: Number(slot.peg_ratio) / PEG_RATIO_SCALE,
+        score: riskScore.score,
+        band: riskBandFor(riskScore.band),
+      };
+      break;
+    }
+  }
+
+  // The newest slot overall, only if it's a real posted hour still inside
+  // its own dispute window (genuinely Pending, not yet promoted to
+  // effectively Final).
+  let latestPending: LatestPendingHour | null = null;
+  const newest = ring[ring.length - 1];
+  if (newest && newest.state.tag === "Pending" && newest.effectiveState === "Pending") {
+    latestPending = {
+      epoch: newest.epoch,
+      pegRatio: Number(newest.peg_ratio) / PEG_RATIO_SCALE,
+      pendingUntil: newest.pending_until,
+    };
+  }
+
+  return { confirmed, latestPending };
 }
 
 /**
@@ -151,33 +194,94 @@ async function fetchLive(_asset: string): Promise<LiveValue> {
 // 3. Peg history (ring)
 // ---------------------------------------------------------------------------
 
+const RING_SLOTS = 240; // contracts/risk-oracle/src/storage.rs: RING_SLOTS, frozen for v1.
+
 export interface PegHistoryPoint {
   /** Unix seconds (epoch * EPOCH_SECS), the real time axis - never slot index. */
   timestamp: number;
   epoch: bigint;
+  /** The EFFECTIVE state (Pending promoted to Final once pending_until has passed), never the raw stored tag. */
   state: SlotState["tag"];
   /** Null for Empty/Pending/Disputed slots - a gap, never a fake 0. */
   pegRatio: number | null;
 }
 
-async function fetchPegHistory(
+export interface EffectiveRingSlot extends RingSlot {
+  /** `storage::effective_state`'s result for this slot, via RiskOracle.effective_window - the contract's own Pending-to-Final promotion rule, never reimplemented client-side. */
+  effectiveState: SlotState["tag"];
+}
+
+/**
+ * `ring()` returns slots oldest-first, but a never-written slot's stored
+ * `epoch` is 0 (storage.rs's `empty_slot()` default) - using it directly
+ * for the time axis puts empty hours in 1970. The ring's own layout
+ * (storage.rs's `get_ring`: positions `newest_index+1 .. newest_index`,
+ * wrapping) means array index `i` always corresponds to real epoch
+ * `newestEpoch - (RING_SLOTS - 1) + i`, regardless of what any individual
+ * slot's stored epoch says - so the axis is derived from the newest
+ * epoch and position alone, never from a per-slot epoch field.
+ *
+ * Paired here with `effective_window`, the contract's own read for
+ * whether a Pending slot's dispute window has already elapsed
+ * (ADR-008/review item C5) - the only Final/not-Final rule this screen
+ * uses, never `now >= pending_until` reimplemented client-side.
+ */
+export async function fetchEffectiveRing(
   oracle: ReturnType<typeof riskOracleClient>,
   asset: string,
-): Promise<PegHistoryPoint[]> {
+): Promise<EffectiveRingSlot[]> {
   const ringTx = await oracle.ring({ asset });
   const slots: RingSlot[] = ringTx.result;
 
-  return slots.map((slot) => ({
+  const newestSlot = [...slots].reverse().find((s) => s.state.tag !== "Empty");
+  if (!newestSlot) {
+    // Never posted: no real epoch to anchor the axis to. Every slot stays
+    // Empty; the axis values are arbitrary since nothing will render as a
+    // point anyway (every pegRatio comes out null for an all-Empty ring).
+    return slots.map((slot) => ({ ...slot, effectiveState: "Empty" }));
+  }
+
+  const newestEpoch = newestSlot.epoch;
+  const oldestEpoch =
+    newestEpoch >= BigInt(RING_SLOTS - 1) ? newestEpoch - BigInt(RING_SLOTS - 1) : BigInt(0);
+
+  const windowTx = await oracle.effective_window({
+    asset,
+    start_epoch: oldestEpoch,
+    count: RING_SLOTS,
+  });
+  const effectiveStates = windowTx.result; // Array<SlotState | undefined>, indexed by (epoch - oldestEpoch).
+
+  return slots.map((slot, i) => {
+    const epoch = newestEpoch - BigInt(RING_SLOTS - 1) + BigInt(i);
+    const windowIndex = Number(epoch - oldestEpoch);
+    const effective = effectiveStates[windowIndex];
+    return {
+      ...slot,
+      epoch, // Overrides the raw stored epoch (0 for an unwritten slot) with the derived, always-correct one.
+      effectiveState: effective ? effective.tag : "Empty",
+    };
+  });
+}
+
+export async function fetchPegHistory(
+  oracle: ReturnType<typeof riskOracleClient>,
+  asset: string,
+): Promise<PegHistoryPoint[]> {
+  const ring = await fetchEffectiveRing(oracle, asset);
+
+  return ring.map((slot) => ({
     timestamp: Number(slot.epoch) * EPOCH_SECS,
     epoch: slot.epoch,
-    state: slot.state.tag,
-    // Only a Final slot's peg_ratio is a settled, trustworthy value.
-    // Pending/Disputed/Empty all render as gaps (null), never as 0 -
-    // a missing or still-contested hour must never be drawn as a
-    // depeg dip (technical-doc.md Section 5.8: missing epochs "count
-    // neither for nor against" anything the contract itself checks;
-    // this screen holds the same rule for what it draws).
-    pegRatio: slot.state.tag === "Final" ? Number(slot.peg_ratio) / PEG_RATIO_SCALE : null,
+    state: slot.effectiveState,
+    // Only an EFFECTIVELY Final slot's peg_ratio is settled and
+    // trustworthy - a Pending slot still inside its dispute window,
+    // a Disputed slot, or a missing (Empty) one all render as gaps
+    // (null), never as 0. A missing or still-contested hour must never
+    // be drawn as a depeg dip (technical-doc.md Section 5.8: missing
+    // epochs "count neither for nor against" anything the contract
+    // itself checks; this screen holds the same rule for what it draws).
+    pegRatio: slot.effectiveState === "Final" ? Number(slot.peg_ratio) / PEG_RATIO_SCALE : null,
   }));
 }
 
@@ -300,7 +404,7 @@ async function fetchActiveEventCount(
 
 export interface AssetPageData {
   header: SectionResult<AssetHeader>;
-  confirmed: SectionResult<ConfirmedValue | null>;
+  confirmed: SectionResult<{ confirmed: ConfirmedValue | null; latestPending: LatestPendingHour | null }>;
   live: SectionResult<LiveValue>;
   pegHistory: SectionResult<PegHistoryPoint[]>;
   failureDefinitions: SectionResult<FailureDefinition[]>;
