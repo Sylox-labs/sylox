@@ -272,6 +272,14 @@ DEPEG_DEF="{\"asset\":\"$TRACKED_ASSET_ID\",\"kind\":\"Depeg\",\"version\":0,\"r
 invoke "$ER_ID" "$ADMIN" register_definition --def "$DEPEG_DEF" >/dev/null
 log "EventRegistry.register_definition: Depeg v1 registered for $TRACKED_ASSET_ID"
 
+# Section 5.9 S1 (v1.5): takes effect from the next hour boundary
+# onward, never retroactively; the asset's FIRST hour still posts via
+# the hourly fallback path either way (post_sub_signals needs this
+# config to already exist, and deploy/post-demo-signals.sh's own
+# backfill, further below, always uses the hourly path regardless).
+invoke "$RO_ID" "$ADMIN" set_sub_epoch_secs --asset "$TRACKED_ASSET_ID" --value 300 >/dev/null
+log "RiskOracle.set_sub_epoch_secs: 300 (5 minutes) set for $TRACKED_ASSET_ID, effective next hour"
+
 # -- Write the deployment record -----------------------------------------
 
 mkdir -p "$DEPLOYMENTS_DIR"

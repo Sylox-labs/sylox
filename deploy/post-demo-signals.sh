@@ -11,6 +11,19 @@
 # this script posts as a genuine signal about USDC's actual peg,
 # liquidity, or supply.
 #
+# Since v1.5 (Section 5.9): any hour whose own close is still within
+# `sub_backfill_secs` (2h) of now posts through the sub-epoch path
+# instead of the hourly one (12 posts at the 300s default, one per
+# sub-epoch), mirroring the real schedule technical-doc.md Section
+# 15.4 describes: a live keeper posts sub-epochs going forward, and
+# only falls back to the hourly path for a gap older than its own
+# 2h backfill window. Every older hour in range still posts through
+# the existing hourly path (window_secs, 72h), since post_sub_signals
+# cannot reach that far back at all — Sub(asset)'s own ring only ever
+# holds 5 hours of wall-clock history. This is also why this script
+# cannot seed the full 96 hours score() needs on its own: see the
+# README / PR description for the exact timeline.
+#
 # Usage: deploy/post-demo-signals.sh testnet [epochs]
 #   epochs: how many of the most recently closed epochs to post,
 #           oldest first. Default 24. Capped by the 72h backfill
@@ -37,6 +50,9 @@ RECORD="$REPO_ROOT/deployments/testnet.json"
 
 STELLAR_BIN="${STELLAR_CLI_BIN:-stellar}"
 EPOCH_SECS=3600
+SUB_EPOCH_SECS=300
+SUB_BACKFILL_SECS=7200   # crate::SUB_BACKFILL_SECS: post_sub_signals's own backfill reach
+SUBS_PER_HOUR=$(( EPOCH_SECS / SUB_EPOCH_SECS ))
 
 RO_ID="$(jq -r '.contracts.risk_oracle.id' "$RECORD")"
 KEEPER_ADDR="$(jq -r '.identities.keeper' "$RECORD")"
@@ -63,13 +79,10 @@ echo "[]" > "$INPUTS_FILE"
 SUPPLY="10000000000000"       # 1,000,000 units at SCALE 1e7, arbitrary plausible size
 LIQUIDITY="500000000000"      # 50,000 units at SCALE 1e7
 
-for (( epoch = FIRST_EPOCH; epoch <= NEWEST_CLOSED_EPOCH; epoch++ )); do
-  # Small, plausible noise around a 1.0 peg: +/- 0.001, deterministic
-  # per epoch so re-running with the same epoch range is reproducible.
-  noise=$(( (epoch % 7) - 3 ))                  # -3..3
-  peg_ratio=$(( 10000000 + noise * 1000 ))       # 1.0 +/- 0.003, SCALE 1e7
-  peg_ratio_p10=$(( peg_ratio - 2000 ))          # p10 slightly below the mean, never above (sanity bound)
+post_hourly() {
+  local epoch="$1" peg_ratio="$2" peg_ratio_p10="$3"
 
+  local inputs_json
   inputs_json=$(jq -nc \
     --arg epoch "$epoch" \
     --arg peg_ratio "$peg_ratio" \
@@ -77,16 +90,61 @@ for (( epoch = FIRST_EPOCH; epoch <= NEWEST_CLOSED_EPOCH; epoch++ )); do
     --arg liquidity "$LIQUIDITY" \
     --arg supply "$SUPPLY" \
     '{epoch: ($epoch|tonumber), peg_ratio: ($peg_ratio|tonumber), peg_ratio_p10: ($peg_ratio_p10|tonumber), liquidity_2pct: ($liquidity|tonumber), supply: ($supply|tonumber), redemption_net: 0, supply_change_bps: 0, endpoint: "Unknown"}')
+  local inputs_hash
   inputs_hash="$(printf '%s' "$inputs_json" | shasum -a 256 | cut -d' ' -f1)"
 
-  jq --argjson entry "$(jq -nc --argjson inputs "$inputs_json" --arg hash "$inputs_hash" '{inputs: $inputs, inputs_hash: $hash}')" \
+  jq --argjson entry "$(jq -nc --argjson inputs "$inputs_json" --arg hash "$inputs_hash" '{inputs: $inputs, inputs_hash: $hash, path: "hourly"}')" \
      '. += [$entry]' "$INPUTS_FILE" > "$INPUTS_FILE.tmp" && mv "$INPUTS_FILE.tmp" "$INPUTS_FILE"
 
-  signal_set="{\"epoch\":$epoch,\"posted_at\":0,\"peg_ratio\":\"$peg_ratio\",\"peg_ratio_p10\":\"$peg_ratio_p10\",\"liquidity_2pct\":\"$LIQUIDITY\",\"redemption_net\":\"0\",\"supply\":\"$SUPPLY\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
+  local signal_set="{\"epoch\":$epoch,\"posted_at\":0,\"peg_ratio\":\"$peg_ratio\",\"peg_ratio_p10\":\"$peg_ratio_p10\",\"liquidity_2pct\":\"$LIQUIDITY\",\"redemption_net\":\"0\",\"supply\":\"$SUPPLY\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
 
   "$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
     post_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --s "$signal_set" >/dev/null
-  log "epoch $epoch posted (peg_ratio $(awk -v p="$peg_ratio" 'BEGIN { printf "%.4f", p/10000000 }'))"
+  log "epoch $epoch posted via the hourly path (peg_ratio $(awk -v p="$peg_ratio" 'BEGIN { printf "%.4f", p/10000000 }'))"
+}
+
+post_sub_epochs() {
+  local epoch="$1"
+  local sub
+  for (( sub = 0; sub < SUBS_PER_HOUR; sub++ )); do
+    # Same small, deterministic noise convention as the hourly path,
+    # varied per sub-epoch too so a build_hour roll-up has something
+    # other than 12 identical values to average.
+    local noise=$(( ((epoch * SUBS_PER_HOUR + sub) % 7) - 3 ))   # -3..3
+    local peg_ratio=$(( 10000000 + noise * 1000 ))
+    local peg_ratio_p10=$(( peg_ratio - 2000 ))
+
+    local inputs_json
+    inputs_json=$(jq -nc \
+      --arg epoch "$epoch" --arg sub "$sub" \
+      --arg peg_ratio "$peg_ratio" --arg peg_ratio_p10 "$peg_ratio_p10" \
+      --arg liquidity "$LIQUIDITY" --arg supply "$SUPPLY" \
+      '{hour: ($epoch|tonumber), sub: ($sub|tonumber), peg_ratio: ($peg_ratio|tonumber), peg_ratio_p10: ($peg_ratio_p10|tonumber), liquidity_2pct: ($liquidity|tonumber), supply: ($supply|tonumber), redemption_net: 0, supply_change_bps: 0, endpoint: "Unknown"}')
+    local inputs_hash
+    inputs_hash="$(printf '%s' "$inputs_json" | shasum -a 256 | cut -d' ' -f1)"
+
+    jq --argjson entry "$(jq -nc --argjson inputs "$inputs_json" --arg hash "$inputs_hash" '{inputs: $inputs, inputs_hash: $hash, path: "sub_epoch"}')" \
+       '. += [$entry]' "$INPUTS_FILE" > "$INPUTS_FILE.tmp" && mv "$INPUTS_FILE.tmp" "$INPUTS_FILE"
+
+    local signal_set="{\"epoch\":$epoch,\"posted_at\":0,\"peg_ratio\":\"$peg_ratio\",\"peg_ratio_p10\":\"$peg_ratio_p10\",\"liquidity_2pct\":\"$LIQUIDITY\",\"redemption_net\":\"0\",\"supply\":\"$SUPPLY\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
+
+    "$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
+      post_sub_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --hour "$epoch" --sub "$sub" --s "$signal_set" >/dev/null
+  done
+  log "epoch $epoch posted via the sub-epoch path ($SUBS_PER_HOUR sub-epochs at ${SUB_EPOCH_SECS}s)"
+}
+
+for (( epoch = FIRST_EPOCH; epoch <= NEWEST_CLOSED_EPOCH; epoch++ )); do
+  epoch_close=$(( (epoch + 1) * EPOCH_SECS ))
+  noise=$(( (epoch % 7) - 3 ))
+  peg_ratio=$(( 10000000 + noise * 1000 ))
+  peg_ratio_p10=$(( peg_ratio - 2000 ))
+
+  if (( NOW - epoch_close <= SUB_BACKFILL_SECS )); then
+    post_sub_epochs "$epoch"
+  else
+    post_hourly "$epoch" "$peg_ratio" "$peg_ratio_p10"
+  fi
 done
 
 log "Inputs written to $INPUTS_FILE"
@@ -100,6 +158,8 @@ newest="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-te
 log "newest_epoch: $newest"
 latest="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet --send=no -- latest --asset "$ASSET_ID")"
 log "latest: $latest"
+live="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet --send=no -- live --asset "$ASSET_ID")"
+log "live: $live"
 score="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet --send=no -- score --asset "$ASSET_ID")"
 log "score: $score"
 band="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet --send=no -- band --asset "$ASSET_ID")"
