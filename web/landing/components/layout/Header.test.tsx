@@ -34,6 +34,24 @@ describe("Header", () => {
     expect(desktopNav.parentElement).toHaveTextContent(/testnet/i);
   });
 
+  it("unmounts the compact phone-header Launch app button once the mobile menu opens, so it isn't shown alongside the menu's own copy", async () => {
+    render(<Header />);
+
+    // The compact header button, the desktop button, and the menu
+    // panel's own copy all share the same accessible name ("Launch
+    // app"), so the compact one specifically is identified by its own
+    // data-compact-launch-app marker rather than by role/name.
+    expect(document.querySelector("[data-compact-launch-app]")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /open menu/i }));
+    await screen.findByRole("dialog", { name: /menu/i });
+
+    // Open: the compact header copy is gone entirely (conditionally
+    // unmounted, not just visually hidden) - only the desktop button
+    // and the menu panel's own copy remain.
+    expect(document.querySelector("[data-compact-launch-app]")).toBeNull();
+  });
+
   it("opens the mobile menu as a dialog and closes it on Escape", async () => {
     render(<Header />);
     const toggle = screen.getByRole("button", { name: /open menu/i });
