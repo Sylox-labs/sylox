@@ -209,14 +209,20 @@ export function Header() {
                 menu button otherwise, hiding the main CTA behind an extra
                 tap - a compact version (smaller padding, no tag - it
                 doesn't fit at this size) sits next to the menu toggle
-                instead. The full version stays inside the open menu too. */}
-            <ButtonLink
-              href={nav.launchApp.href}
-              variant="primary"
-              className="!px-3 !py-1.5 text-xs md:hidden"
-            >
-              {nav.launchApp.label}
-            </ButtonLink>
+                instead. Hidden while the menu is open, since the open
+                menu has its own full-size copy of this same button -
+                showing both at once would be the button rendered twice
+                on screen simultaneously. */}
+            {!isMenuOpen && (
+              <ButtonLink
+                href={nav.launchApp.href}
+                variant="primary"
+                data-compact-launch-app
+                className="!px-3 !py-1.5 text-xs md:hidden"
+              >
+                {nav.launchApp.label}
+              </ButtonLink>
+            )}
 
             <button
               ref={menuButtonRef}
