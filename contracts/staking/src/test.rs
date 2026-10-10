@@ -1654,6 +1654,44 @@ fn reward_keeper_unfunded_bucket_accrues_only_what_is_there() {
     );
 }
 
+/// Section 5.9 S6 (v1.5): keeper pay for one hour of real coverage is
+/// identical whether that hour was posted as 12 sub-epochs at the
+/// 300s default, as 1 sub-epoch at the 3,600s (hourly) interval, or
+/// through the existing hourly `reward_keeper` path directly. Proves
+/// the brief's own "keeper pay per hour being the same at 300 and at
+/// 3,600" requirement against the real reward formula, not just the
+/// mock's own accounting.
+#[test]
+fn reward_keeper_sub_epochs_pays_the_same_per_hour_at_300s_and_at_3_600s() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let keeper_hourly = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    let keeper_300 = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    let keeper_3600 = add_and_fund_keeper(&env, &fx, params::KEEPER_BOND);
+    fund_treasury_bucket(
+        &env,
+        &fx,
+        TreasuryBucket::KeeperRewards,
+        params::KEEPER_REWARD_PER_ACCEPTED_EPOCH * 3,
+    );
+
+    let hourly = fx.client.reward_keeper(&keeper_hourly, &1);
+    // 12 sub-epochs of 300s each make up exactly one hour.
+    let at_300s = fx.client.reward_keeper_sub_epochs(&keeper_300, &12, &300);
+    // 1 sub-epoch of 3,600s is exactly one hour on its own.
+    let at_3600s = fx.client.reward_keeper_sub_epochs(&keeper_3600, &1, &3_600);
+
+    assert_eq!(
+        hourly, at_300s,
+        "one hour of sub-epochs at the 300s default must pay the same as one hourly reward"
+    );
+    assert_eq!(
+        hourly, at_3600s,
+        "one hour of sub-epochs at the 3,600s interval must pay the same as one hourly reward"
+    );
+    assert_eq!(hourly, params::KEEPER_REWARD_PER_ACCEPTED_EPOCH);
+}
+
 #[test]
 fn claim_reward_on_treasury_rejects_when_nothing_is_accrued() {
     let env = Env::default();

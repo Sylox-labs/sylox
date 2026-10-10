@@ -956,18 +956,23 @@ impl Staking {
         if sub_epoch_count == 0 {
             return Ok(0);
         }
-        // keeper_reward * sub_epoch_secs / 3,600 per accepted
-        // sub-epoch: scaling down from the hourly default so the SUM
-        // across one hour's worth of sub-epochs always equals exactly
-        // one hourly reward, never more or less because of how finely
-        // an asset's posting interval happens to be divided.
-        let per_sub_epoch = params::KEEPER_REWARD_PER_ACCEPTED_EPOCH
+        // keeper_reward * sub_epoch_secs * sub_epoch_count / 3,600:
+        // every multiplication happens before the one division, so a
+        // full hour's worth of sub-epochs (sub_epoch_count ==
+        // 3,600 / sub_epoch_secs) always pays EXACTLY one hourly
+        // reward, no matter how finely the interval divides the
+        // hour. Dividing once per sub-epoch first (computing a
+        // per-sub-epoch rate, then multiplying by the count) would
+        // truncate on every division instead of once overall: at the
+        // 300s default, 12 separate truncations lose up to 11 more
+        // units than this one combined division does, measurably
+        // underpaying keepers every single hour.
+        let amount = params::KEEPER_REWARD_PER_ACCEPTED_EPOCH
             .checked_mul(sub_epoch_secs as i128)
             .ok_or(Error::MathOverflow)?
-            / params::EPOCH_SECS as i128;
-        let amount = per_sub_epoch
             .checked_mul(sub_epoch_count as i128)
-            .ok_or(Error::MathOverflow)?;
+            .ok_or(Error::MathOverflow)?
+            / params::EPOCH_SECS as i128;
         let accrued = TreasuryClient::new(&env, &config.treasury).accrue_reward(
             &keeper,
             &TreasuryBucket::KeeperRewards,

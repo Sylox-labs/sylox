@@ -120,8 +120,11 @@ impl MockStaking {
         env.storage()
             .temporary()
             .set(&StakingKey::RewardKeeperSubEpochs(keeper.clone()), &total);
-        let per_sub_epoch = 500_000i128 * sub_epoch_secs as i128 / 3_600;
-        per_sub_epoch * sub_epoch_count as i128
+        // Multiply before dividing (mirrors the fix in the real
+        // Staking contract): a full hour's worth of sub-epochs must
+        // add up to exactly one hourly reward, not lose units to
+        // repeated truncation from dividing once per sub-epoch first.
+        500_000i128 * sub_epoch_secs as i128 * sub_epoch_count as i128 / 3_600
     }
 
     /// Total sub-epochs ever credited to `keeper` via
