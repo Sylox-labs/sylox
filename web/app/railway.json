@@ -1,18 +1,18 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "build": {
-    "buildCommand": "npm run build -w web/landing",
+    "buildCommand": "npm run build -w web/app",
     "watchPatterns": [
-      "/web/landing/**",
+      "/web/app/**",
       "/web/shared/**",
+      "/deployments/**",
       "/package.json",
       "/package-lock.json",
-      "/railway.json",
       "/railpack.json"
     ]
   },
   "deploy": {
-    "startCommand": "npm run serve -w web/landing",
+    "startCommand": "npm run start -w web/app -- -p $PORT",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3
   }
