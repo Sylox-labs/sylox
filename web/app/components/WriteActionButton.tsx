@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useWallet } from "@/lib/wallet/WalletContext";
 import { stellarExpertTxUrl } from "@/lib/stellar-expert";
+import type { Prepared } from "@/lib/event-actions";
 
 type Step =
   | { kind: "idle" }
@@ -12,12 +13,12 @@ type Step =
   | { kind: "done"; txHash: string }
   | { kind: "error"; message: string };
 
-export interface WriteActionButtonProps<Prepared> {
+export interface WriteActionButtonProps<T> {
   label: string;
-  /** Simulates the write (the contract's own auto-simulation on construction) and throws a plain-language error if it would be rejected. Called on the first click. */
-  prepare: () => Promise<Prepared>;
+  /** Simulates the write for the given (already-connected) address and throws a plain-language error if it would be rejected. Called on the first click, and again automatically if the connected address changes before confirm. */
+  prepare: (address: string) => Promise<Prepared<T>>;
   /** Signs and sends the already-prepared transaction. Called only after the simulated result was shown and the visitor confirms. */
-  confirm: (prepared: Prepared, signer: { publicKey: string; signTransaction: ReturnType<typeof useWallet>["signTransaction"] }) => Promise<{ txHash: string }>;
+  confirm: (prepared: Prepared<T>, signer: { publicKey: string; signTransaction: ReturnType<typeof useWallet>["signTransaction"] }) => Promise<{ txHash: string }>;
   /** True while this action doesn't apply right now (e.g. Finalize before the challenge window closes) - disables the button with no network call at all. */
   disabled?: boolean;
   disabledReason?: string;
@@ -25,27 +26,35 @@ export interface WriteActionButtonProps<Prepared> {
 
 /**
  * One button, the full simulate-then-sign flow: click simulates via
- * `prepare` and shows its outcome in plain words; a bad simulation
- * stops there, with no wallet prompt. A good simulation shows a
- * "Confirm & sign" step; only that click calls `confirm`, which is
- * the only place a signature is actually requested. A successful send
- * links to the transaction on stellar.expert.
+ * `prepare` (only ever called with a connected address - the
+ * disconnected state below never reaches it) and shows its outcome in
+ * plain words; a bad simulation stops there, with no wallet prompt. A
+ * good simulation shows a "Confirm & sign" step; only that click calls
+ * `confirm`, which is the only place a signature is actually
+ * requested. If the connected wallet changed between the two clicks
+ * (a real scenario: switching accounts in the extension), confirm
+ * re-prepares against the new address instead of signing a
+ * transaction built for the old one - eventRegistryClient(publicKey)
+ * bakes the address into the transaction's own source account, so a
+ * stale `prepared` can never just be reused. A successful send links
+ * to the transaction on stellar.expert.
  */
-export function WriteActionButton<Prepared>({
+export function WriteActionButton<T>({
   label,
   prepare,
   confirm,
   disabled = false,
   disabledReason,
-}: WriteActionButtonProps<Prepared>) {
+}: WriteActionButtonProps<T>) {
   const { address, openPicker, signTransaction } = useWallet();
   const [step, setStep] = useState<Step>({ kind: "idle" });
-  const [prepared, setPrepared] = useState<Prepared | null>(null);
+  const [prepared, setPrepared] = useState<Prepared<T> | null>(null);
 
   const handleSimulate = async () => {
+    if (!address) return; // Render-gated below too, but never trust the gate alone for the actual call.
     setStep({ kind: "simulating" });
     try {
-      const result = await prepare();
+      const result = await prepare(address);
       setPrepared(result);
       setStep({ kind: "ready-to-confirm" });
     } catch (e) {
@@ -57,7 +66,16 @@ export function WriteActionButton<Prepared>({
     if (!address || prepared === null) return;
     setStep({ kind: "confirming" });
     try {
-      const { txHash } = await confirm(prepared, { publicKey: address, signTransaction });
+      let toConfirm = prepared;
+      if (prepared.preparedFor !== address) {
+        // The connected wallet changed since Simulate - the old
+        // transaction's source account no longer matches who's about
+        // to sign, so it's discarded and re-simulated against the
+        // current address rather than ever being signed as-is.
+        toConfirm = await prepare(address);
+        setPrepared(toConfirm);
+      }
+      const { txHash } = await confirm(toConfirm, { publicKey: address, signTransaction });
       setStep({ kind: "done", txHash });
     } catch (e) {
       setStep({ kind: "error", message: e instanceof Error ? e.message : String(e) });

@@ -245,15 +245,15 @@ function ActionsSection({ eventId, data }: { eventId: string; data: EventPageDat
           label="Checkpoint"
           disabled={checkpointDisabled}
           disabledReason={checkpointDisabled ? "Only applies to a Depeg event that's still Proposed." : undefined}
-          prepare={() => prepareCheckpointCure(eventIdBigInt())}
-          confirm={(tx, signer) => confirmCheckpointCure(tx, signer)}
+          prepare={(address) => prepareCheckpointCure(eventIdBigInt(), address)}
+          confirm={(prepared, signer) => confirmCheckpointCure(prepared, signer)}
         />
         <WriteActionButton
           label="Finalize"
           disabled={finalizeDisabled}
           disabledReason={finalizeDisabled ? "Only applies to an event that's still Proposed." : undefined}
-          prepare={() => prepareFinalize(eventIdBigInt())}
-          confirm={(tx, signer) => confirmFinalize(tx, signer)}
+          prepare={(address) => prepareFinalize(eventIdBigInt(), address)}
+          confirm={(prepared, signer) => confirmFinalize(prepared, signer)}
         />
       </div>
       <p className="mt-4 font-mono text-xs text-cyber-tin">
