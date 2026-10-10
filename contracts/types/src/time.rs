@@ -153,6 +153,5 @@ pub const MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE: u32 = 73;
 /// `budget_cover_gate_at_the_structural_cap_every_hour_disputed`
 /// every time the test suite runs, which is the actual guard against
 /// a regression here.
-const _: () = assert!(
-    MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE == (RING_SLOTS - AGGREGATE_SLOTS_7D + 1)
-);
+const _: () =
+    assert!(MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE == (RING_SLOTS - AGGREGATE_SLOTS_7D + 1));

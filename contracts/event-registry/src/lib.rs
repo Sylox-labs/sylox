@@ -579,7 +579,15 @@ impl EventRegistry {
         let halt_window_secs = DEFAULT_HALT_WINDOW_SECS;
 
         let depeg_epochs = (depeg_window_secs / EPOCH_SECS) as u32;
-        match depeg_check(&env, &oracle, &asset, &ring, newest_epoch, depeg_epochs, depeg_threshold) {
+        match depeg_check(
+            &env,
+            &oracle,
+            &asset,
+            &ring,
+            newest_epoch,
+            depeg_epochs,
+            depeg_threshold,
+        ) {
             DepegCheck::Depeg => return Ok(CoverGate::RecentDepeg),
             DepegCheck::UnbuiltBacklog => return Ok(CoverGate::UnbuiltBacklog),
             DepegCheck::Clear => {}

@@ -18,8 +18,8 @@ use sylox_types::network_limits::{
     TX_MAX_WRITE_LEDGER_ENTRIES, TX_MEMORY_LIMIT_BYTES,
 };
 use sylox_types::{
-    AssetConfig, CoverGate, EndpointStatus, EventDefinition, EventKind, IssuerActions,
-    IssuerFlags, Reference, SignalSet,
+    AssetConfig, CoverGate, EndpointStatus, EventDefinition, EventKind, IssuerActions, IssuerFlags,
+    Reference, SignalSet,
 };
 
 use crate::{EventRegistry, EventRegistryClient};
@@ -209,7 +209,11 @@ impl MockGovernor {
 /// cross-contract call to it.
 fn setup_with_governor(
     env: &Env,
-) -> (EventRegistryClient<'_>, risk_oracle::RiskOracleClient<'_>, Address) {
+) -> (
+    EventRegistryClient<'_>,
+    risk_oracle::RiskOracleClient<'_>,
+    Address,
+) {
     env.mock_all_auths();
     let governor = env.register(MockGovernor, ());
     let governor_client = MockGovernorClient::new(env, &governor);
@@ -661,9 +665,12 @@ fn budget_cover_gate_against_1_and_12_unbuilt_hours() {
 /// directly: footprint at 1 unbuilt hour must equal footprint at 72.
 #[test]
 fn budget_cover_gate_footprint_is_constant_from_1_to_72_unbuilt_hours() {
-    let at_1 = measure_cover_gate_with_n_unbuilt_hours(1, "cover_gate, 1 unbuilt hour (footprint check)");
-    let at_72 =
-        measure_cover_gate_with_n_unbuilt_hours(72, "cover_gate, 72 unbuilt hours (footprint check)");
+    let at_1 =
+        measure_cover_gate_with_n_unbuilt_hours(1, "cover_gate, 1 unbuilt hour (footprint check)");
+    let at_72 = measure_cover_gate_with_n_unbuilt_hours(
+        72,
+        "cover_gate, 72 unbuilt hours (footprint check)",
+    );
     assert_eq!(
         footprint_entries(&at_1),
         footprint_entries(&at_72),
@@ -784,7 +791,8 @@ fn disputed_sub_epoch_excluded_then_restored_or_cleared_by_ruling_matches_the_ro
         &sub_signal_set(&env, &keeper, hour, 10_100_000),
     );
     // A third, genuinely depegged sub-epoch, immediately disputed.
-    env.ledger().set_timestamp(hour * EPOCH_SECS + 2 * 300 + 300);
+    env.ledger()
+        .set_timestamp(hour * EPOCH_SECS + 2 * 300 + 300);
     oracle.post_sub_signals(
         &keeper,
         &asset,
@@ -847,7 +855,8 @@ fn disputed_sub_epoch_excluded_then_restored_or_cleared_by_ruling_matches_the_ro
     // the committee UPHOLD the keeper (keeper_wins: true): the
     // sub-epoch must come back as a real, trusted value, visible to
     // both the gate and the roll-up.
-    env.ledger().set_timestamp(hour * EPOCH_SECS + 2 * 300 + 300);
+    env.ledger()
+        .set_timestamp(hour * EPOCH_SECS + 2 * 300 + 300);
     oracle.post_sub_signals(
         &keeper,
         &asset,

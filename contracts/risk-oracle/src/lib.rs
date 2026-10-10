@@ -750,7 +750,13 @@ impl RiskOracle {
             // hour has a held entry, sub_disposition reads THAT, not
             // the ring, so the ring-only write above alone would
             // never be seen for an hour whose ring has rotated on.
-            storage::set_held_sub_slot_state(&env, &asset, hour, sub, sylox_types::SlotState::Final);
+            storage::set_held_sub_slot_state(
+                &env,
+                &asset,
+                hour,
+                sub,
+                sylox_types::SlotState::Final,
+            );
             events::SubSignalsFinal {
                 asset: asset.clone(),
                 hour,
@@ -1998,7 +2004,7 @@ fn refresh_waiting_hour(
     }
 
     let provisional = roll_up_sub_slots(env, config, asset, hour, &posted_slots, &posted_subs)?;
-    let coverage = Some(posted_slots.len() as u32);
+    let coverage = Some(posted_slots.len());
     if any_disputed {
         storage::force_set_slot_disputed(
             env,
@@ -2009,7 +2015,14 @@ fn refresh_waiting_hour(
             coverage,
         );
     } else {
-        storage::write_ring_slot(env, asset, hour, &provisional, HOUR_PENDING_SENTINEL, coverage);
+        storage::write_ring_slot(
+            env,
+            asset,
+            hour,
+            &provisional,
+            HOUR_PENDING_SENTINEL,
+            coverage,
+        );
     }
     Ok(())
 }

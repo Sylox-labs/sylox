@@ -902,7 +902,10 @@ fn byte_coverage(b: u8) -> Option<u32> {
     if b == 0xFF {
         None
     } else {
-        assert!(b <= 12, "stored provisional_sub_coverage byte out of range: {b}");
+        assert!(
+            b <= 12,
+            "stored provisional_sub_coverage byte out of range: {b}"
+        );
         Some(b as u32)
     }
 }

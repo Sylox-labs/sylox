@@ -609,7 +609,8 @@ fn write_ring_slot_refuses_to_overwrite_a_newer_epoch() {
         let older_epoch = 5u64;
 
         let signals = signal_set(&env, newer_epoch, 9_900_000);
-        let wrote_newer = crate::storage::write_ring_slot(&env, &asset, newer_epoch, &signals, 100, None);
+        let wrote_newer =
+            crate::storage::write_ring_slot(&env, &asset, newer_epoch, &signals, 100, None);
         assert!(wrote_newer);
 
         let stale_signals = signal_set(&env, older_epoch, 9_000_000);
