@@ -60,8 +60,18 @@ DEMO_ISSUER=sylox-demo-issuer
 log() { echo "==> $*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
-SUPPLY="10000000000000"      # 1,000,000 units at SCALE 1e7, same convention as post-demo-signals.sh.
-LIQUIDITY="500000000000"     # 50,000 units at SCALE 1e7.
+# Review finding (this session): SUPPLY must reflect what this script
+# actually mints/claws back, not post-demo-signals.sh's own arbitrary
+# 1,000,000 unit figure (that script never claws anything back, so its
+# supply number is never divided into anything). check_issuer_freeze
+# (contracts/event-registry/src/lib.rs) computes clawback_amount *
+# 10000 / supply in INTEGER arithmetic and compares against
+# freeze_pct_bps: a real 50 of 1,000,000 units (0.005%) truncates to 0
+# bps and can never pass any positive threshold. Posting SUPPLY equal
+# to what is actually minted below (100 units) makes the real 50 unit
+# clawback a real, checkable 50% of supply.
+SUPPLY="1000000000"          # 100 units at SCALE 1e7: matches HOLDER_BALANCE below exactly.
+LIQUIDITY="500000000"        # 50 units at SCALE 1e7, proportionally smaller to match.
 
 # -- [1/6] Holder identity and trustline -----------------------------
 
