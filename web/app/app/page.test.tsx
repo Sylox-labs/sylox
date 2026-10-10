@@ -78,6 +78,14 @@ describe("ExplorerPage", () => {
     expect(await screen.findByText(/no assets are tracked yet/i)).toBeInTheDocument();
   });
 
+  it("links each asset card to its Asset screen now that the route exists", async () => {
+    fetchExplorerData.mockResolvedValue({ rows: [baseRow], errors: [] });
+    render(<ExplorerPage />);
+
+    const link = await screen.findByRole("link");
+    expect(link).toHaveAttribute("href", `/asset/${baseRow.asset}`);
+  });
+
   it("renders a per-asset error card without losing the other rows", async () => {
     const errors: ExplorerAssetError[] = [
       { asset: "CAFRI2UDYGXUU25B5ITFNZDUMJXZYD7S4ATYBSYCANETT5UN6JRPUP2H", message: "boom" },
