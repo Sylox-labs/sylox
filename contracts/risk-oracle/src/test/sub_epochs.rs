@@ -1589,24 +1589,100 @@ mod property {
         }
     }
 
+    /// This test's own model of one sub-epoch's current disposition,
+    /// kept independently of the contract's own storage, precisely
+    /// enough to predict whether `post_sub_signals` will accept or
+    /// reject the NEXT `Post` step against it, and what value a
+    /// built hour should end up reading if this sub-epoch is Final
+    /// when it builds.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum ModelSub {
+        /// Never posted, or posted and then overturned with its
+        /// repost window closed and either no repost or the repost
+        /// itself overturned again: settled, permanently excluded,
+        /// but a fresh `Post` is only ever ACCEPTED again while still
+        /// genuinely `NeverPosted` (an overturned-and-settled sub
+        /// never reopens).
+        NeverPosted,
+        /// Currently has a live `SubSignals` entry (Pending,
+        /// Disputed, or effectively Final): a further `Post` must be
+        /// rejected (`EpochAlreadyPosted`), regardless of which of
+        /// those three states it is actually in right now, since all
+        /// three share the same "already posted" rejection.
+        Live { value: i128 },
+        /// Overturned (a dispute the disputer won), its own repost
+        /// window still open or already closed, `reposted` tracking
+        /// whether the ONE allowed repost has already been used.
+        Overturned {
+            sub_close: u64,
+            overturned_at: u64,
+            reposted: bool,
+        },
+    }
+
+    impl ModelSub {
+        /// Mirrors `check_sub_epoch_window`/`check_sub_epoch_repost_
+        /// window`/the `EpochAlreadyPosted`/`HourAlreadyPosted` checks
+        /// `post_sub_signals` makes, in that order, against THIS
+        /// model's own view of the sub-epoch (never the contract's),
+        /// so a mismatch between this prediction and the real result
+        /// is exactly the kind of bug the hand-found repost-limit gap
+        /// was: the model accepting (or rejecting) something the
+        /// real contract does the opposite of.
+        fn predict_post_accepted(&self, sub_close: u64, now: u64, hour_is_final: bool) -> bool {
+            if hour_is_final {
+                return false;
+            }
+            match self {
+                ModelSub::NeverPosted => {
+                    sub_close <= now && now.saturating_sub(sub_close) <= crate::SUB_BACKFILL_SECS
+                }
+                ModelSub::Live { .. } => false,
+                ModelSub::Overturned {
+                    overturned_at,
+                    reposted,
+                    ..
+                } => {
+                    if *reposted {
+                        false
+                    } else {
+                        let anchor = sub_close.max(*overturned_at);
+                        now.saturating_sub(anchor) <= crate::SUB_BACKFILL_SECS
+                    }
+                }
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 24, .. ProptestConfig::default() })]
 
-        /// I21, I23, "a built hour never changes": a random sequence
-        /// of up to 80 steps against ONE hour, mixing posts, disputes
+        /// I21, I23, "a built hour never changes", and now the exact
+        /// repost accept/reject boundary: a random sequence of up to
+        /// 80 steps against ONE hour, mixing posts, disputes
         /// (including ones left open long enough to outlast
         /// `Sub(asset)`'s own 5 hour ring, per `AdvanceTime`'s wide
         /// range), rulings (both outcomes, via both the committee and
         /// timeout paths), missed sub-epochs (any `sub` nobody ever
         /// posts), manual `build_hour` calls at arbitrary points, and
-        /// `sub_epoch_secs` changes mid-sequence. Checked after EVERY
-        /// step: once the hour is first observed decided (Final or
-        /// built-Empty), every later step's own snapshot must be
-        /// byte-for-byte identical (I21's "never changes an hour
-        /// that is already built" and the brief's own "a built hour
-        /// never changes," together), and no Final hour's peg_ratio
-        /// ever equals an overturned sub-epoch's own distinctive
-        /// sentinel value (I23).
+        /// `sub_epoch_secs` changes mid-sequence. Every `Post` step is
+        /// checked against this test's OWN independent model
+        /// (`ModelSub::predict_post_accepted`) before being applied:
+        /// a model that always predicts rejection, or one with no
+        /// repost limit at all, would both have passed the OLD
+        /// version of this test (which only ever ignored the result
+        /// via `let _ =`), the exact shape of the one-repost-per-
+        /// overturn bug found by hand while writing the deterministic
+        /// tests. Checked after EVERY step: once the hour is first
+        /// observed decided (Final or built-Empty), every later
+        /// step's own snapshot must be byte-for-byte identical (I21's
+        /// "never changes an hour that is already built" and the
+        /// brief's own "a built hour never changes," together), and
+        /// a Final hour's own `peg_ratio` must equal the mean of
+        /// whichever sub-epochs this test's own model believes are
+        /// currently live, not a value recomputed from stale,
+        /// overturned data (I23, generalized from "the sentinel never
+        /// leaks" into "the built value matches the model exactly").
         #[test]
         fn random_sequences_never_violate_i21_i23_or_a_built_hour_changing(
             steps in prop::collection::vec(step_strategy(), 1..80),
@@ -1628,19 +1704,8 @@ mod property {
             // realistically reach.
             env.ledger().set_timestamp(hour_close(hour));
 
-            // A distinctive, impossible-to-reach-by-honest-averaging
-            // sentinel: every OVERTURNED sub-epoch is posted with
-            // this exact peg_ratio (overriding the strategy's own
-            // generated value for that one post), so if it ever
-            // leaked into a Final hour's mean, the mean would equal
-            // it only in the deliberately-contrived case of every
-            // OTHER sub-epoch also happening to average out to
-            // exactly this value from a disjoint set of inputs drawn
-            // from a different range (9_000_000..=10_100_000, which
-            // this sentinel sits far outside of).
-            const OVERTURNED_SENTINEL: i128 = 1;
-
-            let mut overturned_subs = [false; MAX_SUBS_AT_300S as usize];
+            let mut model: [ModelSub; MAX_SUBS_AT_300S as usize] =
+                [ModelSub::NeverPosted; MAX_SUBS_AT_300S as usize];
             // Tracked independently of the contract's own SubDispute
             // storage, from this test's own view of which dispute
             // calls it made succeed: an open dispute must always
@@ -1651,11 +1716,10 @@ mod property {
             // dispute bug this whole mechanism exists to fix):
             // removing that check does not necessarily change the
             // FINAL VALUE a built hour ends up with (so the
-            // never-flips and I23 sentinel checks alone can miss it
-            // under many sequences), but it DOES let the hour build
-            // Final while this test's own bookkeeping still
-            // considers a dispute open, which this check catches
-            // directly.
+            // never-flips and I23 checks alone can miss it under
+            // many sequences), but it DOES let the hour build Final
+            // while this test's own bookkeeping still considers a
+            // dispute open, which this check catches directly.
             let mut open_disputes = [false; MAX_SUBS_AT_300S as usize];
             let mut decided: Option<Decided> = None;
 
@@ -1677,16 +1741,34 @@ mod property {
                         if sub >= per_hour {
                             continue;
                         }
-                        let is_overturned_repost = overturned_subs[sub as usize];
-                        let effective_peg_ratio = if is_overturned_repost {
-                            OVERTURNED_SENTINEL
-                        } else {
-                            peg_ratio
-                        };
-                        let mut s = signal_set(&env, hour, effective_peg_ratio);
+                        let sub_close = sub_start(hour, sub, sub_epoch_secs) + sub_epoch_secs;
+                        let hour_is_final = client.is_final(&asset, &hour);
+                        let predicted =
+                            model[sub as usize].predict_post_accepted(sub_close, now, hour_is_final);
+
+                        let mut s = signal_set(&env, hour, peg_ratio);
                         s.liquidity_2pct = 500_000_000_000;
                         s.supply_change_bps = 0;
-                        let _ = client.try_post_sub_signals(&keeper, &asset, &hour, &sub, &s);
+                        let result = client.try_post_sub_signals(&keeper, &asset, &hour, &sub, &s);
+
+                        prop_assert_eq!(
+                            result.is_ok(),
+                            predicted,
+                            "sub {}: post_sub_signals returned {:?}, model predicted \
+                             accepted = {}, model state = {:?}",
+                            sub,
+                            result,
+                            predicted,
+                            model[sub as usize],
+                        );
+                        if result.is_ok() {
+                            // On a successful repost, this REPLACES
+                            // the model's own prior Overturned entry
+                            // (never keeps tagging it as overturned):
+                            // the final check below must know the
+                            // real, current value, not stale history.
+                            model[sub as usize] = ModelSub::Live { value: peg_ratio };
+                        }
                     }
                     Step::Dispute { sub } => {
                         if sub >= per_hour {
@@ -1717,16 +1799,36 @@ mod property {
                         if result.is_ok() {
                             open_disputes[sub as usize] = false;
                         }
-                        if !keeper_wins && result.is_ok() {
-                            // Disputer won: this sub-epoch is
-                            // overturned. Remember it so a LATER
-                            // repost (the strategy can generate
-                            // another Post for the same sub) is
-                            // tagged with the sentinel too, keeping
-                            // I23's check meaningful across a
-                            // dispute -> overturn -> repost ->
-                            // dispute-again cycle.
-                            overturned_subs[sub as usize] = true;
+                        if result.is_ok() {
+                            if keeper_wins {
+                                // Upheld: stays Live with its own
+                                // already-recorded value (nothing
+                                // else changes it).
+                            } else {
+                                // Overturned: the sub's repost window
+                                // opens now, anchored to whichever is
+                                // later, its own original close or
+                                // this overturn. If this posting was
+                                // ITSELF already a repost (the model's
+                                // own prior state was Overturned with
+                                // reposted: true), the one-repost-
+                                // per-original-overturn rule means no
+                                // further repost either, so the new
+                                // record starts already `reposted:
+                                // true` too, mirroring storage::
+                                // overturn_sub_signals exactly.
+                                let sub_close =
+                                    sub_start(hour, sub, sub_epoch_secs) + sub_epoch_secs;
+                                let already_used_its_repost = matches!(
+                                    model[sub as usize],
+                                    ModelSub::Overturned { reposted: true, .. }
+                                );
+                                model[sub as usize] = ModelSub::Overturned {
+                                    sub_close,
+                                    overturned_at: now,
+                                    reposted: already_used_its_repost,
+                                };
+                            }
                         }
                     }
                     Step::Timeout { sub } => {
@@ -1734,8 +1836,9 @@ mod property {
                             continue;
                         }
                         // The timeout path always favors the data
-                        // (ADR-010): never overturns, so no
-                        // overturned_subs bookkeeping needed here.
+                        // (ADR-010): never overturns, so the model
+                        // never moves to Overturned here; it stays
+                        // Live with whatever value it already had.
                         let tr = client.try_resolve_sub_dispute_timeout(&asset, &hour, &sub);
                         if tr.is_ok() {
                             open_disputes[sub as usize] = false;
@@ -1773,10 +1876,13 @@ mod property {
                     }
                 }
 
-                // I23: a Final hour's peg_ratio must never equal the
-                // overturned sentinel, regardless of how many
-                // sub-epochs were overturned and reposted along the
-                // way.
+                // I23 (generalized): a Final hour's own peg_ratio
+                // must equal the mean of exactly the sub-epochs this
+                // test's own model currently believes are Live, never
+                // a value that leaked stale, overturned data (the
+                // old sentinel check) and never one that is simply
+                // wrong for some other reason (the new, stronger
+                // check this model enables).
                 if client.is_final(&asset, &hour) {
                     // The hour must never read Final while this
                     // test's own bookkeeping still considers ANY
@@ -1793,13 +1899,24 @@ mod property {
                         );
                     }
 
-                    let ring = client.ring(&asset);
-                    if let Some(slot) = ring.iter().find(|s| s.epoch == hour) {
-                        prop_assert_ne!(
-                            slot.peg_ratio,
-                            OVERTURNED_SENTINEL,
-                            "an overturned sub-epoch's sentinel value leaked into the built hour's mean"
-                        );
+                    let live_values: std::vec::Vec<i128> = (0..per_hour)
+                        .filter_map(|sub| match model[sub as usize] {
+                            ModelSub::Live { value } => Some(value),
+                            _ => None,
+                        })
+                        .collect();
+                    if !live_values.is_empty() {
+                        let expected_mean: i128 =
+                            live_values.iter().sum::<i128>() / live_values.len() as i128;
+                        let ring = client.ring(&asset);
+                        if let Some(slot) = ring.iter().find(|s| s.epoch == hour) {
+                            prop_assert_eq!(
+                                slot.peg_ratio,
+                                expected_mean,
+                                "the built hour's own peg_ratio must match the mean of \
+                                 exactly the sub-epochs this model believes are live"
+                            );
+                        }
                     }
                 }
             }
