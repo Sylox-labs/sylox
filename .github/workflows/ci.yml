@@ -148,3 +148,71 @@ jobs:
         run: npm run build -w web/landing
       - name: Build web/app
         run: npm run build -w web/app
+
+  deploy-sylox-app:
+    name: deploy sylox-app to Railway
+    runs-on: ubuntu-latest
+    # Only a real push to main, never a PR (a PR branch's build should
+    # never reach production), and only once every existing check has
+    # passed - a broken contract build or a failing Rust test on main
+    # blocks this exactly like it blocks everything else.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [fmt, clippy, test, build-contracts, web]
+    # One deploy at a time, in order - a second push landing while the
+    # first is still deploying queues behind it instead of racing it
+    # (never cancel-in-progress: a deploy that's already uploading to
+    # Railway shouldn't be cut off mid-flight).
+    concurrency:
+      group: deploy-sylox-app
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # The whole push can be more than one commit; need full history to diff github.event.before..github.sha below, not just the latest commit's own parent.
+      # The workflow's own path filter, not Railway's - see the
+      # service's README (web/app/README.md's "Deployment" section)
+      # for why: Railway's watch-path evaluation has been observed
+      # skipping deploys that genuinely touched a watched path (a
+      # confirmed bug, reported to Railway support) and, separately,
+      # skipping every direct `railway up` upload outright regardless
+      # of content (an upload carries no changed-files list for
+      # Railway's watch-path check to match against, so with any watch
+      # paths set it always skips) - which is why sylox-app's own
+      # Railway watch paths are cleared to empty; this job's filter is
+      # the only one that runs.
+      - name: Check whether anything deploy-relevant changed
+        id: changes
+        run: |
+          before="${{ github.event.before }}"
+          # All-zeros is GitHub's own sentinel for "no prior commit to
+          # diff from" (a new branch, or a force-push that rewrites
+          # history past what GitHub had). An empty value shouldn't
+          # happen on a real push event, but is treated the same way -
+          # always deploy rather than risk silently skipping a real
+          # change because there was nothing safe to diff against.
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            echo "No prior commit to diff from (new branch or force-push) - treating as relevant."
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            changed=$(git diff --name-only "$before" "${{ github.sha }}")
+            echo "Changed files ($before..${{ github.sha }}):"
+            echo "$changed"
+            if echo "$changed" | grep -qE '^(web/app/|web/shared/|deployments/|package\.json$|package-lock\.json$)'; then
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "relevant=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+      - name: Install the Railway CLI
+        if: steps.changes.outputs.relevant == 'true'
+        # Pinned to the exact version this workflow was tested against
+        # locally (see web/app/README.md) - not @latest, so a Railway
+        # CLI release doesn't silently change deploy behavior here.
+        run: npm install -g @railway/cli@5.64.2
+      - name: Deploy sylox-app
+        if: steps.changes.outputs.relevant == 'true'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          echo "Deploying commit ${{ github.sha }} to sylox-app"
+          railway up --service sylox-app --ci
