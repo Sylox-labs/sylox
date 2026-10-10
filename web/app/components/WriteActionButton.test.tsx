@@ -174,7 +174,7 @@ describe("WriteActionButton - connected flow", () => {
     // Switch wallets: disconnect, then reconnect as B - same real UI
     // path a visitor would use to switch accounts, not a direct state
     // injection.
-    await user.click(screen.getByRole("button", { name: "GCWW…KER5" })); // The connected-address button, opening its menu.
+    await user.click(screen.getByRole("button", { name: "GCWW…KER5, wallet options" })); // The connected-address button, opening its menu.
     await user.click(await screen.findByRole("menuitem", { name: /disconnect/i }));
     currentAddress = ADDRESS_B;
     await connectWallet(user, "Connect wallet");

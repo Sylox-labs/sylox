@@ -49,9 +49,25 @@ function ConnectedButton({ address, disconnect }: { address: string; disconnect:
         onClick={() => setIsMenuOpen((open) => !open)}
         aria-haspopup="menu"
         aria-expanded={isMenuOpen}
-        className="rounded-sm border border-cement-grey/40 px-3 py-1.5 font-mono text-xs text-silo-oatmeal transition-colors hover:border-risk-crimson/50"
+        aria-label={`${shortenAddress(address)}, wallet options`}
+        className="flex items-center gap-1.5 rounded-sm border border-cement-grey/40 px-3 py-1.5 font-mono text-xs text-silo-oatmeal transition-colors hover:border-risk-crimson/50"
       >
         {shortenAddress(address)}
+        {/* The only visible signal this button opens a menu (Copy
+            address, Disconnect) - without it the address reads as a
+            static label, not something to click. Rotates on open for
+            the same reason native <select> chevrons do: confirms the
+            click actually did something. */}
+        <svg
+          width="10"
+          height="10"
+          viewBox="0 0 10 10"
+          fill="none"
+          aria-hidden="true"
+          className={`shrink-0 text-cyber-tin transition-transform ${isMenuOpen ? "rotate-180" : ""}`}
+        >
+          <path d="M2 3.5L5 6.5L8 3.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
       </button>
 
       {isMenuOpen && (
