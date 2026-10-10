@@ -283,6 +283,65 @@ fn budget_finality_backward_scan_across_a_full_backfill_window() {
     );
 }
 
+/// The sub-epoch path's own exposure to the SAME `try_advance_
+/// finality` sweep the hourly path's own
+/// `budget_finality_backward_scan_across_a_full_backfill_window`
+/// (above) measures: `post_sub_signals` calls the identical
+/// `try_advance_finality(&env, &config, &asset,
+/// FINALITY_LOOKBACK_EPOCHS)` inline, over the SAME `Ring(asset)`
+/// (the hourly ring, never `Sub(asset)`, since finality is always an
+/// hourly concept), so a 71 epoch missing gap costs the sub-epoch
+/// path exactly as much as it costs the hourly one. No separate
+/// bound is needed (the sweep is already capped at
+/// `FINALITY_LOOKBACK_EPOCHS`, shared by both paths), but this proves
+/// the sub-epoch path's own call site is not secretly worse (e.g. an
+/// extra per-hour cost stacking on top of the shared scan).
+#[test]
+fn budget_post_sub_signals_finality_scan_across_a_full_backfill_window() {
+    let env = Env::default();
+    let (client, asset) = setup(&env);
+    let next_epoch = warm_full_ring(&env, &client, &asset);
+    let keeper = Address::generate(&env);
+
+    env.ledger().set_timestamp((next_epoch + 1) * 3_600);
+    client.post_signals(&keeper, &asset, &signal_set(&env, next_epoch, 9_900_000));
+    // The next 71 hours intentionally never posted at all (neither
+    // path), leaving Ring(asset)'s own gap for the sweep to walk.
+    let gap_start = next_epoch + 1;
+    let resume_hour = gap_start + 71;
+
+    env.ledger().set_timestamp(resume_hour * 3_600 + 300);
+    client.post_sub_signals(
+        &keeper,
+        &asset,
+        &resume_hour,
+        &0u32,
+        &sub_signal_set(&env, resume_hour, 9_900_000),
+    );
+
+    let estimate = env.cost_estimate();
+    print_resources(
+        "post_sub_signals, full ring, try_advance_finality scanning a 71 epoch missing gap",
+        &estimate,
+    );
+
+    assert_eq!(
+        client.score(&asset).epoch,
+        next_epoch - 2,
+        "the measured call's backward scan must walk nearly the full 71 epoch gap, \
+         not stop early; a different result here means this test is not actually \
+         measuring the scenario it claims to"
+    );
+
+    let resources = estimate.resources();
+    assert!(
+        (resources.instructions as u64) < TX_MAX_INSTRUCTIONS / 2,
+        "must stay under 50% of tx_max_instructions ({TX_MAX_INSTRUCTIONS}) even at \
+         this scan's worst case; got {}",
+        resources.instructions
+    );
+}
+
 /// Issue #11 fix (feat/treasury): the worst case for
 /// `reward_posters_for_newly_final_epochs` is a FULL backfill window
 /// (`FINALITY_LOOKBACK_EPOCHS`, 73 at the defaults) becoming Final in
@@ -405,6 +464,162 @@ fn budget_reward_keeper_grouping_across_a_full_backfill_window_several_keepers_m
         (resources.instructions as u64) < TX_MAX_INSTRUCTIONS / 2,
         "must stay under 50% of tx_max_instructions ({TX_MAX_INSTRUCTIONS}) even with \
          every keeper in the window rewarded in one call; got {}",
+        resources.instructions
+    );
+    assert!(
+        (resources.write_bytes as u64) < TX_MAX_WRITE_BYTES / 2,
+        "must stay under 50% of tx_max_write_bytes ({TX_MAX_WRITE_BYTES}); got {}",
+        resources.write_bytes
+    );
+    assert!(
+        (resources.disk_read_entries as u64) < TX_MAX_READ_LEDGER_ENTRIES as u64 / 2,
+        "must stay under 50% of tx_max_disk_read_entries ({TX_MAX_READ_LEDGER_ENTRIES}); got {}",
+        resources.disk_read_entries
+    );
+    assert!(
+        (resources.write_entries as u64) < TX_MAX_WRITE_LEDGER_ENTRIES as u64 / 2,
+        "must stay under 50% of tx_max_write_ledger_entries ({TX_MAX_WRITE_LEDGER_ENTRIES}); got {}",
+        resources.write_entries
+    );
+}
+
+// -- Section 5.9 (v1.5): sub-epoch budgets --
+
+fn sub_signal_set(env: &Env, hour: u64, peg_ratio: i128) -> SignalSet {
+    SignalSet {
+        epoch: hour,
+        posted_at: 0,
+        peg_ratio,
+        peg_ratio_p10: peg_ratio,
+        liquidity_2pct: 500_000_000_000,
+        redemption_net: 10_000_000_000,
+        supply: 10_000_000_000_000,
+        supply_change_bps: 0,
+        issuer_actions: IssuerActions {
+            clawbacks: 1,
+            clawback_amount: 5_000_000_000,
+            auth_revocations: 1,
+            flag_changes: 0,
+        },
+        endpoint: EndpointStatus::Up,
+        inputs_hash: BytesN::from_array(env, &[7u8; 32]),
+        poster: Address::generate(env),
+    }
+}
+
+/// A single sub-epoch post at the 300s default, against a FRESH
+/// `Sub(asset)` ring (the realistic steady state: unlike `Ring(asset)`,
+/// `Sub(asset)` only ever holds at most 5 hours of history, so there
+/// is no separate "cold" vs. "warm" ring size distinction to measure
+/// the way `budget_post_signals_against_a_full_ring` needs one for the
+/// 240 slot hourly ring).
+#[test]
+fn budget_post_sub_signals_at_the_300s_default() {
+    let env = Env::default();
+    let (client, asset) = setup(&env);
+    let keeper = Address::generate(&env);
+    let hour = 0u64;
+
+    env.ledger().set_timestamp(300);
+    client.post_sub_signals(
+        &keeper,
+        &asset,
+        &hour,
+        &0u32,
+        &sub_signal_set(&env, hour, 9_900_000),
+    );
+
+    let estimate = env.cost_estimate();
+    print_resources("post_sub_signals, 300s default, sub 0 of hour 0", &estimate);
+
+    let resources = estimate.resources();
+    assert!(
+        (resources.instructions as u64) < TX_MAX_INSTRUCTIONS / 2,
+        "must stay under 50% of tx_max_instructions ({TX_MAX_INSTRUCTIONS}); got {}",
+        resources.instructions
+    );
+    assert!(
+        resources.write_bytes < 65_536,
+        "a single Sub(asset) entry must fit under contract_data_entry_size_bytes (65,536); got {}",
+        resources.write_bytes
+    );
+}
+
+/// The worst case for `build_hour` at the 300s default: 12 sub-epochs
+/// in the hour, with the LAST one arriving as a genuine backfill (its
+/// own post happening well after its own close, inside
+/// `sub_backfill_secs`), so the measured call must read every one of
+/// the 12 sub-epochs' own `SubSignals` entries (for
+/// `hash_sub_epoch_inputs`), compute the full S4 roll-up, write
+/// `Signals`/`Ring`, and run `reward_sub_epoch_keepers` across however
+/// many distinct posters contributed.
+///
+/// The backfilled post itself cannot be the measured call: a freshly
+/// posted sub-epoch is only Pending, never immediately Final (its OWN
+/// `SIGNAL_DISPUTE_SECS` dispute window has not closed yet), so
+/// `try_build_hour`'s own coverage scan would still find it NotReady
+/// right after posting. The measured call is instead the explicit,
+/// permissionless `build_hour` trigger, made once every sub-epoch
+/// (including the backfilled one) has cleared its own window.
+#[test]
+fn budget_build_hour_worst_case_300s_12_subs_with_a_backfill() {
+    let env = Env::default();
+    let (client, asset) = setup(&env);
+    let keeper = Address::generate(&env);
+    let hour = 0u64;
+
+    // Sub-epochs 0..11 post promptly, each right at its own close.
+    for sub in 0..11u32 {
+        let sub_start = sub as u64 * 300;
+        env.ledger().set_timestamp(sub_start + 300);
+        client.post_sub_signals(
+            &keeper,
+            &asset,
+            &hour,
+            &sub,
+            &sub_signal_set(&env, hour, 9_900_000 + sub as i128 * 1_000),
+        );
+    }
+    // Sub-epoch 11 posts as a genuine backfill: well after its own
+    // close (hour*3,600 + 11*300 + 300 = 3,600), still inside
+    // sub_backfill_secs (7,200s).
+    env.ledger().set_timestamp(10_000);
+    client.post_sub_signals(
+        &keeper,
+        &asset,
+        &hour,
+        &11u32,
+        &sub_signal_set(&env, hour, 9_900_000 + 11_000),
+    );
+
+    // Past every one of the 12 sub-epochs' own pending_until,
+    // including sub 11's (the latest to post, so the latest to
+    // close): now every one reads effectively Final, not just
+    // Pending-but-posted.
+    env.ledger()
+        .set_timestamp(10_000 + crate::SIGNAL_DISPUTE_SECS + 1);
+    client.build_hour(&asset, &hour);
+
+    let estimate = env.cost_estimate();
+    print_resources(
+        "build_hour, full 12 sub-epoch hour at the 300s default, one sub-epoch backfilled",
+        &estimate,
+    );
+
+    assert!(
+        client.is_final(&asset, &hour),
+        "the measured build_hour call must have actually built the hour Final, not left \
+         it pending; a different result here means this test is not measuring the \
+         scenario it claims to"
+    );
+
+    let resources = estimate.resources();
+    assert!(
+        (resources.instructions as u64) < TX_MAX_INSTRUCTIONS / 2,
+        "must stay under 50% of tx_max_instructions ({TX_MAX_INSTRUCTIONS}) even for \
+         build_hour's own worst case (12 SubSignals reads, the full S4 roll-up, and the \
+         reward_sub_epoch_keepers grouping call) running inline with the triggering post; \
+         got {}",
         resources.instructions
     );
     assert!(

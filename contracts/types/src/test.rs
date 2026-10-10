@@ -133,6 +133,35 @@ fn ring_slot_round_trips_in_every_state() {
             clawback_amount: 0,
             auth_revocations: 0,
             endpoint: EndpointStatus::Degraded,
+            provisional_sub_coverage: None,
+        };
+        assert_eq!(roundtrip(&env, &slot), slot);
+    }
+}
+
+/// `provisional_sub_coverage`'s own round trip through the
+/// `#[contracttype]` XDR encoding (the packed on-ring byte encoding,
+/// `coverage_byte`/`byte_coverage` in `risk-oracle/src/storage.rs`,
+/// is covered separately there, since that logic is private to that
+/// crate).
+#[test]
+fn ring_slot_round_trips_every_provisional_sub_coverage_value() {
+    let env = Env::default();
+    let values = (0..=12u32).map(Some).chain(core::iter::once(None));
+    for provisional_sub_coverage in values {
+        let slot = RingSlot {
+            epoch: 7,
+            state: SlotState::Disputed,
+            pending_until: 1_700_007_200,
+            peg_ratio: 9_400_000,
+            liquidity_2pct: 80_000 * SCALE,
+            redemption_net: 0,
+            supply: 1_000_000 * SCALE,
+            supply_change_bps: 0,
+            clawback_amount: 0,
+            auth_revocations: 0,
+            endpoint: EndpointStatus::Degraded,
+            provisional_sub_coverage,
         };
         assert_eq!(roundtrip(&env, &slot), slot);
     }

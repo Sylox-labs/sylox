@@ -27,6 +27,7 @@ function emptySlot(): RingSlot {
     clawback_amount: BigInt(0),
     auth_revocations: 0,
     endpoint: EMPTY_ENDPOINT,
+    provisional_sub_coverage: undefined,
   };
 }
 

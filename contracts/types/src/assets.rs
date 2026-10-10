@@ -66,6 +66,37 @@ pub enum FxRateSource {
     Market,
 }
 
+/// Per asset sub-epoch configuration. technical-doc.md Section 15.1
+/// `SubEpochConfig(asset)`, Section 5.9 S1. `sub_epoch_secs` is the
+/// value currently in effect; `pending_sub_epoch_secs` and
+/// `effective_from_hour` describe a queued change that has not yet
+/// taken effect (both `None` when no change is pending). A change
+/// never applies before `effective_from_hour`, so no sub-epoch
+/// already posted, or postable before that boundary, is ever
+/// reinterpreted under a different length.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubEpochConfig {
+    pub sub_epoch_secs: u64,
+    pub pending_sub_epoch_secs: Option<u64>,
+    pub effective_from_hour: Option<u64>,
+}
+
+/// Identifies one sub-epoch at the posting/dispute API boundary:
+/// `hour`, and `sub`, its position within that hour under whichever
+/// `sub_epoch_secs` governed it. technical-doc.md Section 5.9 S2.
+/// `Sub(asset)`'s own ring stores a different identity internally
+/// (`sub_start`, the sub-epoch's absolute start time, Section 5.9 S3),
+/// since what `sub` means depends on an interval that can later
+/// change; `SubEpoch` is the human-meaningful pair a keeper posts
+/// against, converted internally to `sub_start`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubEpoch {
+    pub hour: u64,
+    pub sub: u32,
+}
+
 /// One epoch's measured signals for one asset. technical-doc.md Section 4.1.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +182,32 @@ pub struct RingSlot {
     pub clawback_amount: i128,
     pub auth_revocations: u32,
     pub endpoint: EndpointStatus,
+    /// Section 5.9 S4/S5 (v1.5): how many of this hour's own
+    /// sub-epochs (0 to 12, never more, `SUB_RING_SLOTS`'s own upper
+    /// bound on `sub_epochs_per_hour`) currently contribute to this
+    /// slot's own fields, when this hour is on the sub-epoch posting
+    /// path. `None` for an hour on the hourly fallback path (whose
+    /// `peg_ratio` etc. are the real, single posted reading, contested
+    /// or not, with no sub-epoch coverage concept) and for an hour
+    /// that has never had a sub-epoch posted at all.
+    ///
+    /// `Some(n)` tells two things apart that `state` alone cannot:
+    /// which posting path produced a `Disputed` slot (only the
+    /// sub-epoch path ever sets this to `Some`; an hour disputed
+    /// through the hourly fallback, whose `peg_ratio` IS the
+    /// contested value itself, stays `None`), and whether a `Disputed`
+    /// sub-epoch-path slot still holds usable data from its OTHER,
+    /// non-disputed sub-epochs (`Some(n > 0)`) or genuinely none at
+    /// all (`Some(0)`, every posted sub-epoch currently disputed) —
+    /// deliberately not read off `peg_ratio` or `pending_until`, since
+    /// both already carry other meanings a reader could misinterpret.
+    ///
+    /// `u32` for `#[contracttype]` compatibility (this SDK's packed
+    /// type support stops at `u32`/`u64`/`i32`/`i64`/`u128`/`i128`, no
+    /// `u8`), but the valid range stays 0 to 12: the packed on-ring
+    /// encoding (`storage.rs`) stores it in a single byte regardless,
+    /// `0xFF` for `None`, and rejects any decoded value above 12.
+    pub provisional_sub_coverage: Option<u32>,
 }
 
 /// A reporter's signed observation of one asset's endpoint for one epoch.

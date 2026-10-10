@@ -105,6 +105,37 @@ impl MockStaking {
         epochs as i128
     }
 
+    /// Section 5.9 S6 (v1.5): the sub-epoch reward path's own mock,
+    /// mirroring `reward_keeper`'s accounting but keyed separately so
+    /// a test can assert the hourly and sub-epoch paths independently.
+    pub fn reward_keeper_sub_epochs(
+        env: Env,
+        keeper: Address,
+        sub_epoch_count: u32,
+        sub_epoch_secs: u64,
+    ) -> i128 {
+        record_call(&env, "reward_keeper_sub_epochs");
+        let total =
+            Self::reward_keeper_sub_epoch_count(env.clone(), keeper.clone()) + sub_epoch_count;
+        env.storage()
+            .temporary()
+            .set(&StakingKey::RewardKeeperSubEpochs(keeper.clone()), &total);
+        // Multiply before dividing (mirrors the fix in the real
+        // Staking contract): a full hour's worth of sub-epochs must
+        // add up to exactly one hourly reward, not lose units to
+        // repeated truncation from dividing once per sub-epoch first.
+        500_000i128 * sub_epoch_secs as i128 * sub_epoch_count as i128 / 3_600
+    }
+
+    /// Total sub-epochs ever credited to `keeper` via
+    /// `reward_keeper_sub_epochs`, across every call so far.
+    pub fn reward_keeper_sub_epoch_count(env: Env, keeper: Address) -> u32 {
+        env.storage()
+            .temporary()
+            .get(&StakingKey::RewardKeeperSubEpochs(keeper))
+            .unwrap_or(0)
+    }
+
     pub fn call_count(env: Env, name: Symbol) -> u32 {
         env.storage()
             .temporary()
@@ -151,6 +182,7 @@ enum StakingKey {
     CallCount(Symbol),
     RewardKeeperEpochs(Address),
     LastRewardKeeperCall(Address),
+    RewardKeeperSubEpochs(Address),
 }
 
 /// Mock `PriceAdapter`: returns whatever was last set with `set_price`

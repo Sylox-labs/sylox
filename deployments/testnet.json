@@ -2,14 +2,14 @@
   "network": "testnet",
   "passphrase": "Test SDF Network ; September 2015",
   "rpc_url": "https://soroban-testnet.stellar.org",
-  "deployed_at": "2026-10-09T15:01:17Z",
-  "git_commit": "a61d5c021f9440157d7f0cd933b6633859725aab",
+  "deployed_at": "2026-10-10T13:53:03Z",
+  "git_commit": "b0984cd0b8d44a39886e2fd5c9519510cbcdaf3f",
   "stellar_cli_version": "28.1.0",
   "contracts": {
-    "risk_oracle": { "id": "CC6NJT4ZCIHZGVWFNV4XSKAQ3NHAUVPJLSXTXMKLRIUL5GZWXAEWE4PX", "wasm_hash": "bb608f05697f3f9c86d05d292d2bbcc26dcd4751976b3c87de9963b92b71546a", "wasm_size": 55650 },
-    "staking": { "id": "CBT5REH3ZVNYY7BW25MJOTSEG7WMJQEW2GYSP6KSD4H3EIA364LVTA6H", "wasm_hash": "05ac9e8e336796d2048e3f9a71959efab48102f36572820eeb66b0386ebfd97d", "wasm_size": 43254 },
-    "treasury": { "id": "CAJDSWEWUZFMAAYWE3C3LE3WXA6CX3G2IJBSAT27DV2VGSPG45JVVHIP", "wasm_hash": "272d8554be96dc62c0af5bfa246ec4dc2a495e26dd263889958f0c1cc34464a6", "wasm_size": 11229 },
-    "event_registry": { "id": "CAFRI2UDYGXUU25B5ITFNZDUMJXZYD7S4ATYBSYCANETT5UN6JRPUP2H", "wasm_hash": "2bd4fa4fd5fa30ba4bdd3e1d5727c7287405ec066624f4ca4e581362e6e31fed", "wasm_size": 43256 }
+    "risk_oracle": { "id": "CD73S5ZPCPPPI2WSSUMGMEETM7YUSLDNQRHQEZNELB3NBHXJWYAGJEXE", "wasm_hash": "842d5408019a952b495128b1732cd0d77b1dbdedda1df01b018677aa00d5c60e", "wasm_size": 85000 },
+    "staking": { "id": "CC5ZSJHCIJYNDCVQFR72WPQLDJQ25FFXRKBJTU3AI6SH3RGDV4X6576G", "wasm_hash": "44da9f224d5247dcb2fc568d6d362cef8740ed580082298bbe154521a77c2110", "wasm_size": 44398 },
+    "treasury": { "id": "CD5AIXC6VYINJG25YTDY4ZNLWVGBGX5JBMXR5QPS7KGNS6JGN5HAXYBP", "wasm_hash": "272d8554be96dc62c0af5bfa246ec4dc2a495e26dd263889958f0c1cc34464a6", "wasm_size": 11229 },
+    "event_registry": { "id": "CA7CQNGU6X7DAJUN747KZHA3YDNO4GBLWVDU45BUBVKLEV7H3CVIP6EF", "wasm_hash": "20a0137653e9c7dd7dcd8eaf660663f18e6b2d412d92bedd2456a66c77a56b3f", "wasm_size": 45110 }
   },
   "tusd": {
     "contract_id": "CAYG7PY2SRNVZDFKF5K65AUJTAD3LNSHGZWYVAZXPHNYYOF4MEMANXRU",

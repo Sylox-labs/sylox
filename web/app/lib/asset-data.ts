@@ -447,6 +447,7 @@ const COVER_GATE_LABEL: Record<CoverGate["tag"], string> = {
   RecentDepeg: "Sales paused: the price was below the threshold in the last depeg window.",
   RecentEndpointOutage: "Sales paused: the issuer's redemption endpoint was recently down or degraded.",
   RecentIssuerAction: "Sales paused: a clawback or authorization revocation happened in the last 7 days.",
+  UnbuiltBacklog: "Sales paused: too many unbuilt hours in the depeg window to scan safely.",
 };
 
 /**

@@ -31,6 +31,25 @@ pub trait RiskOracle {
     /// relative to when this asset actually started posting, not
     /// against the newest epoch's own (always large) absolute number.
     fn first_epoch(env: Env, asset: Address) -> Option<u64>;
+    /// technical-doc.md Section 5.9 S5 (v1.5, footprint-fix revision):
+    /// each requested hour's own sub-epochs' `peg_ratio` (in `sub`
+    /// order, `None` for a sub-epoch not posted or currently Disputed),
+    /// one entry per requested hour, in the same order. Only valid for
+    /// an hour still INSIDE `Sub(asset)`'s own 5-hour span
+    /// (`sylox_types::time::SUB_RING_SLOTS *
+    /// SUB_EPOCH_GRID_SECS`); `depeg_check` itself decides which hours
+    /// qualify before calling this, never this function. ONE
+    /// cross-contract call touching exactly one ledger key
+    /// (`Sub(asset)`) regardless of how many hours or sub-epochs are
+    /// requested, never `HeldHour`: `HeldHour` is a write-path
+    /// (build/dispute) concern only, never read by the gate, so this
+    /// call's own footprint stays constant no matter how many hours
+    /// are unbuilt (R10).
+    fn sub_peg_ratios_in_span_batch(
+        env: Env,
+        asset: Address,
+        hours: Vec<u64>,
+    ) -> Vec<Vec<Option<i128>>>;
 }
 
 /// The slice of `Staking`'s API (Section 12.3) that `EventRegistry`

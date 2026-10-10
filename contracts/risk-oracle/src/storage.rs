@@ -36,8 +36,12 @@ use crate::score::Formula;
 /// Frozen for v1, not a governance parameter: changing it would require
 /// re-encoding every asset's existing `Ring(asset)` entry (see the header
 /// layout version below), which is a migration, not a parameter change.
-/// See the PR's "Spec deviations" section.
-pub const RING_SLOTS: u32 = 240;
+/// See the PR's "Spec deviations" section. Moved to `sylox_types::time`
+/// (Section 5.9 S7) so `event-registry` imports the same constant
+/// instead of keeping its own private copy; re-exported here under its
+/// established local name so every existing call site in this module
+/// is unchanged.
+pub use sylox_types::time::RING_SLOTS;
 
 /// Packed width of one `RingSlot`, in bytes:
 /// epoch (8) + state (1) + pending_until (8) + peg_ratio (16) +
@@ -130,6 +134,78 @@ pub enum DataKey {
     FirstEpoch(Address),
     Assets,
     Formula,
+    /// Section 5.9 S1: this asset's current and pending `sub_epoch_secs`.
+    SubEpochConfig(Address),
+    /// Section 5.9 S2: the full `SignalSet` for one sub-epoch,
+    /// addressed by the `(hour, sub)` pair a keeper posted it under
+    /// (the posting API's own addressing). Mirrors `Signals(asset,
+    /// epoch)`'s own role for the hourly path: `Sub(asset)`'s packed
+    /// ring below carries only the fields needed for cheap aggregate
+    /// reads (the same subset `RingSlot` already carries for the
+    /// hourly ring), never `inputs_hash` or `poster`, which have no
+    /// fixed-width packed encoding; this key is where those live.
+    SubSignals(Address, u64, u32),
+    /// Mirrors `Overturned(Address, u64)`'s own role for the sub-epoch
+    /// path (ADR-005, extended to sub-epochs by the Section 5.9 S5
+    /// footprint-fix review): history for an overturned sub-epoch's
+    /// `SignalSet`, moved here from `SubSignals(asset, hour, sub)` by
+    /// `resolve_sub_signal_dispute`'s rejection branch, so
+    /// `get_sub_signals` no longer finds it and `post_sub_signals` can
+    /// accept a fresh posting for the same `(hour, sub)`, while the
+    /// overturned data stays available for audit.
+    SubOverturned(Address, u64, u32),
+    /// Section 5.9 S2 (v1.5, footprint-fix revision): set the moment
+    /// `post_sub_signals` accepts a REPOST for this `(hour, sub)`
+    /// (never on an ordinary first post). Checked by `overturn_sub_
+    /// signals` if THIS posting is later overturned too: the one
+    /// repost per original overturn rule means that second overturn
+    /// must start its own `SubOverturnedRecord` already `reposted:
+    /// true`, not `false`, so a third posting attempt is refused.
+    /// Removed by `overturn_sub_signals` once consumed, so a FUTURE
+    /// original post (after this sub-epoch's entire two-cycle history
+    /// has played out and the hour has moved on) never misreads a
+    /// stale flag from a previous, unrelated hour reusing this key
+    /// (sub-epoch keys are never reused across different `(hour,
+    /// sub)` pairs in practice, but this still keeps the key's own
+    /// lifetime bounded to the one repost it describes).
+    SubRepostUsed(Address, u64, u32),
+    /// Section 5.9 S3: the packed sub-epoch ring, fixed at
+    /// `SUB_RING_SLOTS` slots, same encoding as `Ring(asset)` but
+    /// keyed by each slot's own `sub_start` identity, not `epoch`.
+    Sub(Address),
+    /// Newest `sub_start` successfully written to `Sub(asset)`, the
+    /// sub-epoch analog of `RingNewest`.
+    SubRingNewest(Address),
+    /// Section 5.9 S3, S4: a disputed sub-epoch's record, copied out
+    /// of `Sub(asset)` the moment it is disputed, addressed by the
+    /// `(hour, sub)` pair a keeper posted it under (the posting API's
+    /// own addressing, Section 5.9 S2), mirroring `Overturned`'s own
+    /// move-out-of-the-ring pattern.
+    SubDispute(Address, u64, u32),
+    /// Section 5.9 S3: `hour`'s own sub-epoch data, copied out of
+    /// `Sub(asset)` once any of its sub-epochs is disputed, so a
+    /// ruling that arrives after the ring has rotated past the hour's
+    /// own slots still has every OTHER sub-epoch's data to roll up
+    /// from, not just the disputed one's. Cleared once the hour
+    /// builds.
+    HeldHour(Address, u64),
+    /// Section 5.9 S2: marks which path (sub-epoch or hourly fallback)
+    /// has already posted for this hour, so the other path's own
+    /// `HourAlreadyPosted` guard has something to check against even
+    /// after `Sub(asset)`'s own 60 slot ring has rotated the hour's
+    /// sub-epochs out.
+    HourPostedVia(Address, u64),
+}
+
+/// Section 5.9 S2: which path posted an hour, for the one-writer-per-hour
+/// rule. Persists past `Sub(asset)`'s own 60 slot rotation window, so
+/// the guard still holds even once an hour's sub-epochs are long gone
+/// from the sub-epoch ring.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HourPostedVia {
+    SubEpoch,
+    HourlyFallback,
 }
 
 #[contracttype]
@@ -421,6 +497,7 @@ pub fn write_ring_slot(
     epoch: u64,
     signals: &SignalSet,
     pending_until: u64,
+    provisional_sub_coverage: Option<u32>,
 ) -> bool {
     let mut packed = get_ring_packed(env, asset);
     let index = position_of(epoch);
@@ -441,6 +518,7 @@ pub fn write_ring_slot(
         clawback_amount: signals.issuer_actions.clawback_amount,
         auth_revocations: signals.issuer_actions.auth_revocations,
         endpoint: signals.endpoint,
+        provisional_sub_coverage,
     };
     // A fresh post always starts unannounced: either this epoch has
     // never been posted before, or it is a repost after an overturn
@@ -606,6 +684,75 @@ pub fn set_slot_disputed(env: &Env, asset: &Address, epoch: u64) {
         .set(&DataKey::Ring(asset.clone()), &packed);
 }
 
+/// Section 5.9 S4 (v1.5): unlike `set_slot_disputed`, writes `Disputed`
+/// unconditionally for `epoch`'s slot, even if it currently holds no
+/// data at all (state `Empty`, the case `set_slot_disputed` treats as
+/// "nothing to transition"). An hour's `Ring(asset)` slot is written
+/// only by `refresh_waiting_hour`/`try_build_hour`, never by
+/// `post_sub_signals` itself, so the FIRST sub-epoch ever disputed in
+/// a brand-new hour can arrive while that hour's own slot has never
+/// been written at all; this function is what lets that first dispute
+/// still mark the hour `Disputed` rather than being silently dropped.
+///
+/// Unlike the old all-zero write this replaces, `signals` carries the
+/// REAL provisional roll-up of this hour's other, non-disputed
+/// sub-epochs (`refresh_waiting_hour`'s own `roll_up_sub_slots` call,
+/// or `empty_hour_signal_set` when every posted sub-epoch happens to
+/// be disputed): a disputed sub-epoch must exclude only itself, never
+/// zero out its whole hour's otherwise-healthy data (the footprint-fix
+/// review's own finding). `provisional_sub_coverage` is the explicit
+/// marker a reader uses instead of inferring from `peg_ratio` or
+/// `pending_until`: `Some(0)` means zero real coverage (every posted
+/// sub-epoch disputed), `Some(n > 0)` means `n` non-disputed
+/// sub-epochs contributed to `signals`. `pending_until` is set to
+/// `HOUR_PENDING_SENTINEL` by the caller (`lib.rs`), never derived
+/// here, matching every other waiting-hour write.
+pub fn force_set_slot_disputed(
+    env: &Env,
+    asset: &Address,
+    epoch: u64,
+    pending_until: u64,
+    signals: &SignalSet,
+    provisional_sub_coverage: Option<u32>,
+) -> bool {
+    let mut packed = get_ring_packed(env, asset);
+    let index = position_of(epoch);
+    let existing = read_slot(&packed, index);
+    // Same ring protection write_ring_slot gives the hourly path: never
+    // overwrite a position that currently holds a strictly newer
+    // epoch (the ring wrapped past it since epoch's own position was
+    // last written).
+    if existing.state != SlotState::Empty && existing.epoch > epoch {
+        return false;
+    }
+    let slot = RingSlot {
+        epoch,
+        state: SlotState::Disputed,
+        pending_until,
+        peg_ratio: signals.peg_ratio,
+        liquidity_2pct: signals.liquidity_2pct,
+        redemption_net: signals.redemption_net,
+        supply: signals.supply,
+        supply_change_bps: signals.supply_change_bps,
+        clawback_amount: signals.issuer_actions.clawback_amount,
+        auth_revocations: signals.issuer_actions.auth_revocations,
+        endpoint: signals.endpoint,
+        provisional_sub_coverage,
+    };
+    write_slot(&mut packed, index, &slot, false);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Ring(asset.clone()), &packed);
+
+    let newest = get_newest_epoch(env, asset);
+    if newest.is_none_or(|n| epoch > n) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::RingNewest(asset.clone()), &epoch);
+    }
+    true
+}
+
 /// `resolve_signal_dispute`'s keeper-wins path (Section 5.4): the slot
 /// becomes definitely `Final`. Review item C6 (re-review): sets
 /// `final_announced` to `true` in the SAME write, since the caller is
@@ -733,6 +880,7 @@ fn empty_slot() -> RingSlot {
         clawback_amount: 0,
         auth_revocations: 0,
         endpoint: EndpointStatus::Unknown,
+        provisional_sub_coverage: None,
     }
 }
 
@@ -751,6 +899,38 @@ fn byte_state(b: u8) -> SlotState {
         2 => SlotState::Disputed,
         3 => SlotState::Final,
         _ => SlotState::Empty,
+    }
+}
+
+/// Packs `RingSlot.provisional_sub_coverage` into byte 107 (one of the
+/// slot's spare padding bytes, alongside byte 106's `final_announced`).
+/// `0xFF` means `None`; every other byte value is the coverage count
+/// itself, so the valid range is 0 to 12 (`sub_epochs_per_hour`'s own
+/// maximum, `SUB_EPOCH_SECS_MIN`'s own 300s giving `3,600 / 300 = 12`).
+/// Panics on a value above 12, the same "decode what was written, or
+/// trap" contract `read_slot`'s own doc comment already states for
+/// this file: nothing in this contract can ever WRITE more than 12
+/// here, so a value above it on read means storage corruption, not a
+/// case to silently coerce.
+fn coverage_byte(coverage: Option<u32>) -> u8 {
+    match coverage {
+        None => 0xFF,
+        Some(n) => {
+            assert!(n <= 12, "provisional_sub_coverage out of range: {n}");
+            n as u8
+        }
+    }
+}
+
+fn byte_coverage(b: u8) -> Option<u32> {
+    if b == 0xFF {
+        None
+    } else {
+        assert!(
+            b <= 12,
+            "stored provisional_sub_coverage byte out of range: {b}"
+        );
+        Some(b as u32)
     }
 }
 
@@ -813,6 +993,7 @@ fn write_slot(packed: &mut Bytes, index: u32, slot: &RingSlot, final_announced: 
     buf[101..105].copy_from_slice(&slot.auth_revocations.to_le_bytes());
     buf[105] = endpoint_byte(slot.endpoint);
     buf[106] = final_announced as u8;
+    buf[107] = coverage_byte(slot.provisional_sub_coverage);
 
     packed.copy_from_slice(base, &buf);
 }
@@ -842,6 +1023,7 @@ fn read_slot(packed: &Bytes, index: u32) -> RingSlot {
         clawback_amount: read_i128(&buf, 85),
         auth_revocations: read_u32(&buf, 101),
         endpoint: byte_endpoint(buf[105]),
+        provisional_sub_coverage: byte_coverage(buf[107]),
     }
 }
 
@@ -968,6 +1150,646 @@ fn read_i128(buf: &[u8; SLOT_BYTES as usize], offset: usize) -> i128 {
     let mut b = [0u8; 16];
     b.copy_from_slice(&buf[offset..offset + 16]);
     i128::from_le_bytes(b)
+}
+
+// -- sub-epochs (technical-doc.md Section 5.9) --
+//
+// `Sub(asset)` is a second packed ring, same encoding as `Ring(asset)`
+// (fixed width fields, no field names, `SLOT_BYTES` per slot plus a
+// `HEADER_BYTES` header), fixed at `SUB_RING_SLOTS` slots. Its own
+// slot identity is `sub_start` (a sub-epoch's absolute start time, a
+// `u64` of seconds), not `(hour, sub)`: what `sub` means depends on
+// which `sub_epoch_secs` governed that hour, so after an interval
+// change `(hour, sub)` alone cannot be read back reliably, while a
+// timestamp is unambiguous regardless of any later interval change
+// (Section 5.9 S3). The ring's own position function is anchored to
+// the fixed `SUB_EPOCH_GRID_SECS` (300 second) grid, never to the
+// asset's current `sub_epoch_secs`, so the ring always spans exactly
+// `SUB_RING_SLOTS * SUB_EPOCH_GRID_SECS` seconds (5 hours) of
+// wall-clock time regardless of interval.
+
+use sylox_types::time::{SUB_EPOCH_GRID_SECS, SUB_RING_SLOTS};
+
+/// One sub-epoch's packed slot. Kept internal to this module (not
+/// part of `sylox_types`, and `ring()`'s own public API gains no
+/// `sub_ring(asset) -> Vec<SubRingSlot>` read per Section 12.1): only
+/// the narrow reads `lib.rs` actually needs are exposed.
+#[derive(Clone)]
+pub struct SubRingSlot {
+    /// This slot's own identity: the sub-epoch's absolute start time
+    /// (`hour * EPOCH_SECS + sub * sub_epoch_secs`), not `(hour, sub)`.
+    pub sub_start: u64,
+    pub state: SlotState,
+    pub pending_until: u64,
+    pub peg_ratio: i128,
+    pub liquidity_2pct: i128,
+    pub redemption_net: i128,
+    pub supply: i128,
+    pub supply_change_bps: i32,
+    pub clawback_amount: i128,
+    pub auth_revocations: u32,
+    pub endpoint: EndpointStatus,
+}
+
+fn empty_sub_slot() -> SubRingSlot {
+    SubRingSlot {
+        sub_start: 0,
+        state: SlotState::Empty,
+        pending_until: 0,
+        peg_ratio: 0,
+        liquidity_2pct: 0,
+        redemption_net: 0,
+        supply: 0,
+        supply_change_bps: 0,
+        clawback_amount: 0,
+        auth_revocations: 0,
+        endpoint: EndpointStatus::Unknown,
+    }
+}
+
+/// `sub_start`'s position in `Sub(asset)`'s fixed ring: anchored to
+/// the `SUB_EPOCH_GRID_SECS` grid, never to `sub_epoch_secs`, so a
+/// `sub_epoch_secs` change never needs to re-encode this ring (Section
+/// 5.9 S3). `pub(crate)` for the same reason `position_of` is: tests
+/// construct same-position pairs directly.
+pub(crate) fn position_of_sub(sub_start: u64) -> u32 {
+    ((sub_start / SUB_EPOCH_GRID_SECS) % SUB_RING_SLOTS as u64) as u32
+}
+
+fn get_sub_ring_packed(env: &Env, asset: &Address) -> Bytes {
+    match env
+        .storage()
+        .persistent()
+        .get::<_, Bytes>(&DataKey::Sub(asset.clone()))
+    {
+        Some(packed) => packed,
+        None => empty_sub_ring_packed(env),
+    }
+}
+
+fn empty_sub_ring_packed(env: &Env) -> Bytes {
+    let mut packed = Bytes::new(env);
+    let zeros = [0u8; SLOT_BYTES as usize];
+    for _ in 0..SUB_RING_SLOTS {
+        packed.extend_from_slice(&zeros);
+    }
+    packed
+}
+
+fn sub_slot_base(index: u32) -> u32 {
+    index * SLOT_BYTES
+}
+
+/// Same byte layout `write_slot` uses for `Ring(asset)`, with
+/// `sub_start` (8 bytes) in place of `epoch` at `[0..8)`; every other
+/// field keeps its existing offset. Byte 106 (`final_announced` in
+/// the hourly ring) is unused here: `Sub(asset)` has no equivalent of
+/// `signals_final`'s own "has this been announced yet" bookkeeping
+/// (`sub_signals_final` fires directly off a state transition,
+/// `lib.rs`, never off a backward scan that needs to avoid
+/// re-announcing).
+fn write_sub_slot(packed: &mut Bytes, index: u32, slot: &SubRingSlot) {
+    let base = sub_slot_base(index);
+    let mut buf = [0u8; SLOT_BYTES as usize];
+    buf[0..8].copy_from_slice(&slot.sub_start.to_le_bytes());
+    buf[8] = state_byte(slot.state);
+    buf[9..17].copy_from_slice(&slot.pending_until.to_le_bytes());
+    buf[17..33].copy_from_slice(&slot.peg_ratio.to_le_bytes());
+    buf[33..49].copy_from_slice(&slot.liquidity_2pct.to_le_bytes());
+    buf[49..65].copy_from_slice(&slot.redemption_net.to_le_bytes());
+    buf[65..81].copy_from_slice(&slot.supply.to_le_bytes());
+    buf[81..85].copy_from_slice(&slot.supply_change_bps.to_le_bytes());
+    buf[85..101].copy_from_slice(&slot.clawback_amount.to_le_bytes());
+    buf[101..105].copy_from_slice(&slot.auth_revocations.to_le_bytes());
+    buf[105] = endpoint_byte(slot.endpoint);
+
+    packed.copy_from_slice(base, &buf);
+}
+
+fn read_sub_slot(packed: &Bytes, index: u32) -> SubRingSlot {
+    let base = sub_slot_base(index);
+    let mut buf = [0u8; SLOT_BYTES as usize];
+    packed
+        .slice(base..base + SLOT_BYTES)
+        .copy_into_slice(&mut buf);
+
+    SubRingSlot {
+        sub_start: read_u64(&buf, 0),
+        state: byte_state(buf[8]),
+        pending_until: read_u64(&buf, 9),
+        peg_ratio: read_i128(&buf, 17),
+        liquidity_2pct: read_i128(&buf, 33),
+        redemption_net: read_i128(&buf, 49),
+        supply: read_i128(&buf, 65),
+        supply_change_bps: read_i32(&buf, 81),
+        clawback_amount: read_i128(&buf, 85),
+        auth_revocations: read_u32(&buf, 101),
+        endpoint: byte_endpoint(buf[105]),
+    }
+}
+
+/// Returns `sub_start`'s slot, verifying the stored identity matches
+/// (the same stored-identity check `get_slot` makes for the hourly
+/// ring): a mismatch means this sub-epoch is missing, never misread
+/// as a different sub-epoch's data occupying the same grid position.
+pub fn get_sub_slot(env: &Env, asset: &Address, sub_start: u64) -> Option<SubRingSlot> {
+    let packed = get_sub_ring_packed(env, asset);
+    let index = position_of_sub(sub_start);
+    let slot = read_sub_slot(&packed, index);
+    if slot.state != SlotState::Empty && slot.sub_start == sub_start {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+/// `get_sub_ring_packed`'s own one-time fetch, exposed for a caller
+/// that needs to read many sub-epochs from the SAME `Sub(asset)` ring
+/// in one call (`sub_peg_ratios_in_span_batch`): fetching and decoding
+/// the whole packed entry once, then decoding every slot from this
+/// one copy via `get_sub_slot_from_packed`, instead of a separate
+/// `get_sub_slot` call (and so a separate storage fetch) per
+/// sub-epoch. The packed entry is small and fixed-size (`Sub(asset)`'s
+/// own 60 slot span, Section 5.9 S3) regardless of how many hours a
+/// caller scans, so reading it once per call, not once per
+/// sub-epoch, is both cheaper and the only read `cost_estimate()`
+/// should ever attribute to this.
+pub fn get_sub_ring_packed_for_batch(env: &Env, asset: &Address) -> Bytes {
+    get_sub_ring_packed(env, asset)
+}
+
+/// Mirrors `get_sub_slot`'s own identity check exactly, against an
+/// ALREADY-FETCHED packed entry (from `get_sub_ring_packed_for_
+/// batch`) instead of fetching it again: decodes `sub_start`'s own
+/// ring position and verifies its stored identity matches, the same
+/// "a mismatch means this sub-epoch is missing, never misread as a
+/// different sub-epoch's data" guarantee `get_sub_slot` gives.
+pub fn get_sub_slot_from_packed(packed: &Bytes, sub_start: u64) -> Option<SubRingSlot> {
+    let index = position_of_sub(sub_start);
+    let slot = read_sub_slot(packed, index);
+    if slot.state != SlotState::Empty && slot.sub_start == sub_start {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): whether `sub_start`'s
+/// own ring position in `Sub(asset)` still belongs to it, i.e. is safe
+/// to write a repost into directly. True if the position is `Empty`
+/// (this sub-epoch's own slot, already cleared by the overturn) OR
+/// still holds `sub_start`'s own identity (not yet overwritten by a
+/// later sub-epoch's rotation). False if the position holds a
+/// DIFFERENT `sub_start` (always a strictly newer one, by `position_
+/// of_sub`'s own wraparound and the ring's existing newer-wins write
+/// guard): the slot has rotated out from under this sub-epoch, and a
+/// repost must go to `HeldHour` instead, never overwrite someone
+/// else's data. A repost's own caller must check this BEFORE writing,
+/// never write first and check after.
+pub fn sub_slot_still_belongs_to(env: &Env, asset: &Address, sub_start: u64, now: u64) -> bool {
+    let packed = get_sub_ring_packed(env, asset);
+    let index = position_of_sub(sub_start);
+    let slot = read_sub_slot(&packed, index);
+    if slot.sub_start == sub_start {
+        return true;
+    }
+    if slot.state != SlotState::Empty {
+        // A DIFFERENT, non-Empty sub_start occupies this position:
+        // always a strictly newer one (position_of_sub's own
+        // wraparound and the ring's existing newer-wins write guard),
+        // so this position never belongs to sub_start any more.
+        return false;
+    }
+    // Empty does not, by itself, mean this position still belongs to
+    // sub_start: the position's own current rotation (whichever
+    // sub_start maps to it right now, via position_of_sub's modular
+    // arithmetic) could belong to a LATER sub-epoch that simply was
+    // never posted, not to sub_start itself. It still belongs to
+    // sub_start only while sub_start's own 5 hour span
+    // (SUB_RING_SLOTS * SUB_EPOCH_GRID_SECS) has not yet elapsed:
+    // past that point, some other, later sub_start now legitimately
+    // owns this position, even though nothing has been written to it
+    // yet. A repost reaching this branch after that point must go to
+    // HeldHour instead (the caller's own job), never write here.
+    let span_secs = SUB_RING_SLOTS as u64 * SUB_EPOCH_GRID_SECS;
+    now < sub_start + span_secs
+}
+
+/// Writes `sub_start`'s slot. Refuses to overwrite a position that
+/// currently holds a strictly newer `sub_start`, the same ring
+/// protection `write_ring_slot` gives the hourly ring. Returns `false`
+/// in that case instead of writing.
+pub fn write_sub_slot_entry(
+    env: &Env,
+    asset: &Address,
+    sub_start: u64,
+    s: &SignalSet,
+    state: SlotState,
+    pending_until: u64,
+) -> bool {
+    let mut packed = get_sub_ring_packed(env, asset);
+    let index = position_of_sub(sub_start);
+    let existing = read_sub_slot(&packed, index);
+    if existing.state != SlotState::Empty && existing.sub_start > sub_start {
+        return false;
+    }
+
+    let slot = SubRingSlot {
+        sub_start,
+        state,
+        pending_until,
+        peg_ratio: s.peg_ratio,
+        liquidity_2pct: s.liquidity_2pct,
+        redemption_net: s.redemption_net,
+        supply: s.supply,
+        supply_change_bps: s.supply_change_bps,
+        clawback_amount: s.issuer_actions.clawback_amount,
+        auth_revocations: s.issuer_actions.auth_revocations,
+        endpoint: s.endpoint,
+    };
+    write_sub_slot(&mut packed, index, &slot);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Sub(asset.clone()), &packed);
+
+    let newest = get_sub_ring_newest(env, asset);
+    if newest.is_none_or(|n| sub_start > n) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubRingNewest(asset.clone()), &sub_start);
+    }
+    true
+}
+
+/// Sets a sub-epoch's state in place (for disputing and resolving),
+/// preserving every other field. A no-op if the slot's stored identity
+/// no longer matches `sub_start` (the ring wrapped past it).
+pub fn set_sub_slot_state(env: &Env, asset: &Address, sub_start: u64, state: SlotState) {
+    let mut packed = get_sub_ring_packed(env, asset);
+    let index = position_of_sub(sub_start);
+    let mut slot = read_sub_slot(&packed, index);
+    if slot.sub_start != sub_start {
+        return;
+    }
+    slot.state = state;
+    write_sub_slot(&mut packed, index, &slot);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Sub(asset.clone()), &packed);
+}
+
+/// Clears a sub-epoch's slot back to Empty (the disputer-wins /
+/// overturned path), mirroring `set_slot_overturned`.
+pub fn clear_sub_slot(env: &Env, asset: &Address, sub_start: u64) {
+    let mut packed = get_sub_ring_packed(env, asset);
+    let index = position_of_sub(sub_start);
+    let slot = read_sub_slot(&packed, index);
+    if slot.sub_start != sub_start {
+        return;
+    }
+    write_sub_slot(&mut packed, index, &empty_sub_slot());
+    env.storage()
+        .persistent()
+        .set(&DataKey::Sub(asset.clone()), &packed);
+}
+
+fn get_sub_ring_newest(env: &Env, asset: &Address) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubRingNewest(asset.clone()))
+}
+
+/// Newest `sub_start` ever written to `Sub(asset)`, for `lib.rs`'s
+/// `live(asset)` read.
+pub fn get_sub_ring_newest_pub(env: &Env, asset: &Address) -> Option<u64> {
+    get_sub_ring_newest(env, asset)
+}
+
+/// Extends `Sub(asset)`'s own TTL. Section 5.9 S3: "extended on every
+/// write, and on every `post_signals` for the asset." A new rule for
+/// this new key, not a retrofit of the existing gap `Ring(asset)`,
+/// `Score(asset)` etc. have today (tracked separately, issue #28);
+/// `Sub(asset)` and `SubDispute` are the only keys this revision adds
+/// TTL extension for.
+pub fn extend_sub_ring_ttl(env: &Env, asset: &Address, threshold: u32, extend_to: u32) {
+    if env.storage().persistent().has(&DataKey::Sub(asset.clone())) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Sub(asset.clone()), threshold, extend_to);
+    }
+}
+
+// -- sub-epoch full SignalSet (Section 5.9 S2) --
+//
+// Mirrors `get_signals`/`set_signals`'s own role for the hourly path:
+// `Sub(asset)`'s packed ring above carries only the aggregate-shaped
+// subset; the full posted `SignalSet` (including `inputs_hash`,
+// `poster`, `peg_ratio_p10`, none of which fit a fixed-width packed
+// field) lives here, addressed by the `(hour, sub)` pair a keeper
+// posted it under.
+
+pub fn get_sub_signals(env: &Env, asset: &Address, hour: u64, sub: u32) -> Option<SignalSet> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubSignals(asset.clone(), hour, sub))
+}
+
+pub fn set_sub_signals(env: &Env, asset: &Address, hour: u64, sub: u32, signals: &SignalSet) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::SubSignals(asset.clone(), hour, sub), signals);
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): one overturned
+/// sub-epoch's own history record, mirroring `Overturned(asset,
+/// epoch)`'s role for the hourly path, extended with the two fields
+/// a sub-epoch's own repost window needs that an hourly epoch's
+/// equivalent (ADR-005) never had to track:
+/// - `overturned_at`: when the ruling landed, so a repost's own
+///   window can be anchored to it (`max(original_close +
+///   sub_backfill_secs, overturned_at + sub_backfill_secs)`), not
+///   just to the sub-epoch's original close, which a slow (up to
+///   `signal_dispute_ruling_secs`, 6 days) ruling could easily land
+///   well past.
+/// - `reposted`: whether this exact overturn has already been
+///   reposted once. A repost's own dispute, if also overturned, is
+///   its OWN new `SubOverturned` record (never this one, mutated),
+///   with THIS record's `reposted` staying `true` forever, so no
+///   second repost of this original overturn is ever accepted: the
+///   longest a hour can wait on one sub-epoch is two dispute cycles
+///   (post, dispute, overturn, repost, dispute again, overturn
+///   again), never more.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubOverturnedRecord {
+    pub signals: SignalSet,
+    pub overturned_at: u64,
+    pub reposted: bool,
+}
+
+/// Mirrors `overturn_signals`'s own move-to-history shape, for one
+/// sub-epoch: moves `SubSignals(asset, hour, sub)` to the
+/// `SubOverturned` history key (tagged with `overturned_at = now`,
+/// `reposted = false`) and removes the live entry, so `get_sub_
+/// signals` reports it missing (unblocking a repost for this exact
+/// `(hour, sub)`, within its own window) while the overturned data
+/// stays retrievable via `get_overturned_sub_signals`. A no-op if
+/// there was no `SubSignals` entry for this sub-epoch (defensive;
+/// `resolve_sub_signal_dispute`'s caller already checked one exists
+/// before calling this).
+pub fn overturn_sub_signals(env: &Env, asset: &Address, hour: u64, sub: u32, now: u64) {
+    let key = DataKey::SubSignals(asset.clone(), hour, sub);
+    if let Some(signals) = env.storage().persistent().get::<_, SignalSet>(&key) {
+        let repost_used_key = DataKey::SubRepostUsed(asset.clone(), hour, sub);
+        // One repost per ORIGINAL overturn: if the posting being
+        // overturned right now was itself already a repost, this new
+        // record starts `reposted: true` from the moment it is
+        // written, so a third posting attempt is refused outright,
+        // never reset to false the way a fresh SubOverturnedRecord
+        // otherwise would be.
+        let already_used_its_repost = env.storage().persistent().has(&repost_used_key);
+        env.storage().persistent().remove(&repost_used_key);
+        env.storage().persistent().set(
+            &DataKey::SubOverturned(asset.clone(), hour, sub),
+            &SubOverturnedRecord {
+                signals,
+                overturned_at: now,
+                reposted: already_used_its_repost,
+            },
+        );
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// The history record an overturned sub-epoch was moved to by
+/// `overturn_sub_signals`. `None` if that sub-epoch was never
+/// overturned (or a repost of it was itself overturned again, which
+/// overwrites this entry with the newer attempt's own record, same
+/// as `get_overturned_signals`'s own convention: only the most
+/// recent overturn stays on record).
+pub fn get_overturned_sub_signals(
+    env: &Env,
+    asset: &Address,
+    hour: u64,
+    sub: u32,
+) -> Option<SubOverturnedRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubOverturned(asset.clone(), hour, sub))
+}
+
+/// Marks the overturn record for `(hour, sub)` as having now been
+/// reposted once, so a second repost of the SAME overturn is refused
+/// (`SubEpochAlreadyReposted`-equivalent, enforced by the caller via
+/// this flag, not a separate error code: a repost is accepted or not
+/// based on whether an overturn record exists and is not yet
+/// reposted, so this flag's own check happens inline in `post_sub_
+/// signals`, not here). A no-op if there is no overturn record for
+/// this sub-epoch at all (defensive; the caller already found one
+/// before calling this).
+pub fn mark_sub_overturn_reposted(env: &Env, asset: &Address, hour: u64, sub: u32) {
+    let key = DataKey::SubOverturned(asset.clone(), hour, sub);
+    if let Some(mut record) = env
+        .storage()
+        .persistent()
+        .get::<_, SubOverturnedRecord>(&key)
+    {
+        record.reposted = true;
+        env.storage().persistent().set(&key, &record);
+    }
+    // Tags the just-accepted repost itself, so IF it is later
+    // overturned too, that overturn's own fresh record starts
+    // already `reposted: true` (see `overturn_sub_signals`): the one
+    // repost per original overturn rule.
+    env.storage()
+        .persistent()
+        .set(&DataKey::SubRepostUsed(asset.clone(), hour, sub), &true);
+}
+
+// -- sub-epoch config (Section 5.9 S1) --
+
+pub fn get_sub_epoch_config(env: &Env, asset: &Address) -> Option<sylox_types::SubEpochConfig> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubEpochConfig(asset.clone()))
+}
+
+pub fn set_sub_epoch_config(env: &Env, asset: &Address, cfg: &sylox_types::SubEpochConfig) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::SubEpochConfig(asset.clone()), cfg);
+}
+
+// -- sub-epoch disputes (Section 5.9 S3, S4) --
+
+pub fn get_sub_dispute(env: &Env, asset: &Address, hour: u64, sub: u32) -> Option<DisputeRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubDispute(asset.clone(), hour, sub))
+}
+
+/// `ttl_ledgers` is the caller's own computed span (mirroring
+/// `Staking::storage`'s own `set_probe`/`set_probes_settled`
+/// convention): long enough to outlive `SIGNAL_DISPUTE_RULING_SECS`,
+/// the worst case a dispute record needs to survive before a ruling
+/// or a timeout clears it.
+pub fn set_sub_dispute(
+    env: &Env,
+    asset: &Address,
+    hour: u64,
+    sub: u32,
+    record: &DisputeRecord,
+    ttl_ledgers: u32,
+) {
+    let key = DataKey::SubDispute(asset.clone(), hour, sub);
+    env.storage().persistent().set(&key, record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
+}
+
+pub fn clear_sub_dispute(env: &Env, asset: &Address, hour: u64, sub: u32) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::SubDispute(asset.clone(), hour, sub));
+}
+
+// -- held hours (Section 5.9 S3, S4): an hour's own sub-epoch data,
+// copied out of Sub(asset) once any of its sub-epochs is disputed --
+
+/// Section 5.9 S3: one sub-epoch's roll-up-relevant fields, held in
+/// `HeldHour(asset, hour)` once the hour has an open dispute. Narrower
+/// than `SubRingSlot` (no `sub_start`: the map's own `sub` key is the
+/// slot's identity here). `state`/`pending_until` ARE still carried,
+/// unlike an earlier draft that stored only already-Final data: a
+/// sub-epoch captured while still `Pending` (its own short dispute
+/// window not yet closed, which is the common case right when a
+/// SIBLING sub-epoch's dispute first triggers the copy-out) needs to
+/// keep becoming effectively Final on its own over time, the same lazy
+/// `now >= pending_until` computation `effective_sub_state` already
+/// gives a ring-read `SubRingSlot`; nothing re-visits this entry to
+/// flip a stored state once the ring itself is no longer the source
+/// of truth for it.
+#[contracttype]
+#[derive(Clone)]
+pub struct HeldSubSlot {
+    pub state: SlotState,
+    pub pending_until: u64,
+    pub peg_ratio: i128,
+    pub liquidity_2pct: i128,
+    pub redemption_net: i128,
+    pub supply: i128,
+    pub clawback_amount: i128,
+    pub auth_revocations: u32,
+}
+
+/// `hour`'s held sub-epoch data, if any dispute has opened for it.
+/// `None` for an hour with no open (or ever opened) dispute: the
+/// ordinary ring-read path (`sub_disposition`) is the source of truth
+/// for every hour that has never needed this.
+pub fn get_held_hour(
+    env: &Env,
+    asset: &Address,
+    hour: u64,
+) -> Option<soroban_sdk::Map<u32, HeldSubSlot>> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::HeldHour(asset.clone(), hour))
+}
+
+/// Copies `sub`'s current Final data into `hour`'s held map, creating
+/// the map if this is the first sub-epoch of `hour` ever held.
+/// Idempotent: calling it again for the same `sub` with the same data
+/// (e.g. a repost after an unrelated dispute in the same hour) simply
+/// overwrites that one entry. `ttl_ledgers` mirrors `set_sub_dispute`'s
+/// own caller-supplied convention.
+pub fn insert_held_sub_slot(
+    env: &Env,
+    asset: &Address,
+    hour: u64,
+    sub: u32,
+    slot: &HeldSubSlot,
+    ttl_ledgers: u32,
+) {
+    let key = DataKey::HeldHour(asset.clone(), hour);
+    let mut map = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(soroban_sdk::Map::new(env));
+    map.set(sub, slot.clone());
+    env.storage().persistent().set(&key, &map);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
+}
+
+/// Sets `sub`'s own held entry's `state` directly: mirrors
+/// `set_sub_slot_state`'s role for the ring, needed because every
+/// reader of a held hour's sub-epoch disposition (`sub_disposition`,
+/// `sub_peg_ratios_for_one_hour`'s own provisional read, the cover
+/// gate via the batched read) now trusts THIS stored `state` alone,
+/// never a separate `SubDispute` lookup, so `Sub(asset)`'s own ring
+/// write is no longer the source of truth for a sub-epoch once it has
+/// been copied out into `HeldHour`. A no-op if `hour` has no held
+/// entry at all (the ordinary case: most disputes resolve long before
+/// the ring ever needs `HeldHour` in the first place, so nothing to
+/// update).
+pub fn set_held_sub_slot_state(env: &Env, asset: &Address, hour: u64, sub: u32, state: SlotState) {
+    let key = DataKey::HeldHour(asset.clone(), hour);
+    if let Some(mut map) = env
+        .storage()
+        .persistent()
+        .get::<_, soroban_sdk::Map<u32, HeldSubSlot>>(&key)
+    {
+        if let Some(mut slot) = map.get(sub) {
+            slot.state = state;
+            map.set(sub, slot);
+            env.storage().persistent().set(&key, &map);
+        }
+    }
+}
+
+/// Removes `sub`'s own entry from `hour`'s held map (the disputer-wins
+/// / overturned path: an overturned sub-epoch must not contribute to
+/// the roll-up, the same exclusion `sub_disposition` already gives a
+/// ring-visible Overturned slot). Leaves the map itself in place (with
+/// `sub` simply absent) even if this was its only entry, so a later
+/// insert for a DIFFERENT sub of the same hour does not need to
+/// recreate it; `clear_held_hour` is the only thing that removes the
+/// map entirely, once the hour is built.
+pub fn remove_held_sub_slot(env: &Env, asset: &Address, hour: u64, sub: u32) {
+    let key = DataKey::HeldHour(asset.clone(), hour);
+    if let Some(mut map) = env
+        .storage()
+        .persistent()
+        .get::<_, soroban_sdk::Map<u32, HeldSubSlot>>(&key)
+    {
+        map.remove(sub);
+        env.storage().persistent().set(&key, &map);
+    }
+}
+
+/// Clears `hour`'s held map entirely, once the hour has built (Final
+/// or Empty) and no held data is needed any more.
+pub fn clear_held_hour(env: &Env, asset: &Address, hour: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::HeldHour(asset.clone(), hour));
+}
+
+// -- one writer per hour (Section 5.9 S2) --
+
+pub fn get_hour_posted_via(env: &Env, asset: &Address, hour: u64) -> Option<HourPostedVia> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::HourPostedVia(asset.clone(), hour))
+}
+
+pub fn set_hour_posted_via(env: &Env, asset: &Address, hour: u64, via: HourPostedVia) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::HourPostedVia(asset.clone(), hour), &via);
 }
 
 /// Test only: flips the stored layout version so the next read is

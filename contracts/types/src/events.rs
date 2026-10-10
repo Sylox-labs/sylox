@@ -131,4 +131,14 @@ pub enum CoverGate {
     RecentEndpointOutage,
     /// A clawback or authorization revocation occurred in the last 7 days.
     RecentIssuerAction,
+    /// Since v1.5 (Section 5.9 S5): more unbuilt hours sit in the
+    /// trailing depeg window than `cover_gate` can safely scan in one
+    /// call (`MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE`). Blocks new
+    /// cover the same way any other gate state does, rather than
+    /// skipping the depeg check outright or risking the call itself
+    /// exceeding the network's own transaction memory limit: a long
+    /// enough build backlog, or enough simultaneous disputes each
+    /// holding their own hour open, reads the same as a depeg would,
+    /// since the feed cannot currently prove it is clear.
+    UnbuiltBacklog,
 }

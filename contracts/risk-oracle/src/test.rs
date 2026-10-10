@@ -2,6 +2,7 @@ extern crate std;
 
 mod golden_vectors;
 mod property;
+mod sub_epochs;
 
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
@@ -608,12 +609,13 @@ fn write_ring_slot_refuses_to_overwrite_a_newer_epoch() {
         let older_epoch = 5u64;
 
         let signals = signal_set(&env, newer_epoch, 9_900_000);
-        let wrote_newer = crate::storage::write_ring_slot(&env, &asset, newer_epoch, &signals, 100);
+        let wrote_newer =
+            crate::storage::write_ring_slot(&env, &asset, newer_epoch, &signals, 100, None);
         assert!(wrote_newer);
 
         let stale_signals = signal_set(&env, older_epoch, 9_000_000);
         let wrote_older =
-            crate::storage::write_ring_slot(&env, &asset, older_epoch, &stale_signals, 100);
+            crate::storage::write_ring_slot(&env, &asset, older_epoch, &stale_signals, 100, None);
         assert!(
             !wrote_older,
             "writing an older epoch over a position that holds a newer one must be refused"
@@ -639,7 +641,7 @@ fn get_ring_packed_rejects_a_header_that_does_not_match() {
     env.as_contract(&contract_id, || {
         // Write a well formed ring first so a Ring(asset) entry exists...
         let signals = signal_set(&env, 0, 9_900_000);
-        crate::storage::write_ring_slot(&env, &asset, 0, &signals, 100);
+        crate::storage::write_ring_slot(&env, &asset, 0, &signals, 100, None);
 
         // ...then corrupt its header directly and confirm the next read
         // refuses to interpret the body under the wrong layout.

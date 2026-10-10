@@ -10,9 +10,11 @@ use crate::storage;
 
 /// Epochs the 24 hour and 7 day aggregates look back, and the slots
 /// `median_liquidity` (Section 11.1) uses. Both read the newest 168 of
-/// the ring's 240 slots (Section 6.5, 5.8).
+/// the ring's 240 slots (Section 6.5, 5.8). Moved to `sylox_types::time`
+/// (Section 5.9 S7); re-exported here under its established local
+/// name so every existing call site in this module is unchanged.
 const AGGREGATE_SLOTS_24H: u32 = 24;
-pub const AGGREGATE_SLOTS_7D: u32 = 168;
+pub use sylox_types::time::AGGREGATE_SLOTS_7D;
 
 /// Epochs in the Depeg window component P's `peg_ratio_p10` is computed
 /// over (the default `depeg_window_secs` = 72h at the default
