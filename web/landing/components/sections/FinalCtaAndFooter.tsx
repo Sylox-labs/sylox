@@ -22,8 +22,8 @@ export function FinalCtaAndFooter() {
             <Image
               src="/brand/sylox-mark.webp"
               alt=""
-              width={56}
-              height={48}
+              width={1315}
+              height={1139}
               className="h-12 w-auto"
             />
             <span className="font-display text-3xl font-black uppercase tracking-tight text-silo-oatmeal">

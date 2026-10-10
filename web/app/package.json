@@ -12,6 +12,7 @@
     "bindings:generate": "node scripts/generate-bindings.mjs"
   },
   "dependencies": {
+    "@creit.tech/stellar-wallets-kit": "^2.7.1",
     "@stellar/stellar-sdk": "^16.0.1",
     "@sylox/ui": "*",
     "next": "16.4.0",
@@ -22,6 +23,7 @@
     "@tailwindcss/turbopack": "^4",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.6.7",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

@@ -10,12 +10,17 @@ import { useActiveSection } from "@/lib/motion/useActiveSection";
 
 function Logo() {
   return (
+    // width/height set the image's own aspect ratio (1315:1139, the
+    // artwork's real proportions - see web/app/lib/.../DashboardShell.tsx
+    // for the matching fix); h-[3em] w-auto sizes by height only and
+    // lets width follow that ratio, so a future swap of the source art
+    // can't silently squash it again the way a fixed w-[4em] box did.
     <Image
       src="/brand/sylox-mark.webp"
       alt="Sylox"
-      width={100}
-      height={44}
-      className="h-[3em] w-[4em]"
+      width={1315}
+      height={1139}
+      className="h-[3em] w-auto"
       priority
     />
   );
