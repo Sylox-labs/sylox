@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7b7770a6b22c1c7a798458e6cff35ffbbae2afff40261456436b055be7c11f23 # shrinks to steps = [Post { sub: Explicit(0), peg_ratio: 9000000 }, Dispute { sub: Explicit(0) }, Rule { sub: Explicit(0), keeper_wins: false }, Post { sub: Explicit(0), peg_ratio: 9515275 }, Dispute { sub: Explicit(0) }, Rule { sub: Explicit(0), keeper_wins: false }, Post { sub: Explicit(0), peg_ratio: 9290519 }]
+cc f4504701f9e44f4dbb780eff416a554801feb69c79dd159099e904b2490570ea # shrinks to steps = [Post { sub: Focus { fallback: 1 }, peg_ratio: 9000000 }, Dispute { sub: Focus { fallback: 1 } }, Rule { sub: Focus { fallback: 1 }, keeper_wins: false }, Post { sub: Focus { fallback: 0 }, peg_ratio: 9000000 }, Dispute { sub: Focus { fallback: 0 } }, Rule { sub: Focus { fallback: 0 }, keeper_wins: false }, Post { sub: Focus { fallback: 1 }, peg_ratio: 9986193 }]
+cc 99694db460857b2e962aae4f048d4167b51e5e1c14cd8280e4b58c7e34b99cff # shrinks to steps = [Post { sub: Focus { fallback: 2 }, peg_ratio: 9000000 }, Dispute { sub: Focus { fallback: 2 } }, Rule { sub: Focus { fallback: 2 }, keeper_wins: false }, AdvanceTime { secs: 7201 }, Post { sub: Focus { fallback: 0 }, peg_ratio: 9187272 }]
