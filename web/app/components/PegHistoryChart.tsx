@@ -114,19 +114,22 @@ export function PegHistoryChart({ points, depegThreshold }: PegHistoryChartProps
     current = segment;
   }
 
-  // The unshaded "not tracked yet" region, drawn as a single rect behind
-  // everything else - a visually distinct "this is before the asset
-  // existed" band, never a line (there is nothing to draw a line through).
-  let untrackedBand: { xStart: number; xEnd: number } | null = null;
+  // The "not tracked yet" region: a subtly shaded rect behind everything
+  // else, with a dashed line marking exactly where tracked history
+  // begins - a visually distinct "this is before the asset existed"
+  // band, never a line (there is nothing to draw a line through).
+  let untrackedBand: { xStart: number; xEnd: number; widthFrac: number } | null = null;
   if (historyStartsLate) {
     const lastUntrackedIndex = points.findIndex((p) => p.tracked) - 1;
     if (lastUntrackedIndex >= 0) {
-      untrackedBand = {
-        xStart: x(points[0].timestamp),
-        xEnd: x(points[lastUntrackedIndex].timestamp),
-      };
+      const xStart = x(points[0].timestamp);
+      const xEnd = x(points[lastUntrackedIndex].timestamp);
+      untrackedBand = { xStart, xEnd, widthFrac: (xEnd - xStart) / (WIDTH - PAD_X * 2) };
     }
   }
+  // "Not tracked yet" only fits legibly once the region is wide enough -
+  // below that, the dashed boundary line alone still marks it clearly.
+  const showUntrackedLabel = untrackedBand !== null && untrackedBand.widthFrac >= 0.15;
 
   const thresholdY = depegThreshold !== null ? y(depegThreshold) : null;
 
@@ -139,14 +142,38 @@ export function PegHistoryChart({ points, depegThreshold }: PegHistoryChartProps
         aria-label={`Peg value over the stored history, ${confirmedCount} confirmed, ${pendingCount} pending, ${missingCount} missing of ${trackedPoints.length} tracked hours`}
       >
         {untrackedBand !== null && (
-          <rect
-            x={untrackedBand.xStart}
-            y={0}
-            width={Math.max(0, untrackedBand.xEnd - untrackedBand.xStart)}
-            height={HEIGHT}
-            fill="var(--color-cement-grey)"
-            fillOpacity={0.08}
-          />
+          <>
+            <rect
+              x={untrackedBand.xStart}
+              y={0}
+              width={Math.max(0, untrackedBand.xEnd - untrackedBand.xStart)}
+              height={HEIGHT}
+              fill="var(--color-cement-grey)"
+              fillOpacity={0.13}
+            />
+            <line
+              x1={untrackedBand.xEnd}
+              x2={untrackedBand.xEnd}
+              y1={0}
+              y2={HEIGHT}
+              stroke="var(--color-cement-grey)"
+              strokeWidth={1}
+              strokeDasharray="3 3"
+            />
+            {showUntrackedLabel && (
+              <text
+                x={(untrackedBand.xStart + untrackedBand.xEnd) / 2}
+                y={HEIGHT / 2}
+                fill="var(--color-cyber-tin)"
+                fontFamily="var(--font-mono)"
+                fontSize={10}
+                textAnchor="middle"
+                dominantBaseline="middle"
+              >
+                Not tracked yet
+              </text>
+            )}
+          </>
         )}
         {thresholdY !== null && (
           <line

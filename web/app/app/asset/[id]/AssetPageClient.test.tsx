@@ -109,6 +109,10 @@ describe("AssetPageClient", () => {
     expect(screen.getByText(/not enough confirmed history yet/i)).toBeInTheDocument();
     // Never a leftover "Normal" (or any other) band badge alongside it.
     expect(screen.queryByText("Normal")).not.toBeInTheDocument();
+    // Never a redundant dash + "score" row underneath - the badge and
+    // explanation above already say there's no score.
+    expect(screen.queryByText("score")).not.toBeInTheDocument();
+    expect(screen.queryByText("—")).not.toBeInTheDocument();
   });
 
   it("falls back to a shortened address when there is no home domain", async () => {

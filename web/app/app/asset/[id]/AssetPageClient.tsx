@@ -115,12 +115,14 @@ function HeaderSection({ data }: { data: AssetPageData }) {
       )}
 
       <div className="mt-4 flex flex-wrap items-center gap-4">
-        <div className="flex items-baseline gap-2">
-          <span className="font-mono text-2xl font-bold text-silo-oatmeal" data-numeric>
-            {header.score === null ? "—" : String(header.score).padStart(2, "0")}
-          </span>
-          <span className="font-mono text-xs uppercase tracking-wide text-cyber-tin">score</span>
-        </div>
+        {header.score !== null && (
+          <div className="flex items-baseline gap-2">
+            <span className="font-mono text-2xl font-bold text-silo-oatmeal" data-numeric>
+              {String(header.score).padStart(2, "0")}
+            </span>
+            <span className="font-mono text-xs uppercase tracking-wide text-cyber-tin">score</span>
+          </div>
+        )}
         {header.stale && (
           <span className="rounded-full border border-cement-grey/40 px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-cyber-tin">
             Stale
