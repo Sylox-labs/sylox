@@ -186,7 +186,7 @@ export function DashboardShell({ title, children }: { title: string; children: R
 
   return (
     <div className="flex min-h-screen">
-      <aside className="hidden w-60 shrink-0 border-r border-cement-grey/20 md:block">
+      <aside className="sticky top-0 hidden h-screen w-60 shrink-0 overflow-y-auto border-r border-cement-grey/20 md:block">
         <SidebarContent pathname={pathname} />
       </aside>
 
