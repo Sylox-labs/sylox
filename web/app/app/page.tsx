@@ -8,6 +8,7 @@ import {
   type ExplorerAssetError,
 } from "@/lib/explorer-data";
 import { TestnetBanner } from "@/components/TestnetBanner";
+import { DashboardShell } from "@/components/DashboardShell";
 
 type LoadState =
   | { status: "loading" }
@@ -37,55 +38,57 @@ export default function ExplorerPage() {
   }, []);
 
   return (
-    <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-16 md:px-16 md:py-24">
-      <TestnetBanner />
+    <DashboardShell title="Explorer">
+      <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-16 md:px-16 md:py-24">
+        <TestnetBanner />
 
-      <Eyebrow className="mt-8">+ EXPLORER</Eyebrow>
-      <h1 className="mt-4 font-display text-4xl leading-[0.95] tracking-tight text-silo-oatmeal md:text-5xl">
-        Every tracked asset, one glance.
-      </h1>
-      <p className="mt-4 max-w-xl text-base leading-relaxed text-cyber-tin md:text-lg">
-        Risk band, latest peg value, and event status, read straight from the
-        oracle on every load.
-      </p>
+        <Eyebrow className="mt-8">+ EXPLORER</Eyebrow>
+        <h1 className="mt-4 font-display text-4xl leading-[0.95] tracking-tight text-silo-oatmeal md:text-5xl">
+          Every tracked asset, one glance.
+        </h1>
+        <p className="mt-4 max-w-xl text-base leading-relaxed text-cyber-tin md:text-lg">
+          Risk band, latest peg value, and event status, read straight from the
+          oracle on every load.
+        </p>
 
-      <div className="mt-12">
-        {state.status === "loading" && (
-          <p className="font-mono text-sm text-cyber-tin" role="status">
-            Loading assets from the oracle…
-          </p>
-        )}
-
-        {/* A failure here means the asset LIST itself couldn't be read
-            (RiskOracle.assets() failed) - a page-wide problem, unlike a
-            single asset's row failing below, which only takes down that
-            one card. */}
-        {state.status === "error" && (
-          <p className="font-mono text-sm text-risk-crimson" role="alert">
-            Could not load assets: {state.message}
-          </p>
-        )}
-
-        {state.status === "ready" &&
-          state.rows.length === 0 &&
-          state.errors.length === 0 && (
-            <p className="font-mono text-sm text-cyber-tin">
-              No assets are tracked yet.
+        <div className="mt-12">
+          {state.status === "loading" && (
+            <p className="font-mono text-sm text-cyber-tin" role="status">
+              Loading assets from the oracle…
             </p>
           )}
 
-        {state.status === "ready" && (state.rows.length > 0 || state.errors.length > 0) && (
-          <div className="grid gap-4 md:grid-cols-2">
-            {state.rows.map((row) => (
-              <AssetCard key={row.asset} row={row} />
-            ))}
-            {state.errors.map((error) => (
-              <AssetErrorCard key={error.asset} error={error} />
-            ))}
-          </div>
-        )}
-      </div>
-    </main>
+          {/* A failure here means the asset LIST itself couldn't be read
+              (RiskOracle.assets() failed) - a page-wide problem, unlike a
+              single asset's row failing below, which only takes down that
+              one card. */}
+          {state.status === "error" && (
+            <p className="font-mono text-sm text-risk-crimson" role="alert">
+              Could not load assets: {state.message}
+            </p>
+          )}
+
+          {state.status === "ready" &&
+            state.rows.length === 0 &&
+            state.errors.length === 0 && (
+              <p className="font-mono text-sm text-cyber-tin">
+                No assets are tracked yet.
+              </p>
+            )}
+
+          {state.status === "ready" && (state.rows.length > 0 || state.errors.length > 0) && (
+            <div className="grid gap-4 md:grid-cols-2">
+              {state.rows.map((row) => (
+                <AssetCard key={row.asset} row={row} />
+              ))}
+              {state.errors.map((error) => (
+                <AssetErrorCard key={error.asset} error={error} />
+              ))}
+            </div>
+          )}
+        </div>
+      </main>
+    </DashboardShell>
   );
 }
 

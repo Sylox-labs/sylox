@@ -5,7 +5,8 @@ import { Eyebrow, Card } from "@sylox/ui/components";
 import { TestnetBanner } from "@/components/TestnetBanner";
 import { Countdown } from "@/components/Countdown";
 import { WriteActionButton } from "@/components/WriteActionButton";
-import { WalletButton } from "@/components/WalletButton";
+import { DashboardShell } from "@/components/DashboardShell";
+import { Breadcrumb } from "@/components/Breadcrumb";
 import { fetchEventPageData, type EventPageData } from "@/lib/event-data";
 import { prepareCheckpointCure, confirmCheckpointCure, prepareFinalize, confirmFinalize } from "@/lib/event-actions";
 
@@ -61,27 +62,41 @@ export function EventPageClient({ eventId }: { eventId: string }) {
     };
   }, [eventId]);
 
+  const assetAddress = state.status === "ready" && state.data.proposal.status === "ok"
+    ? state.data.proposal.value.record.asset
+    : null;
+
   return (
-    <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-16 md:px-16 md:py-24">
-      <div className="flex items-center justify-between gap-4">
+    <DashboardShell title="Event">
+      <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-16 md:px-16 md:py-24">
         <TestnetBanner />
-        <WalletButton />
-      </div>
 
-      {state.status === "loading" && (
-        <p className="mt-8 font-mono text-sm text-cyber-tin" role="status">
-          Loading event from the registry…
-        </p>
-      )}
+        <div className="mt-6">
+          <Breadcrumb
+            items={[
+              { label: "Explorer", href: "/" },
+              { label: "Events", href: "/events" },
+              ...(assetAddress ? [{ label: "Asset", href: `/asset/${assetAddress}` }] : []),
+              { label: `Event #${eventId}` },
+            ]}
+          />
+        </div>
 
-      {state.status === "error" && (
-        <p className="mt-8 font-mono text-sm text-risk-crimson" role="alert">
-          Could not load this event: {state.message}
-        </p>
-      )}
+        {state.status === "loading" && (
+          <p className="mt-8 font-mono text-sm text-cyber-tin" role="status">
+            Loading event from the registry…
+          </p>
+        )}
 
-      {state.status === "ready" && <EventSections eventId={eventId} data={state.data} />}
-    </main>
+        {state.status === "error" && (
+          <p className="mt-8 font-mono text-sm text-risk-crimson" role="alert">
+            Could not load this event: {state.message}
+          </p>
+        )}
+
+        {state.status === "ready" && <EventSections eventId={eventId} data={state.data} />}
+      </main>
+    </DashboardShell>
   );
 }
 

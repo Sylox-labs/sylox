@@ -1,8 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { AssetPageClient } from "./AssetPageClient";
+import { WalletProvider } from "@/lib/wallet/WalletContext";
 import { RISK_BANDS } from "@sylox/ui/risk-bands";
 import type { AssetPageData, AssetHeader, PegHistoryPoint } from "@/lib/asset-data";
+
+function renderAssetPage(asset: string) {
+  return render(
+    <WalletProvider>
+      <AssetPageClient asset={asset} />
+    </WalletProvider>,
+  );
+}
 
 const { fetchAssetPageData } = vi.hoisted(() => ({
   fetchAssetPageData: vi.fn(),
@@ -40,7 +49,7 @@ function okData(overrides: Partial<AssetPageData> = {}): AssetPageData {
     pegHistory: { status: "ok", value: [] },
     failureDefinitions: { status: "ok", value: [] },
     coverGate: { status: "ok", value: { gate: "Clear", label: "Cover can be sold." } },
-    activeEventCount: { status: "ok", value: 0 },
+    activeEventCount: { status: "ok", value: { count: 0, eventIds: [] } },
     ...overrides,
   };
 }
@@ -48,25 +57,25 @@ function okData(overrides: Partial<AssetPageData> = {}): AssetPageData {
 describe("AssetPageClient", () => {
   it("always shows the testnet banner", async () => {
     fetchAssetPageData.mockResolvedValue(okData());
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(screen.getByText(/testnet\. prices are sample data/i)).toBeInTheDocument();
   });
 
   it("shows a loading state before data arrives", () => {
     fetchAssetPageData.mockReturnValue(new Promise(() => {}));
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(screen.getByText(/loading asset from the oracle/i)).toBeInTheDocument();
   });
 
   it("shows a page-wide error when the fetch itself rejects", async () => {
     fetchAssetPageData.mockRejectedValue(new Error("RPC unreachable"));
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(await screen.findByRole("alert")).toHaveTextContent("RPC unreachable");
   });
 
   it("renders the header with code, domain, band, and score", async () => {
     fetchAssetPageData.mockResolvedValue(okData());
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     expect(await screen.findByText("USDC")).toBeInTheDocument();
     expect(screen.getByText("centre.io")).toBeInTheDocument();
@@ -84,7 +93,7 @@ describe("AssetPageClient", () => {
         },
       }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     expect(await screen.findByText("Stale")).toBeInTheDocument();
     expect(screen.getByText("Event in progress")).toBeInTheDocument();
@@ -93,7 +102,7 @@ describe("AssetPageClient", () => {
 
   it("shows the asset code as the big title, with domain and address small underneath", async () => {
     fetchAssetPageData.mockResolvedValue(okData());
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     const heading = await screen.findByRole("heading", { level: 1 });
     expect(heading).toHaveTextContent("USDC");
@@ -103,7 +112,7 @@ describe("AssetPageClient", () => {
     fetchAssetPageData.mockResolvedValue(
       okData({ header: { status: "ok", value: { ...baseHeader, band: null, score: null } } }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     expect(await screen.findByText("Not scored yet")).toBeInTheDocument();
     expect(screen.getByText(/not enough confirmed history yet/i)).toBeInTheDocument();
@@ -119,21 +128,26 @@ describe("AssetPageClient", () => {
     fetchAssetPageData.mockResolvedValue(
       okData({ header: { status: "ok", value: { ...baseHeader, homeDomain: null } } }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
-    expect(await screen.findAllByText(/CBIE…DAMA/)).toHaveLength(2); // h1 fallback + address subtitle
+    // The <h1> always shows the asset code; the shortened address
+    // fallback appears three times once there's no home domain: the
+    // domain line, the address subtitle just below it, and the
+    // breadcrumb's own separate instance of the same shortened form.
+    await screen.findByText("USDC");
+    expect(screen.getAllByText("CBIE…DAMA")).toHaveLength(3);
   });
 
   it("titles the Confirmed/Live section 'Peg price'", async () => {
     fetchAssetPageData.mockResolvedValue(okData());
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(await screen.findByText("+ PEG PRICE")).toBeInTheDocument();
     expect(screen.queryByText("+ SCORE")).not.toBeInTheDocument();
   });
 
   it("shows the confirmed peg value", async () => {
     fetchAssetPageData.mockResolvedValue(okData());
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(await screen.findByText("0.9998")).toBeInTheDocument();
   });
 
@@ -141,7 +155,7 @@ describe("AssetPageClient", () => {
     fetchAssetPageData.mockResolvedValue(
       okData({ confirmed: { status: "ok", value: { confirmed: null, latestPending: null } } }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(await screen.findByText(/no confirmed value yet/i)).toBeInTheDocument();
   });
 
@@ -161,7 +175,7 @@ describe("AssetPageClient", () => {
         },
       }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     expect(await screen.findByText(/latest hour: 0\.9910 peg/i)).toBeInTheDocument();
     expect(screen.getByText(/can still be challenged until 14:30 utc/i)).toBeInTheDocument();
@@ -169,7 +183,7 @@ describe("AssetPageClient", () => {
 
   it("shows 'Live updates coming soon' rather than any mock live number", async () => {
     fetchAssetPageData.mockResolvedValue(okData());
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(await screen.findByText(/live updates coming soon/i)).toBeInTheDocument();
   });
 
@@ -187,7 +201,7 @@ describe("AssetPageClient", () => {
         },
       }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(
       await screen.findByText(/depeg: below 0\.95 of peg for 72 hours/i),
     ).toBeInTheDocument();
@@ -202,7 +216,7 @@ describe("AssetPageClient", () => {
         },
       }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(await screen.findByText(/sales paused: the price was below/i)).toBeInTheDocument();
   });
 
@@ -215,7 +229,7 @@ describe("AssetPageClient", () => {
         },
       }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(await screen.findByText(/sales paused: not enough price history yet/i)).toBeInTheDocument();
   });
 
@@ -228,19 +242,26 @@ describe("AssetPageClient", () => {
         },
       }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     expect(await screen.findByText(/sales paused: the asset is in distress/i)).toBeInTheDocument();
   });
 
-  it("shows an active-event card when active_event_count > 0", async () => {
-    fetchAssetPageData.mockResolvedValue(okData({ activeEventCount: { status: "ok", value: 2 } }));
-    render(<AssetPageClient asset={baseHeader.asset} />);
+  it("shows an active-event card when active_event_count > 0, linking to each event", async () => {
+    fetchAssetPageData.mockResolvedValue(
+      okData({
+        activeEventCount: { status: "ok", value: { count: 2, eventIds: [BigInt(7), BigInt(9)] } },
+      }),
+    );
+    renderAssetPage(baseHeader.asset);
     expect(await screen.findByText(/2 active events for this asset/i)).toBeInTheDocument();
+
+    const links = screen.getAllByRole("link", { name: /view event/i });
+    expect(links.map((l) => l.getAttribute("href"))).toEqual(["/event/7", "/event/9"]);
   });
 
   it("shows no active-event card when the count is zero", async () => {
     fetchAssetPageData.mockResolvedValue(okData());
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
     await screen.findByText("USDC");
     expect(screen.queryByText(/active event/i)).not.toBeInTheDocument();
   });
@@ -249,7 +270,7 @@ describe("AssetPageClient", () => {
     fetchAssetPageData.mockResolvedValue(
       okData({ coverGate: { status: "error", message: "cover_gate unreachable" } }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     // The failing section shows its own error...
     expect(await screen.findByText(/cover_gate unreachable/i)).toBeInTheDocument();
@@ -266,7 +287,7 @@ describe("AssetPageClient", () => {
       { timestamp: 10800, epoch: BigInt(3), state: "Final", pegRatio: 0.999, tracked: true },
     ];
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     const svg = await screen.findByRole("img", {
       name: /2 confirmed, 1 pending, 1 missing of 4 tracked hours/i,
@@ -292,7 +313,7 @@ describe("AssetPageClient", () => {
       { timestamp: 10800, epoch: BigInt(3), state: "Empty", pegRatio: null, tracked: true },
     ];
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     expect(await screen.findByText(/history starts when the asset was added/i)).toBeInTheDocument();
     // Legend counts only the 2 tracked hours (1 confirmed, 1 missing) -
@@ -309,7 +330,7 @@ describe("AssetPageClient", () => {
       { timestamp: 3600, epoch: BigInt(1), state: "Empty", pegRatio: null, tracked: true },
     ];
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     await screen.findByRole("img", { name: /1 confirmed, 0 pending, 1 missing of 2 tracked hours/i });
     expect(screen.queryByText(/history starts when the asset was added/i)).not.toBeInTheDocument();
@@ -321,7 +342,7 @@ describe("AssetPageClient", () => {
       { timestamp: Date.UTC(2026, 9, 9) / 1000, epoch: BigInt(1), state: "Final", pegRatio: 1.0, tracked: true },
     ];
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     expect(await screen.findByText(/sep 29/i)).toBeInTheDocument();
     expect(screen.getByText(/oct 9/i)).toBeInTheDocument();
@@ -331,7 +352,7 @@ describe("AssetPageClient", () => {
     fetchAssetPageData.mockResolvedValue(
       okData({ pegHistory: { status: "error", message: "ring() unreachable" } }),
     );
-    render(<AssetPageClient asset={baseHeader.asset} />);
+    renderAssetPage(baseHeader.asset);
 
     expect(await screen.findByText(/ring\(\) unreachable/i)).toBeInTheDocument();
     expect(screen.getByText("USDC")).toBeInTheDocument();

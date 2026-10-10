@@ -1,9 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { Eyebrow, Card } from "@sylox/ui/components";
 import { TestnetBanner } from "@/components/TestnetBanner";
 import { PegHistoryChart } from "@/components/PegHistoryChart";
+import { DashboardShell } from "@/components/DashboardShell";
+import { Breadcrumb } from "@/components/Breadcrumb";
 import { fetchAssetPageData, type AssetPageData } from "@/lib/asset-data";
 
 type LoadState =
@@ -34,23 +37,34 @@ export function AssetPageClient({ asset }: { asset: string }) {
   }, [asset]);
 
   return (
-    <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-16 md:px-16 md:py-24">
-      <TestnetBanner />
+    <DashboardShell title="Asset">
+      <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-16 md:px-16 md:py-24">
+        <TestnetBanner />
 
-      {state.status === "loading" && (
-        <p className="mt-8 font-mono text-sm text-cyber-tin" role="status">
-          Loading asset from the oracle…
-        </p>
-      )}
+        <div className="mt-6">
+          <Breadcrumb
+            items={[
+              { label: "Explorer", href: "/" },
+              { label: `${asset.slice(0, 4)}…${asset.slice(-4)}` },
+            ]}
+          />
+        </div>
 
-      {state.status === "error" && (
-        <p className="mt-8 font-mono text-sm text-risk-crimson" role="alert">
-          Could not load this asset: {state.message}
-        </p>
-      )}
+        {state.status === "loading" && (
+          <p className="mt-8 font-mono text-sm text-cyber-tin" role="status">
+            Loading asset from the oracle…
+          </p>
+        )}
 
-      {state.status === "ready" && <AssetSections data={state.data} />}
-    </main>
+        {state.status === "error" && (
+          <p className="mt-8 font-mono text-sm text-risk-crimson" role="alert">
+            Could not load this asset: {state.message}
+          </p>
+        )}
+
+        {state.status === "ready" && <AssetSections data={state.data} />}
+      </main>
+    </DashboardShell>
   );
 }
 
@@ -307,19 +321,28 @@ function ActiveEventSection({ data }: { data: AssetPageData }) {
     );
   }
 
-  if (data.activeEventCount.value === 0) return null;
+  const { count, eventIds } = data.activeEventCount.value;
+  if (count === 0) return null;
 
   return (
     <div>
       <Eyebrow>+ ACTIVE EVENT</Eyebrow>
       <Card className="mt-4">
         <p className="font-mono text-sm text-risk-crimson-tint">
-          {data.activeEventCount.value} active event
-          {data.activeEventCount.value > 1 ? "s" : ""} for this asset.
+          {count} active event{count > 1 ? "s" : ""} for this asset.
         </p>
-        <p className="mt-1 text-xs text-cyber-tin">
-          The Event screen isn&apos;t built yet - it&apos;ll link here once it is.
-        </p>
+        <ul className="mt-2 flex flex-col gap-1">
+          {eventIds.map((id) => (
+            <li key={id.toString()}>
+              <Link
+                href={`/event/${id}`}
+                className="font-mono text-xs text-silo-oatmeal underline transition-colors hover:text-risk-crimson-tint"
+              >
+                View event #{id.toString()}
+              </Link>
+            </li>
+          ))}
+        </ul>
       </Card>
     </div>
   );
