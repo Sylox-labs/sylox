@@ -197,7 +197,7 @@ export function Header() {
             <ButtonLink
               href={nav.launchApp.href}
               variant="primary"
-              className="hidden items-center gap-2 !px-4 !py-2 text-xs md:inline-flex"
+              className="hidden items-center gap-2 !px-4 !py-2 text-xs font-bold md:inline-flex"
             >
               {nav.launchApp.label}
               <span className="rounded-full bg-slate-black px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-silo-oatmeal">
@@ -218,7 +218,7 @@ export function Header() {
                 href={nav.launchApp.href}
                 variant="primary"
                 data-compact-launch-app
-                className="!px-3 !py-1.5 text-xs md:hidden"
+                className="!px-3 !py-1.5 text-xs font-bold md:hidden"
               >
                 {nav.launchApp.label}
               </ButtonLink>
@@ -268,7 +268,7 @@ export function Header() {
           variant="primary"
           data-menu-item
           tabIndex={isMenuOpen ? 0 : -1}
-          className="inline-flex w-fit items-center gap-2"
+          className="inline-flex w-fit items-center gap-2 font-bold"
           onClick={() => setIsMenuOpen(false)}
         >
           {nav.launchApp.label}
