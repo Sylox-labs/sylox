@@ -83,24 +83,36 @@ function HeaderSection({ data }: { data: AssetPageData }) {
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <Eyebrow>{header.code}</Eyebrow>
-          <h1 className="mt-2 font-display text-3xl leading-[0.95] tracking-tight text-silo-oatmeal md:text-4xl">
-            {header.homeDomain ?? `${header.asset.slice(0, 4)}…${header.asset.slice(-4)}`}
+          <h1 className="font-display text-3xl leading-[0.95] tracking-tight text-silo-oatmeal md:text-4xl">
+            {header.code}
           </h1>
+          <p className="mt-2 font-mono text-xs text-cyber-tin/70">
+            {header.homeDomain ?? `${header.asset.slice(0, 4)}…${header.asset.slice(-4)}`}
+          </p>
           <p className="mt-1 font-mono text-[10px] text-cyber-tin/70" title={header.asset}>
             {header.asset.slice(0, 4)}…{header.asset.slice(-4)}
           </p>
         </div>
-        <span
-          className="shrink-0 rounded-full px-3 py-1 font-mono text-sm uppercase tracking-wide"
-          style={{
-            color: header.band.colorHex,
-            backgroundColor: `color-mix(in srgb, ${header.band.colorHex} 16%, transparent)`,
-          }}
-        >
-          {header.band.label}
-        </span>
+        {header.band === null ? (
+          <span className="shrink-0 rounded-full border border-cement-grey/40 px-3 py-1 font-mono text-sm uppercase tracking-wide text-cyber-tin">
+            Not scored yet
+          </span>
+        ) : (
+          <span
+            className="shrink-0 rounded-full px-3 py-1 font-mono text-sm uppercase tracking-wide"
+            style={{
+              color: header.band.colorHex,
+              backgroundColor: `color-mix(in srgb, ${header.band.colorHex} 16%, transparent)`,
+            }}
+          >
+            {header.band.label}
+          </span>
+        )}
       </div>
+
+      {header.band === null && (
+        <p className="mt-2 font-mono text-xs text-cyber-tin">Not enough confirmed history yet.</p>
+      )}
 
       <div className="mt-4 flex flex-wrap items-center gap-4">
         <div className="flex items-baseline gap-2">
@@ -139,7 +151,7 @@ function formatChallengeDeadline(pendingUntil: bigint): string {
 function ConfirmedLiveSection({ data }: { data: AssetPageData }) {
   return (
     <div>
-      <Eyebrow>+ SCORE</Eyebrow>
+      <Eyebrow>+ PEG PRICE</Eyebrow>
       <div className="mt-4 grid gap-4 md:grid-cols-2">
         <Card>
           <p className="font-mono text-xs uppercase tracking-wide text-cyber-tin">Confirmed</p>

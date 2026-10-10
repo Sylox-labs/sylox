@@ -36,8 +36,24 @@ export interface AssetHeader {
   asset: string;
   code: string;
   homeDomain: string | null;
-  band: RiskBand;
-  /** 0-100, or null when the contract has no score yet. */
+  /**
+   * Null when the contract has no real score yet - `RiskScore.epoch === 0`
+   * means `score()` is returning `stale_score()`'s never-scored fallback,
+   * whose `band` field is hardcoded to `Band::Normal` (lib.rs's
+   * `stale_score`) as a struct-literal placeholder, not a real "Normal"
+   * verdict. Showing that band would read as "this asset is healthy",
+   * which is not something the contract has actually determined yet.
+   *
+   * No count of confirmed-vs-required history is shown alongside this -
+   * the 7-day baseline length (168) is a Rust constant
+   * (score.rs's AGGREGATE_SLOTS_7D), not something any contract read
+   * exposes, and approximating it client-side risked a number that could
+   * disagree with the contract's own check. A future `history_status`
+   * read returning the contract's own numbers is the right fix,
+   * tracked for a later contracts change - not approximated here.
+   */
+  band: RiskBand | null;
+  /** 0-100, or null when the contract has no score yet (same `epoch === 0` condition as `band`). */
   score: number | null;
   stale: boolean;
   eventInProgress: boolean;
@@ -66,6 +82,7 @@ async function fetchHeader(
     throw new Error(`RiskOracle.score returned a contract error: ${scoreResult.unwrapErr().message}`);
   }
   const riskScore = scoreResult.unwrap();
+  const hasRealScore = riskScore.epoch !== BigInt(0);
 
   const staleResult = staleTx.result;
   const stale = staleResult.isErr() ? true : staleResult.unwrap();
@@ -76,11 +93,11 @@ async function fetchHeader(
     asset,
     code: codeFromDisplayName(name, asset),
     homeDomain: config?.home_domain || null,
-    band: riskBandFor(riskScore.band),
-    score: riskScore.epoch === BigInt(0) ? null : riskScore.score,
+    band: hasRealScore ? riskBandFor(riskScore.band) : null,
+    score: hasRealScore ? riskScore.score : null,
     stale,
     eventInProgress: inProgressTx.result,
-    eventDeclared: riskScore.band.tag === "Event",
+    eventDeclared: hasRealScore && riskScore.band.tag === "Event",
   };
 }
 
@@ -204,6 +221,20 @@ export interface PegHistoryPoint {
   state: SlotState["tag"];
   /** Null for Empty/Pending/Disputed slots - a gap, never a fake 0. */
   pegRatio: number | null;
+  /**
+   * False for an hour before the asset's own `first_epoch` - the window
+   * always spans the full RING_SLOTS hours regardless of how long the
+   * asset has actually existed, so a leading stretch of `Empty` can mean
+   * either "before this asset was added" or "a real gap happened here."
+   * Only `first_epoch` tells them apart. An untracked hour is never
+   * counted as `missing` by the chart's legend - the keeper didn't fail
+   * to post something that was never trackable in the first place - and
+   * is drawn as a plain unshaded region, not a gap. True when
+   * `first_epoch` is unknown (never posted) or its read failed, so a
+   * failure here falls back to treating every hour as tracked (today's
+   * behavior) rather than guessing which ones aren't.
+   */
+  tracked: boolean;
 }
 
 export interface EffectiveRingSlot extends RingSlot {
@@ -285,11 +316,31 @@ export async function fetchEffectiveRing(
   });
 }
 
+/** `first_epoch()`'s result, or undefined on ANY failure (rejection or a synchronous throw) - "treat every hour as tracked" rather than guessing. */
+async function tryFetchFirstEpoch(
+  oracle: ReturnType<typeof riskOracleClient>,
+  asset: string,
+): Promise<bigint | undefined> {
+  try {
+    const tx = await oracle.first_epoch({ asset });
+    return tx.result;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function fetchPegHistory(
   oracle: ReturnType<typeof riskOracleClient>,
   asset: string,
 ): Promise<PegHistoryPoint[]> {
-  const ring = await fetchEffectiveRing(oracle, asset);
+  // A separate first_epoch() call (the header makes its own too) so this
+  // section keeps failing independently of the header - and so a failure
+  // here specifically can fall back to "treat every hour as tracked"
+  // rather than taking down the whole chart.
+  const [ring, firstEpoch] = await Promise.all([
+    fetchEffectiveRing(oracle, asset),
+    tryFetchFirstEpoch(oracle, asset),
+  ]);
 
   return ring.map((slot) => ({
     timestamp: Number(slot.epoch) * EPOCH_SECS,
@@ -303,6 +354,7 @@ export async function fetchPegHistory(
     // epochs "count neither for nor against" anything the contract
     // itself checks; this screen holds the same rule for what it draws).
     pegRatio: slot.effectiveState === "Final" ? Number(slot.peg_ratio) / PEG_RATIO_SCALE : null,
+    tracked: firstEpoch === undefined ? true : slot.epoch >= firstEpoch,
   }));
 }
 
@@ -394,16 +446,54 @@ const COVER_GATE_LABEL: Record<CoverGate["tag"], string> = {
   RecentIssuerAction: "Sales paused: a clawback or authorization revocation happened in the last 7 days.",
 };
 
-async function fetchCoverGate(
+/**
+ * Not just `cover_gate` - `Series.buy_cover`'s real step 2 (technical-
+ * doc.md Section 9.4) rejects if the asset is stale OR its band is
+ * Distress/Event, OR `cover_gate` is not Clear (the sequence diagram:
+ * `Series->>Oracle: is_stale(asset), band(asset)` happens before
+ * `Series->>Registry: cover_gate(asset)`, and either can reject on its
+ * own). `cover_gate` alone only covers the EventRegistry-side checks
+ * (event-in-progress, recent depeg/outage/issuer-action); showing "Cover
+ * can be sold" from that alone would claim a sale would go through when
+ * staleness or a Distress/Event band would still reject it.
+ */
+export type CoverSalesStatus =
+  | { gate: "Clear"; label: string }
+  | { gate: "Stale"; label: string }
+  | { gate: "Distressed"; label: string }
+  | { gate: CoverGate["tag"]; label: string };
+
+export async function fetchCoverGate(
+  oracle: ReturnType<typeof riskOracleClient>,
   registry: ReturnType<typeof eventRegistryClient>,
   asset: string,
-): Promise<{ gate: CoverGate["tag"]; label: string }> {
-  const tx = await registry.cover_gate({ asset });
-  const result = tx.result;
-  if (result.isErr()) {
-    throw new Error(`EventRegistry.cover_gate returned a contract error: ${result.unwrapErr().message}`);
+): Promise<CoverSalesStatus> {
+  const [staleTx, scoreTx, gateTx] = await Promise.all([
+    oracle.check_stale({ asset }),
+    oracle.score({ asset }),
+    registry.cover_gate({ asset }),
+  ]);
+
+  const staleResult = staleTx.result;
+  const stale = staleResult.isErr() ? true : staleResult.unwrap();
+  if (stale) {
+    return { gate: "Stale", label: "Sales paused: not enough price history yet." };
   }
-  const gate = result.unwrap();
+
+  const scoreResult = scoreTx.result;
+  if (scoreResult.isErr()) {
+    throw new Error(`RiskOracle.score returned a contract error: ${scoreResult.unwrapErr().message}`);
+  }
+  const band = scoreResult.unwrap().band.tag;
+  if (band === "Distress" || band === "Event") {
+    return { gate: "Distressed", label: "Sales paused: the asset is in distress." };
+  }
+
+  const gateResult = gateTx.result;
+  if (gateResult.isErr()) {
+    throw new Error(`EventRegistry.cover_gate returned a contract error: ${gateResult.unwrapErr().message}`);
+  }
+  const gate = gateResult.unwrap();
   return { gate: gate.tag, label: COVER_GATE_LABEL[gate.tag] };
 }
 
@@ -429,7 +519,7 @@ export interface AssetPageData {
   live: SectionResult<LiveValue>;
   pegHistory: SectionResult<PegHistoryPoint[]>;
   failureDefinitions: SectionResult<FailureDefinition[]>;
-  coverGate: SectionResult<{ gate: CoverGate["tag"]; label: string }>;
+  coverGate: SectionResult<CoverSalesStatus>;
   activeEventCount: SectionResult<number>;
 }
 
@@ -444,7 +534,7 @@ export async function fetchAssetPageData(asset: string): Promise<AssetPageData> 
       section(() => fetchLive(asset)),
       section(() => fetchPegHistory(oracle, asset)),
       section(() => fetchFailureDefinitions(registry, asset)),
-      section(() => fetchCoverGate(registry, asset)),
+      section(() => fetchCoverGate(oracle, registry, asset)),
       section(() => fetchActiveEventCount(registry, asset)),
     ]);
 

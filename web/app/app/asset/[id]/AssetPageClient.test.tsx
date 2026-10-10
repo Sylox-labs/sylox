@@ -91,6 +91,26 @@ describe("AssetPageClient", () => {
     expect(screen.getByText("Event declared")).toBeInTheDocument();
   });
 
+  it("shows the asset code as the big title, with domain and address small underneath", async () => {
+    fetchAssetPageData.mockResolvedValue(okData());
+    render(<AssetPageClient asset={baseHeader.asset} />);
+
+    const heading = await screen.findByRole("heading", { level: 1 });
+    expect(heading).toHaveTextContent("USDC");
+  });
+
+  it("shows 'Not scored yet' with an explanation instead of a fake band, when there is no real score", async () => {
+    fetchAssetPageData.mockResolvedValue(
+      okData({ header: { status: "ok", value: { ...baseHeader, band: null, score: null } } }),
+    );
+    render(<AssetPageClient asset={baseHeader.asset} />);
+
+    expect(await screen.findByText("Not scored yet")).toBeInTheDocument();
+    expect(screen.getByText(/not enough confirmed history yet/i)).toBeInTheDocument();
+    // Never a leftover "Normal" (or any other) band badge alongside it.
+    expect(screen.queryByText("Normal")).not.toBeInTheDocument();
+  });
+
   it("falls back to a shortened address when there is no home domain", async () => {
     fetchAssetPageData.mockResolvedValue(
       okData({ header: { status: "ok", value: { ...baseHeader, homeDomain: null } } }),
@@ -98,6 +118,13 @@ describe("AssetPageClient", () => {
     render(<AssetPageClient asset={baseHeader.asset} />);
 
     expect(await screen.findAllByText(/CBIE…DAMA/)).toHaveLength(2); // h1 fallback + address subtitle
+  });
+
+  it("titles the Confirmed/Live section 'Peg price'", async () => {
+    fetchAssetPageData.mockResolvedValue(okData());
+    render(<AssetPageClient asset={baseHeader.asset} />);
+    expect(await screen.findByText("+ PEG PRICE")).toBeInTheDocument();
+    expect(screen.queryByText("+ SCORE")).not.toBeInTheDocument();
   });
 
   it("shows the confirmed peg value", async () => {
@@ -175,6 +202,32 @@ describe("AssetPageClient", () => {
     expect(await screen.findByText(/sales paused: the price was below/i)).toBeInTheDocument();
   });
 
+  it("shows sales paused for staleness, combined from cover_gate + stale + band", async () => {
+    fetchAssetPageData.mockResolvedValue(
+      okData({
+        coverGate: {
+          status: "ok",
+          value: { gate: "Stale", label: "Sales paused: not enough price history yet." },
+        },
+      }),
+    );
+    render(<AssetPageClient asset={baseHeader.asset} />);
+    expect(await screen.findByText(/sales paused: not enough price history yet/i)).toBeInTheDocument();
+  });
+
+  it("shows sales paused for distress even when cover_gate alone would be Clear", async () => {
+    fetchAssetPageData.mockResolvedValue(
+      okData({
+        coverGate: {
+          status: "ok",
+          value: { gate: "Distressed", label: "Sales paused: the asset is in distress." },
+        },
+      }),
+    );
+    render(<AssetPageClient asset={baseHeader.asset} />);
+    expect(await screen.findByText(/sales paused: the asset is in distress/i)).toBeInTheDocument();
+  });
+
   it("shows an active-event card when active_event_count > 0", async () => {
     fetchAssetPageData.mockResolvedValue(okData({ activeEventCount: { status: "ok", value: 2 } }));
     render(<AssetPageClient asset={baseHeader.asset} />);
@@ -203,15 +256,17 @@ describe("AssetPageClient", () => {
 
   it("never renders a missing or pending hour as a zero value in the chart", async () => {
     const pegHistory: PegHistoryPoint[] = [
-      { timestamp: 0, epoch: BigInt(0), state: "Final", pegRatio: 1.0 },
-      { timestamp: 3600, epoch: BigInt(1), state: "Pending", pegRatio: null },
-      { timestamp: 7200, epoch: BigInt(2), state: "Empty", pegRatio: null },
-      { timestamp: 10800, epoch: BigInt(3), state: "Final", pegRatio: 0.999 },
+      { timestamp: 0, epoch: BigInt(0), state: "Final", pegRatio: 1.0, tracked: true },
+      { timestamp: 3600, epoch: BigInt(1), state: "Pending", pegRatio: null, tracked: true },
+      { timestamp: 7200, epoch: BigInt(2), state: "Empty", pegRatio: null, tracked: true },
+      { timestamp: 10800, epoch: BigInt(3), state: "Final", pegRatio: 0.999, tracked: true },
     ];
     fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
     render(<AssetPageClient asset={baseHeader.asset} />);
 
-    const svg = await screen.findByRole("img", { name: /2 confirmed, 1 pending, 1 missing of 4 hours/i });
+    const svg = await screen.findByRole("img", {
+      name: /2 confirmed, 1 pending, 1 missing of 4 tracked hours/i,
+    });
     expect(svg).toBeInTheDocument();
 
     // Two known points, zero gaps drawn through: exactly two disconnected
@@ -223,6 +278,49 @@ describe("AssetPageClient", () => {
       const d = path.getAttribute("d") ?? "";
       expect(d.trim().split(" ")).toHaveLength(1); // one lone "M x,y" - no "L" segment bridging the gap
     }
+  });
+
+  it("shows a 'history starts when the asset was added' note and excludes untracked hours from the legend", async () => {
+    const pegHistory: PegHistoryPoint[] = [
+      { timestamp: 0, epoch: BigInt(0), state: "Empty", pegRatio: null, tracked: false },
+      { timestamp: 3600, epoch: BigInt(1), state: "Empty", pegRatio: null, tracked: false },
+      { timestamp: 7200, epoch: BigInt(2), state: "Final", pegRatio: 1.0, tracked: true },
+      { timestamp: 10800, epoch: BigInt(3), state: "Empty", pegRatio: null, tracked: true },
+    ];
+    fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
+    render(<AssetPageClient asset={baseHeader.asset} />);
+
+    expect(await screen.findByText(/history starts when the asset was added/i)).toBeInTheDocument();
+    // Legend counts only the 2 tracked hours (1 confirmed, 1 missing) -
+    // the 2 untracked hours before first_epoch are never called "missing".
+    const svg = await screen.findByRole("img", {
+      name: /1 confirmed, 0 pending, 1 missing of 2 tracked hours/i,
+    });
+    expect(svg).toBeInTheDocument();
+  });
+
+  it("shows no 'history starts' note when every hour is tracked", async () => {
+    const pegHistory: PegHistoryPoint[] = [
+      { timestamp: 0, epoch: BigInt(0), state: "Final", pegRatio: 1.0, tracked: true },
+      { timestamp: 3600, epoch: BigInt(1), state: "Empty", pegRatio: null, tracked: true },
+    ];
+    fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
+    render(<AssetPageClient asset={baseHeader.asset} />);
+
+    await screen.findByRole("img", { name: /1 confirmed, 0 pending, 1 missing of 2 tracked hours/i });
+    expect(screen.queryByText(/history starts when the asset was added/i)).not.toBeInTheDocument();
+  });
+
+  it("shows start and end date labels under the chart", async () => {
+    const pegHistory: PegHistoryPoint[] = [
+      { timestamp: Date.UTC(2026, 8, 29) / 1000, epoch: BigInt(0), state: "Final", pegRatio: 1.0, tracked: true },
+      { timestamp: Date.UTC(2026, 9, 9) / 1000, epoch: BigInt(1), state: "Final", pegRatio: 1.0, tracked: true },
+    ];
+    fetchAssetPageData.mockResolvedValue(okData({ pegHistory: { status: "ok", value: pegHistory } }));
+    render(<AssetPageClient asset={baseHeader.asset} />);
+
+    expect(await screen.findByText(/sep 29/i)).toBeInTheDocument();
+    expect(screen.getByText(/oct 9/i)).toBeInTheDocument();
   });
 
   it("shows the chart's own error without losing other sections", async () => {

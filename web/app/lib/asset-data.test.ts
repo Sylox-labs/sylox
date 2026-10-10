@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { fetchEffectiveRing, fetchPegHistory, fetchConfirmed, PEG_RATIO_SCALE } from "./asset-data";
+import {
+  fetchEffectiveRing,
+  fetchPegHistory,
+  fetchConfirmed,
+  fetchCoverGate,
+  PEG_RATIO_SCALE,
+} from "./asset-data";
 import type { RingSlot, SlotState } from "./contracts/risk-oracle";
+import type { CoverGate } from "./contracts/event-registry";
 
 const RING_SLOTS = 240;
 const EPOCH_SECS = 3600;
@@ -52,6 +59,8 @@ function pendingSlot(epoch: bigint, pegRatio: number, pendingUntil: bigint): Rin
 function fakeOracle(opts: {
   ringSlots: RingSlot[]; // oldest-first, length RING_SLOTS - what `ring()` returns.
   effectiveByEpoch: Map<string, SlotState["tag"]>; // what `effective_window` would report, keyed by epoch.toString().
+  firstEpoch?: bigint; // what `first_epoch()` would report; undefined = never posted (matches "treat every hour as tracked").
+  firstEpochThrows?: boolean; // simulates first_epoch() failing, to exercise fetchPegHistory's fallback.
 }) {
   return {
     ring: async () => ({ result: opts.ringSlots }),
@@ -70,6 +79,10 @@ function fakeOracle(opts: {
         result.push(tag ? ({ tag, values: undefined } as SlotState) : undefined);
       }
       return { result };
+    },
+    first_epoch: async () => {
+      if (opts.firstEpochThrows) throw new Error("first_epoch unreachable");
+      return { result: opts.firstEpoch };
     },
     score: async () => ({
       result: {
@@ -251,6 +264,57 @@ describe("fetchPegHistory timestamps", () => {
   });
 });
 
+describe("fetchPegHistory tracked", () => {
+  it("marks every hour tracked when first_epoch is unknown (never posted)", async () => {
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch: new Map(), firstEpoch: undefined });
+
+    const history = await fetchPegHistory(oracle, "ASSET");
+
+    expect(history.every((p) => p.tracked)).toBe(true);
+  });
+
+  it("marks hours before first_epoch untracked, not missing", async () => {
+    const newestEpoch = BigInt(500_000);
+    const firstEpoch = newestEpoch - BigInt(49); // Asset is only 50 hours old - window is 240.
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    ringSlots[RING_SLOTS - 1] = finalSlot(newestEpoch, 1.0);
+    ringSlots[RING_SLOTS - 50] = finalSlot(firstEpoch, 1.0); // The asset's very first posted hour.
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([
+      [newestEpoch.toString(), "Final"],
+      [firstEpoch.toString(), "Final"],
+    ]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch, firstEpoch });
+
+    const history = await fetchPegHistory(oracle, "ASSET");
+
+    // Everything before the asset's first epoch is untracked...
+    const untracked = history.filter((p) => !p.tracked);
+    expect(untracked).toHaveLength(RING_SLOTS - 50);
+    for (const point of untracked) {
+      expect(point.epoch).toBeLessThan(firstEpoch);
+    }
+    // ...and everything from first_epoch onward is tracked, including
+    // real gaps that happen to exist in that tracked range.
+    const tracked = history.filter((p) => p.tracked);
+    expect(tracked).toHaveLength(50);
+    expect(tracked.every((p) => p.epoch >= firstEpoch)).toBe(true);
+  });
+
+  it("falls back to treating every hour as tracked if first_epoch() fails", async () => {
+    const newestEpoch = BigInt(500_000);
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    ringSlots[RING_SLOTS - 1] = finalSlot(newestEpoch, 1.0);
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([[newestEpoch.toString(), "Final"]]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch, firstEpochThrows: true });
+
+    const history = await fetchPegHistory(oracle, "ASSET");
+
+    expect(history.every((p) => p.tracked)).toBe(true);
+  });
+});
+
 describe("fetchConfirmed", () => {
   it("uses the newest EFFECTIVELY final slot's peg value, not latest()", async () => {
     const newestEpoch = BigInt(500_000);
@@ -300,5 +364,103 @@ describe("fetchConfirmed", () => {
 
     expect(confirmed).toBeNull();
     expect(latestPending).toBeNull();
+  });
+});
+
+/**
+ * fetchCoverGate's own fake clients: just the 3 reads it makes
+ * (check_stale, score, cover_gate) - this mirrors Series.buy_cover's
+ * real step 2 (technical-doc.md Section 9.4): stale OR band
+ * Distress/Event OR cover_gate not Clear all independently reject.
+ */
+function fakeCoverGateClients(opts: {
+  stale: boolean;
+  band: string;
+  gate: CoverGate["tag"];
+}) {
+  const oracle = {
+    check_stale: async () => ({ result: { isErr: () => false, unwrap: () => opts.stale } }),
+    score: async () => ({
+      result: {
+        isErr: () => false,
+        unwrap: () => ({
+          epoch: BigInt(1),
+          score: 5,
+          band: { tag: opts.band, values: undefined },
+          formula_version: 1,
+          stale: opts.stale,
+        }),
+      },
+    }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+  const registry = {
+    cover_gate: async () => ({
+      result: { isErr: () => false, unwrap: () => ({ tag: opts.gate, values: undefined }) },
+    }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+  return { oracle, registry };
+}
+
+describe("fetchCoverGate", () => {
+  it("says sales are paused for staleness before ever checking cover_gate", async () => {
+    const { oracle, registry } = fakeCoverGateClients({ stale: true, band: "Normal", gate: "Clear" });
+
+    const status = await fetchCoverGate(oracle, registry, "ASSET");
+
+    expect(status.gate).toBe("Stale");
+    expect(status.label).toMatch(/not enough price history yet/i);
+  });
+
+  it("says sales are paused for a Distress band, even when cover_gate itself is Clear", async () => {
+    const { oracle, registry } = fakeCoverGateClients({
+      stale: false,
+      band: "Distress",
+      gate: "Clear",
+    });
+
+    const status = await fetchCoverGate(oracle, registry, "ASSET");
+
+    expect(status.gate).toBe("Distressed");
+    expect(status.label).toMatch(/the asset is in distress/i);
+  });
+
+  it("says sales are paused for an Event band", async () => {
+    const { oracle, registry } = fakeCoverGateClients({ stale: false, band: "Event", gate: "Clear" });
+
+    const status = await fetchCoverGate(oracle, registry, "ASSET");
+
+    expect(status.gate).toBe("Distressed");
+  });
+
+  it("falls through to cover_gate's own reason once stale and band both pass", async () => {
+    const { oracle, registry } = fakeCoverGateClients({
+      stale: false,
+      band: "Watch",
+      gate: "RecentDepeg",
+    });
+
+    const status = await fetchCoverGate(oracle, registry, "ASSET");
+
+    expect(status.gate).toBe("RecentDepeg");
+    expect(status.label).toMatch(/below the threshold/i);
+  });
+
+  it("only says sales can go through when stale, band, and cover_gate all pass", async () => {
+    const { oracle, registry } = fakeCoverGateClients({ stale: false, band: "Normal", gate: "Clear" });
+
+    const status = await fetchCoverGate(oracle, registry, "ASSET");
+
+    expect(status.gate).toBe("Clear");
+    expect(status.label).toBe("Cover can be sold.");
+  });
+
+  it("treats Normal and Watch bands as not-distressed", async () => {
+    const { oracle, registry } = fakeCoverGateClients({ stale: false, band: "Watch", gate: "Clear" });
+
+    const status = await fetchCoverGate(oracle, registry, "ASSET");
+
+    expect(status.gate).toBe("Clear");
   });
 });
