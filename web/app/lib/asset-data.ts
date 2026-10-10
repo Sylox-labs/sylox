@@ -221,6 +221,13 @@ export interface EffectiveRingSlot extends RingSlot {
  * slot's stored epoch says - so the axis is derived from the newest
  * epoch and position alone, never from a per-slot epoch field.
  *
+ * `newestEpoch` itself is anchored on whichever array index actually
+ * holds the newest non-Empty slot, not assumed to be the last index -
+ * the newest hour can itself be Empty (ADR-005: an overturned slot
+ * returns to Empty for reposting), in which case the real newest slot
+ * sits earlier in the array and every derived epoch must be computed
+ * from ITS index, or the whole axis is off by a constant amount.
+ *
  * Paired here with `effective_window`, the contract's own read for
  * whether a Pending slot's dispute window has already elapsed
  * (ADR-008/review item C5) - the only Final/not-Final rule this screen
@@ -233,15 +240,29 @@ export async function fetchEffectiveRing(
   const ringTx = await oracle.ring({ asset });
   const slots: RingSlot[] = ringTx.result;
 
-  const newestSlot = [...slots].reverse().find((s) => s.state.tag !== "Empty");
-  if (!newestSlot) {
+  // The newest non-Empty slot isn't necessarily at the last array index -
+  // if the newest hour was overturned and reopened (ADR-005: an
+  // overturned slot returns to Empty for reposting), the array's last
+  // slot can itself be Empty while an earlier one is real. Anchoring on
+  // that slot's own index (not an assumed "last position") is what keeps
+  // the derived axis correct in that case: newestEpoch = slot[j].epoch +
+  // (RING_SLOTS - 1 - j), for whichever index j actually holds it.
+  let anchorIndex = -1;
+  for (let i = slots.length - 1; i >= 0; i--) {
+    if (slots[i].state.tag !== "Empty") {
+      anchorIndex = i;
+      break;
+    }
+  }
+  if (anchorIndex === -1) {
     // Never posted: no real epoch to anchor the axis to. Every slot stays
     // Empty; the axis values are arbitrary since nothing will render as a
     // point anyway (every pegRatio comes out null for an all-Empty ring).
     return slots.map((slot) => ({ ...slot, effectiveState: "Empty" }));
   }
 
-  const newestEpoch = newestSlot.epoch;
+  const anchorSlot = slots[anchorIndex];
+  const newestEpoch = anchorSlot.epoch + BigInt(RING_SLOTS - 1 - anchorIndex);
   const oldestEpoch =
     newestEpoch >= BigInt(RING_SLOTS - 1) ? newestEpoch - BigInt(RING_SLOTS - 1) : BigInt(0);
 

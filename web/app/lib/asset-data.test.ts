@@ -190,6 +190,48 @@ describe("fetchEffectiveRing", () => {
     // Still one epoch apart from its neighbors - no gap or jump in the axis.
     expect(ring[0].epoch).toBe(newestEpoch - BigInt(RING_SLOTS - 1));
   });
+
+  it("anchors on the newest non-Empty slot's own index, not the array's last index", async () => {
+    // ADR-005: an overturned slot returns to Empty for reposting. If the
+    // most recently posted hour was overturned, the array's LAST slot
+    // (index 239) is Empty even though a real, newer-than-everything-else
+    // slot still sits a few positions earlier (index 237). Anchoring on
+    // "the last index" instead of that slot's actual index would derive
+    // every epoch in the ring off by (239 - 237) = 2 hours.
+    const trueNewestEpoch = BigInt(500_000);
+    const anchorIndex = RING_SLOTS - 3; // 237 - two positions before the end.
+    const ringSlots: RingSlot[] = Array.from({ length: RING_SLOTS }, () => emptySlot());
+    ringSlots[anchorIndex] = finalSlot(trueNewestEpoch, 0.9995);
+    // The last two slots (238, 239) are genuinely Empty - the overturned
+    // hour and the one after it, neither reposted yet.
+
+    const effectiveByEpoch = new Map<string, SlotState["tag"]>([
+      [trueNewestEpoch.toString(), "Final"],
+    ]);
+    const oracle = fakeOracle({ ringSlots, effectiveByEpoch });
+
+    const ring = await fetchEffectiveRing(oracle, "ASSET");
+
+    // The real slot keeps its own true epoch, from its own array index -
+    // not from being misread as sitting at the last index.
+    expect(ring[anchorIndex].epoch).toBe(trueNewestEpoch);
+    expect(ring[anchorIndex].effectiveState).toBe("Final");
+
+    // The axis still ends 2 epochs after the anchor (the array's last
+    // index is 2 positions past the anchor), and is still contiguous
+    // and real (never 0) all the way through - including past the
+    // anchor, where nothing was ever written.
+    expect(ring[ring.length - 1].epoch).toBe(trueNewestEpoch + BigInt(2));
+    for (let i = 1; i < ring.length; i++) {
+      expect(ring[i].epoch).toBe(ring[i - 1].epoch + BigInt(1));
+    }
+
+    // The two trailing Empty slots are genuinely gaps, not 0 or a fake value.
+    const history = await fetchPegHistory(oracle, "ASSET");
+    expect(history[history.length - 1].pegRatio).toBeNull();
+    expect(history[history.length - 2].pegRatio).toBeNull();
+    expect(history[anchorIndex].pegRatio).toBeCloseTo(0.9995, 5);
+  });
 });
 
 describe("fetchPegHistory timestamps", () => {
