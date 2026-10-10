@@ -1,0 +1,47 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+# next-env.d.ts is committed (not ignored): CI's typecheck step runs
+# `tsc --noEmit` directly, with no `next build`/`next dev` step before
+# it to regenerate this file, so without it LayoutProps and friends
+# (declared via this file's triple-slash references) are undefined and
+# the typecheck fails for real - exactly what happened once this file
+# existed locally (masking the gap) but was never actually committed.
+# web/landing commits its own next-env.d.ts for the same reason.

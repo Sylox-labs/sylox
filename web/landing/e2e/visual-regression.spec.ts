@@ -57,3 +57,36 @@ test("phone matches baseline", async ({ page }) => {
     mask: heroVideoMask(page),
   });
 });
+
+// This page has no prefers-color-scheme handling — its light/dark sections
+// are driven entirely by a per-section data-theme attribute, not an OS
+// preference, so the full-page captures above already exercise both
+// themes. These two isolate one dark section on its own (Who It's For:
+// dark theme, no looping video, no scroll-triggered count-up, so it's
+// stable without the freeze() helper's extra steps) as a focused
+// regression target for dark-theme-specific styling.
+test("dark section (desktop) matches baseline", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/#who-its-for");
+  await page.evaluate(() => document.fonts.ready);
+  const section = page.locator("#who-its-for");
+  await section.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(300);
+  await expect(section).toHaveScreenshot("dark-section-desktop.png", {
+    maxDiffPixelRatio: 0,
+  });
+});
+
+test("dark section (phone) matches baseline", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/#who-its-for");
+  await page.evaluate(() => document.fonts.ready);
+  const section = page.locator("#who-its-for");
+  await section.scrollIntoViewIfNeeded();
+  await page.waitForTimeout(300);
+  await expect(section).toHaveScreenshot("dark-section-phone.png", {
+    maxDiffPixelRatio: 0,
+  });
+});
