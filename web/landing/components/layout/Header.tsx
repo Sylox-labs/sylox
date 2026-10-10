@@ -192,16 +192,30 @@ export function Header() {
             </a>
           </nav>
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            {/* Desktop: full size next to the nav links, tag included. */}
             <ButtonLink
               href={nav.launchApp.href}
               variant="primary"
-              className="hidden items-center gap-2 md:inline-flex"
+              className="hidden items-center gap-2 !px-4 !py-2 text-xs md:inline-flex"
             >
               {nav.launchApp.label}
-              <span className="rounded-full border border-slate-black/30 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wide text-slate-black/70">
+              <span className="rounded-full bg-slate-black px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-silo-oatmeal">
                 {nav.launchApp.tag}
               </span>
+            </ButtonLink>
+
+            {/* Phone: the collapsed header only shows the logo and the
+                menu button otherwise, hiding the main CTA behind an extra
+                tap - a compact version (smaller padding, no tag - it
+                doesn't fit at this size) sits next to the menu toggle
+                instead. The full version stays inside the open menu too. */}
+            <ButtonLink
+              href={nav.launchApp.href}
+              variant="primary"
+              className="!px-3 !py-1.5 text-xs md:hidden"
+            >
+              {nav.launchApp.label}
             </ButtonLink>
 
             <button
@@ -252,7 +266,7 @@ export function Header() {
           onClick={() => setIsMenuOpen(false)}
         >
           {nav.launchApp.label}
-          <span className="rounded-full border border-slate-black/30 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wide text-slate-black/70">
+          <span className="rounded-full bg-slate-black px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-silo-oatmeal">
             {nav.launchApp.tag}
           </span>
         </ButtonLink>
