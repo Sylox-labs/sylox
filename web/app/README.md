@@ -33,9 +33,13 @@ The generated bindings are committed (not gitignored): CI has no network path to
 
 ## Deployment
 
-Served from Railway as its own service (`web/app/railway.json`), separate from the `web/landing` service - `web/app` needs a live `next start` process (dynamic server-streamed content on `/asset/[id]`), not a static export. Build is `npm run build -w web/app`; start is `npm run start -w web/app -- -p $PORT`, both run from the repo root so the `web/shared/ui` workspace member resolves. `PORT` is set automatically by Railway; set `NODE_ENV=production` on the service.
+Served from Railway as its own service, separate from the `web/landing` service - `web/app` needs a live `next start` process (dynamic server-streamed content on `/asset/[id]`), not a static export.
 
-**Environment variables:** none beyond `NODE_ENV=production` and `PORT` (Railway sets `PORT` automatically). The app has no server-side secrets, API keys, or other runtime config - every contract address it reads comes from the committed `deployments/testnet.json`, and all RPC calls go straight from the browser to the public Soroban RPC endpoint (see "No backend" above).
+Built from `web/app/Dockerfile`, not Railpack. Railpack's own build-plan resolution in this monorepo consistently ran `web/landing`'s `package.json` scripts regardless of this service's dashboard-configured custom build/start commands - reproduced across three separate Railway services/projects, with the repo-root `railpack.json` (needed so Railpack detects Node rather than Rust at the repo root - see its own commit history) logged as the authoritative config source each time, overriding the dashboard's build command specifically. A Dockerfile has no auto-detection step to get wrong: `docker build -f web/app/Dockerfile .` from the repo root runs exactly `npm install`, `npm run build -w web/app`, then `next start -w web/app -- -p $PORT` on container start - nothing else. `web/app/railway.json` (an earlier attempt at this via Railway's config-as-code) is dead weight now - config-as-code never actually took effect for a service created after Railway's 2026-08-28 deprecation cutoff - and should probably be deleted in a follow-up once this is confirmed stable.
+
+The build needs the whole monorepo (repo root, not `web/app/` alone) in its Docker build context, since `web/app` depends on the `web/shared/ui` workspace member for npm's workspace resolution to find it.
+
+**Environment variables:** none beyond `NODE_ENV=production` and `PORT` (Railway sets `PORT` automatically; `NODE_ENV=production` is set explicitly on the service, same as before). The app has no server-side secrets, API keys, or other runtime config - every contract address it reads comes from the committed `deployments/testnet.json`, and all RPC calls go straight from the browser to the public Soroban RPC endpoint (see "No backend" above).
 
 ## Rules this app follows
 
