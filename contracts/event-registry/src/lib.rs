@@ -579,30 +579,10 @@ impl EventRegistry {
         let halt_window_secs = DEFAULT_HALT_WINDOW_SECS;
 
         let depeg_epochs = (depeg_window_secs / EPOCH_SECS) as u32;
-        if any_epoch_below_threshold(&ring, newest_epoch, depeg_epochs, depeg_threshold) {
-            return Ok(CoverGate::RecentDepeg);
-        }
-        // Since v1.5 (Section 5.9 S5): also scan the posted sub-epochs
-        // (Pending or Final) of every hour in the window that has not
-        // built yet, so a depeg is visible within one sub_epoch_secs
-        // of starting, not diluted into the hour's own averaged
-        // provisional peg_ratio (which any_epoch_below_threshold above
-        // already reads, but only as a mean across however many
-        // sub-epochs have posted so far). An already-built hour
-        // (ring()'s own slot reports it effectively Final) is never
-        // re-read at sub-epoch level: a wick that hour's own roll-up
-        // already absorbed into its average cannot be read back out
-        // once built, since Sub(asset) is no longer consulted for it.
-        if any_unbuilt_sub_epoch_below_threshold(
-            &env,
-            &oracle,
-            &asset,
-            &ring,
-            newest_epoch,
-            depeg_epochs,
-            depeg_threshold,
-        ) {
-            return Ok(CoverGate::RecentDepeg);
+        match depeg_check(&env, &oracle, &asset, &ring, newest_epoch, depeg_epochs, depeg_threshold) {
+            DepegCheck::Depeg => return Ok(CoverGate::RecentDepeg),
+            DepegCheck::UnbuiltBacklog => return Ok(CoverGate::UnbuiltBacklog),
+            DepegCheck::Clear => {}
         }
 
         let halt_epochs = (halt_window_secs / EPOCH_SECS) as u32;
@@ -1220,39 +1200,57 @@ const DEFAULT_DEPEG_WINDOW_SECS: u64 = 259_200;
 const DEFAULT_DEPEG_THRESHOLD: i128 = 9_500_000;
 const DEFAULT_HALT_WINDOW_SECS: u64 = 259_200;
 
-fn any_epoch_below_threshold(
-    ring: &Vec<sylox_types::RingSlot>,
-    newest_epoch: u64,
-    window_epochs: u32,
-    threshold: i128,
-) -> bool {
-    let start = newest_epoch.saturating_sub(window_epochs as u64);
-    let mut epoch = start;
-    while epoch <= newest_epoch {
-        if let Some(slot) = slot_for_epoch(ring, newest_epoch, epoch) {
-            if slot.state != SlotState::Empty && slot.peg_ratio < threshold {
-                return true;
-            }
-        }
-        epoch += 1;
-    }
-    false
+enum DepegCheck {
+    Clear,
+    Depeg,
+    UnbuiltBacklog,
 }
 
-/// Since v1.5 (Section 5.9 S5): for every hour in
-/// `[newest_epoch - window_epochs, newest_epoch]` that `ring`'s own
-/// slot does NOT report effectively Final (a waiting hour, Section
-/// 5.9 S4), reads that hour's individual sub-epoch `peg_ratio`s
-/// directly (`RiskOracle.sub_peg_ratios`) and checks each one against
-/// `threshold`. An already-built hour (`effective_state_of` reports
-/// it Final) is skipped entirely: its own data is already covered by
-/// `any_epoch_below_threshold`'s existing hourly scan, at its own
-/// built, averaged `peg_ratio`, exactly as before this revision. This
-/// keeps the gate's own sensitivity fixed at every `sub_epoch_secs`:
-/// a wick a built hour's roll-up already absorbed into its average
-/// can never be read back out at sub-epoch granularity once that
-/// hour builds.
-fn any_unbuilt_sub_epoch_below_threshold(
+/// Section 5.9 S4/S5 (v1.5), R10: `RecentDepeg`'s own check across
+/// `[newest_epoch - window_epochs, newest_epoch]`, exactly ONE source
+/// per hour, and NEVER `HeldHour` (the footprint-fix review's own
+/// finding: `HeldHour` is a write-path, build/dispute-only concern,
+/// so the gate's own footprint never depends on how many disputes are
+/// open, only on the fixed set of keys below):
+///
+/// - A BUILT hour (`effective_state_of` reports its `ring()` slot
+///   Final) reads from the ring alone, at its own built, averaged
+///   `peg_ratio`, exactly as before v1.5. A wick a built hour's own
+///   roll-up already absorbed into its average can never be read back
+///   out at sub-epoch granularity once that hour builds, keeping the
+///   gate's own sensitivity fixed at every `sub_epoch_secs`.
+/// - Every UNBUILT hour in the window is instead batched into ONE
+///   `RiskOracle.sub_peg_ratios_in_span_batch` call, touching exactly
+///   one ledger key (`Sub(asset)`) regardless of how many hours are
+///   requested. If more unbuilt hours sit in the window than
+///   `MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE` allows, this returns
+///   `UnbuiltBacklog` without making that call at all: blocking new
+///   cover is the safe failure, not guessing or risking the call
+///   itself exceeding the network's own transaction memory limit.
+/// - For each unbuilt hour the batch call returns real sub-epoch data
+///   for (still inside `Sub(asset)`'s own 5 hour span), those
+///   sub-epoch values are the check, read at sub-epoch granularity so
+///   a depeg is visible within one `sub_epoch_secs` of starting, not
+///   diluted into the hour's own provisional mean.
+/// - For an unbuilt hour the batch call returns nothing for at all
+///   (its sub-epochs have rotated out of that 5 hour span), its own
+///   `Ring(asset)` provisional roll-up is the check instead, using
+///   `provisional_sub_coverage` (never `peg_ratio` or `pending_until`)
+///   to decide whether that roll-up holds real data:
+///     - `Some(0)`: every posted sub-epoch is currently disputed, zero
+///       real coverage; treated as no signal, same as a missing hour.
+///     - `Some(n > 0)`: `n` non-disputed sub-epochs' real roll-up,
+///       read REGARDLESS of `state` (even `Disputed`, since the
+///       footprint-fix review's own roll-up fix means a `Disputed`
+///       sub-epoch-path slot's `peg_ratio` already excludes the
+///       disputed sub-epoch itself, not the whole hour).
+///     - `None`: this hour was posted (if at all) through the hourly
+///       fallback path, so `peg_ratio` IS the one real, possibly
+///       contested reading itself; today's rule applies unchanged
+///       (`state != Empty && state != Disputed`), since a `Disputed`
+///       hourly-fallback slot's own fields are the contested value,
+///       not a roll-up that already excludes it.
+fn depeg_check(
     env: &Env,
     oracle: &RiskOracleClient,
     asset: &Address,
@@ -1260,9 +1258,11 @@ fn any_unbuilt_sub_epoch_below_threshold(
     newest_epoch: u64,
     window_epochs: u32,
     threshold: i128,
-) -> bool {
+) -> DepegCheck {
     let start = newest_epoch.saturating_sub(window_epochs as u64);
     let now = env.ledger().timestamp();
+
+    let mut unbuilt_hours: Vec<u64> = Vec::new(env);
     let mut epoch = start;
     while epoch <= newest_epoch {
         let slot = slot_for_epoch(ring, newest_epoch, epoch);
@@ -1270,16 +1270,49 @@ fn any_unbuilt_sub_epoch_below_threshold(
             slot.as_ref().map(|s| effective_state_of(s, now)),
             Some(SlotState::Final)
         );
-        if !is_built {
-            for peg_ratio in oracle.sub_peg_ratios(asset, &epoch).iter().flatten() {
-                if peg_ratio < threshold {
-                    return true;
+        if is_built {
+            if let Some(s) = &slot {
+                if s.state != SlotState::Empty && s.peg_ratio < threshold {
+                    return DepegCheck::Depeg;
                 }
             }
+        } else {
+            unbuilt_hours.push_back(epoch);
         }
         epoch += 1;
     }
-    false
+
+    if unbuilt_hours.len() > sylox_types::time::MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE {
+        return DepegCheck::UnbuiltBacklog;
+    }
+    if unbuilt_hours.is_empty() {
+        return DepegCheck::Clear;
+    }
+
+    let batch = oracle.sub_peg_ratios_in_span_batch(asset, &unbuilt_hours);
+    for (i, hour) in unbuilt_hours.iter().enumerate() {
+        let ratios = batch.get(i as u32).unwrap_or(Vec::new(env));
+        let any_sub_epoch_data = ratios.iter().flatten().count() > 0;
+        if any_sub_epoch_data {
+            if ratios.iter().flatten().any(|p| p < threshold) {
+                return DepegCheck::Depeg;
+            }
+        } else if let Some(s) = slot_for_epoch(ring, newest_epoch, hour) {
+            let is_depeg = match s.provisional_sub_coverage {
+                Some(0) => false,
+                Some(_) => s.peg_ratio < threshold,
+                None => {
+                    s.state != SlotState::Empty
+                        && s.state != SlotState::Disputed
+                        && s.peg_ratio < threshold
+                }
+            };
+            if is_depeg {
+                return DepegCheck::Depeg;
+            }
+        }
+    }
+    DepegCheck::Clear
 }
 
 fn any_epoch_endpoint_down(

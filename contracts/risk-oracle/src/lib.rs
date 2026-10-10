@@ -292,7 +292,10 @@ impl RiskOracle {
         storage::set_first_epoch_if_unset(&env, &asset, s.epoch);
 
         let pending_until = now + SIGNAL_DISPUTE_SECS;
-        let wrote = storage::write_ring_slot(&env, &asset, s.epoch, &s, pending_until);
+        // Hourly fallback path: peg_ratio etc. are the single real
+        // posted reading, not a sub-epoch roll-up, so no coverage
+        // concept applies.
+        let wrote = storage::write_ring_slot(&env, &asset, s.epoch, &s, pending_until, None);
         if !wrote {
             // The ring position for this epoch already holds a strictly
             // newer epoch (the buffer wrapped past it). check_epoch_window
@@ -587,7 +590,15 @@ impl RiskOracle {
             hour,
             sub,
             &storage::HeldSubSlot {
-                state: slot.state,
+                // Disputed, not slot.state's own pre-dispute Pending:
+                // every reader of a held sub-epoch's disposition now
+                // trusts this stored state directly (no separate
+                // SubDispute lookup, R10's own footprint fix), so it
+                // must already read Disputed the instant the dispute
+                // opens. The roll-up FIELDS below still keep this
+                // sub-epoch's own real pre-dispute values, so a later
+                // keeper-wins ruling has real data to bring back.
+                state: sylox_types::SlotState::Disputed,
                 pending_until: slot.pending_until,
                 peg_ratio: slot.peg_ratio,
                 liquidity_2pct: slot.liquidity_2pct,
@@ -739,7 +750,7 @@ impl RiskOracle {
             // hour has a held entry, sub_disposition reads THAT, not
             // the ring, so the ring-only write above alone would
             // never be seen for an hour whose ring has rotated on.
-            storage::set_held_sub_slot_final(&env, &asset, hour, sub);
+            storage::set_held_sub_slot_state(&env, &asset, hour, sub, sylox_types::SlotState::Final);
             events::SubSignalsFinal {
                 asset: asset.clone(),
                 hour,
@@ -860,7 +871,7 @@ impl RiskOracle {
         let bond_key = sylox_types::BondKey::SignalDispute(asset.clone(), sub_start);
         staking.release_bond(&bond_key);
         storage::set_sub_slot_state(&env, &asset, sub_start, sylox_types::SlotState::Final);
-        storage::set_held_sub_slot_final(&env, &asset, hour, sub);
+        storage::set_held_sub_slot_state(&env, &asset, hour, sub, sylox_types::SlotState::Final);
         events::SubSignalsFinal {
             asset: asset.clone(),
             hour,
@@ -1150,7 +1161,7 @@ impl RiskOracle {
                     final_subs.push_back(sub);
                     any_posted = true;
                 }
-                SubDisposition::NotReady => return Err(Error::SubEpochNotReady),
+                SubDisposition::Pending(_) => return Err(Error::SubEpochNotReady),
                 SubDisposition::Disputed => return Err(Error::SubEpochNotReady),
                 SubDisposition::MissingWithinBackfill => return Err(Error::SubEpochNotReady),
                 SubDisposition::PermanentlyMissing => any_posted = true,
@@ -1176,41 +1187,49 @@ impl RiskOracle {
     /// window is still read through `ring()` exactly as before this
     /// revision.
     pub fn sub_peg_ratios(env: Env, asset: Address, hour: u64) -> Vec<Option<i128>> {
-        let sub_epoch_secs = current_sub_epoch_secs(&env, &asset, hour);
-        let per_hour = sub_epochs_per_hour(sub_epoch_secs);
+        sub_peg_ratios_for_one_hour(&env, &asset, hour)
+    }
+
+    /// Section 5.9 S5 (v1.5, footprint-fix revision): `EventRegistry.
+    /// cover_gate`'s own `RecentDepeg` check, for unbuilt hours still
+    /// INSIDE `Sub(asset)`'s own 5-hour span (`SUB_RING_SLOTS *
+    /// SUB_EPOCH_GRID_SECS`), never calling this for an hour outside
+    /// it (the caller's own job to tell apart, using `newest_epoch`
+    /// and those same constants: this function trusts its caller
+    /// completely and does not re-check). Unlike `sub_peg_ratios` /
+    /// the since-removed `sub_peg_ratios_batch`, this NEVER reads
+    /// `HeldHour`: every hour it is asked about is assumed still
+    /// physically present in `Sub(asset)`'s own ring, so `HeldHour` (a
+    /// write-path, build/dispute-only concern, never a gate concern,
+    /// per the Section 5.9 S5 footprint-fix review) plays no part
+    /// here. One cross-contract call for every hour the gate needs,
+    /// touching exactly ONE key (`Sub(asset)`, read once regardless of
+    /// how many hours or sub-epochs are requested) rather than one key
+    /// per hour: this is what makes the gate's own footprint constant
+    /// regardless of how many hours are unbuilt (R10).
+    pub fn sub_peg_ratios_in_span_batch(
+        env: Env,
+        asset: Address,
+        hours: Vec<u64>,
+    ) -> Vec<Vec<Option<i128>>> {
         let mut out = Vec::new(&env);
-        // Section 5.9 S3: checks HeldHour the same way sub_disposition
-        // does, not Sub(asset)'s ring alone. Without this, a held
-        // hour (one with an open or formerly-open dispute, whose data
-        // Sub(asset)'s own ring may since have rotated past) would
-        // read every sub-epoch as None here, going blind to EXACTLY
-        // the depeg-window reads cover_gate's own RecentDepeg check
-        // depends on for an hour that has not built yet.
-        let held = storage::get_held_hour(&env, &asset, hour);
-        for sub in 0..per_hour {
-            let sub_start = sub_start_of(hour, sub, sub_epoch_secs);
-            // A currently Disputed sub-epoch reads None here, same as
-            // the ring path below: spec Section 5.9 S5's own
-            // "Pending or Final" wording for what cover_gate reads,
-            // Disputed deliberately excluded (its own value is
-            // unverified while a ruling is pending).
-            if storage::get_sub_dispute(&env, &asset, hour, sub).is_some() {
-                out.push_back(None);
-                continue;
-            }
-            if let Some(map) = &held {
-                match map.get(sub) {
-                    Some(slot) => out.push_back(Some(slot.peg_ratio)),
-                    None => out.push_back(None),
+        for hour in hours.iter() {
+            let sub_epoch_secs = current_sub_epoch_secs(&env, &asset, hour);
+            let per_hour = sub_epochs_per_hour(sub_epoch_secs);
+            let mut ratios = Vec::new(&env);
+            for sub in 0..per_hour {
+                let sub_start = sub_start_of(hour, sub, sub_epoch_secs);
+                match storage::get_sub_slot(&env, &asset, sub_start) {
+                    Some(slot)
+                        if slot.state != sylox_types::SlotState::Empty
+                            && slot.state != sylox_types::SlotState::Disputed =>
+                    {
+                        ratios.push_back(Some(slot.peg_ratio));
+                    }
+                    _ => ratios.push_back(None),
                 }
-                continue;
             }
-            match storage::get_sub_slot(&env, &asset, sub_start) {
-                Some(slot) if slot.state != sylox_types::SlotState::Empty => {
-                    out.push_back(Some(slot.peg_ratio));
-                }
-                _ => out.push_back(None),
-            }
+            out.push_back(ratios);
         }
         out
     }
@@ -1525,6 +1544,58 @@ fn check_epoch_window(epoch: u64, now: u64) -> Result<(), Error> {
 
 // -- sub-epochs (technical-doc.md Section 5.9, v1.5) --
 
+/// Shared body of `sub_peg_ratios` and `sub_peg_ratios_batch`: `hour`'s
+/// own sub-epoch peg ratios, in `sub` order, `None` for a sub-epoch
+/// that is not posted, Disputed, or not yet effectively Pending/Final
+/// (the same "Pending or Final" convention `cover_gate`'s own
+/// `RecentDepeg` check already read from `Ring(asset)` before v1.5,
+/// extended to `Sub(asset)`/`HeldHour` for an hour that has not built
+/// yet).
+fn sub_peg_ratios_for_one_hour(env: &Env, asset: &Address, hour: u64) -> Vec<Option<i128>> {
+    let sub_epoch_secs = current_sub_epoch_secs(env, asset, hour);
+    let per_hour = sub_epochs_per_hour(sub_epoch_secs);
+    let mut out = Vec::new(env);
+    // Section 5.9 S3: checks HeldHour the same way sub_disposition
+    // does, not Sub(asset)'s ring alone. Without this, a held
+    // hour (one with an open or formerly-open dispute, whose data
+    // Sub(asset)'s own ring may since have rotated past) would
+    // read every sub-epoch as None here, going blind to EXACTLY
+    // the depeg-window reads cover_gate's own RecentDepeg check
+    // depends on for an hour that has not built yet. This touches
+    // at most ONE extra key for the WHOLE hour (R10): `state ==
+    // Disputed` is read straight off whichever slot (held or ring)
+    // this function already fetched, never a separate `SubDispute`
+    // lookup per sub-epoch.
+    let held = storage::get_held_hour(env, asset, hour);
+    for sub in 0..per_hour {
+        let sub_start = sub_start_of(hour, sub, sub_epoch_secs);
+        if let Some(map) = &held {
+            match map.get(sub) {
+                // A currently Disputed sub-epoch reads None here,
+                // same as the ring path below: spec Section 5.9 S5's
+                // own "Pending or Final" wording for what cover_gate
+                // reads, Disputed deliberately excluded (its own
+                // value is unverified while a ruling is pending).
+                Some(slot) if slot.state != sylox_types::SlotState::Disputed => {
+                    out.push_back(Some(slot.peg_ratio));
+                }
+                _ => out.push_back(None),
+            }
+            continue;
+        }
+        match storage::get_sub_slot(env, asset, sub_start) {
+            Some(slot)
+                if slot.state != sylox_types::SlotState::Empty
+                    && slot.state != sylox_types::SlotState::Disputed =>
+            {
+                out.push_back(Some(slot.peg_ratio));
+            }
+            _ => out.push_back(None),
+        }
+    }
+    out
+}
+
 /// Which `sub_epoch_secs` governs `hour`: the asset's current value,
 /// unless a pending change's own `effective_from_hour` is at or
 /// before `hour`, in which case the pending value governs instead
@@ -1624,14 +1695,17 @@ fn check_sub_epoch_window(sub_start: u64, sub_epoch_secs: u64, now: u64) -> Resu
 /// genuinely gone).
 enum SubDisposition {
     Final(RingSlot),
-    /// Posted, not yet past its own `pending_until`, or Disputed.
-    NotReady,
-    /// An open `SubDispute` exists for this sub-epoch. Distinct from
-    /// `NotReady` (which `sub_disposition` previously used for this
-    /// case too, read off the ring alone): `SubDispute` is checked
-    /// directly, so this reads correctly even once `Sub(asset)`'s own
-    /// ring has rotated past this sub-epoch's slot and would
-    /// otherwise misreport it `PermanentlyMissing`.
+    /// Posted, not yet past its own `pending_until`: still Pending,
+    /// never Disputed (that case is `Disputed` below, checked first).
+    /// Carries the slot's own real posted data, same shape as
+    /// `Final`, so a provisional roll-up (Section 5.9 S4's own
+    /// "recomputed on every sub-epoch post") can use a Pending
+    /// sub-epoch's real values instead of treating it as absent.
+    Pending(RingSlot),
+    /// An open `SubDispute` exists for this sub-epoch. Checked
+    /// directly against `SubDispute`, so this reads correctly even
+    /// once `Sub(asset)`'s own ring has rotated past this sub-epoch's
+    /// slot and would otherwise misreport it `PermanentlyMissing`.
     Disputed,
     /// Never posted, still within `sub_backfill_secs` of its own
     /// close: could still be backfilled.
@@ -1660,21 +1734,34 @@ fn sub_slot_to_ring_slot(hour: u64, slot: &storage::SubRingSlot) -> RingSlot {
         clawback_amount: slot.clawback_amount,
         auth_revocations: slot.auth_revocations,
         endpoint: slot.endpoint,
+        // A single sub-epoch's own data, not the hour's rolled-up
+        // slot: coverage is a property of the hour, not one sub-epoch.
+        provisional_sub_coverage: None,
     }
 }
 
-/// `SubDispute` is checked FIRST, directly, before anything the ring
-/// currently shows: a disputed sub-epoch stays `Disputed` for as long
-/// as its `SubDispute(asset, hour, sub)` record exists, however the
-/// ring itself has rotated underneath it in the meantime (Section 5.9
-/// S3's own "the dispute lives outside the ring entirely" design).
-/// Absent a dispute, `HeldHour(asset, hour)` (if this hour has one at
-/// all, i.e. SOME sub-epoch in it was disputed at some point) is
-/// checked next, since the ring may have rotated past this sub-epoch's
-/// own slot too even though it was never itself disputed; only when
-/// neither applies does this fall back to reading `Sub(asset)`'s ring
-/// directly, the ordinary path for the overwhelming majority of hours
-/// that never have any dispute at all.
+/// Checks `HeldHour(asset, hour)` first (if this hour has one at all,
+/// i.e. SOME sub-epoch in it was disputed at some point), since the
+/// ring may have rotated past this sub-epoch's own slot even though
+/// it was never itself disputed; only when `HeldHour` does not exist
+/// for this hour at all does this fall back to reading `Sub(asset)`'s
+/// ring directly, the ordinary path for the overwhelming majority of
+/// hours that never have any dispute. Either way, `state ==
+/// Disputed` is read straight off the already-fetched slot (held or
+/// ring), never from a separate `SubDispute` lookup: `dispute_sub_
+/// signals` writes `Disputed` into BOTH the instant a dispute opens
+/// (and always creates a `HeldHour` entry for the hour in the same
+/// call, so there is no window where the ring says `Disputed` but no
+/// held entry exists yet to carry that forward past ring rotation).
+/// `SubDispute(asset, hour, sub)` itself is read only by the actual
+/// dispute-resolution paths (`dispute_sub_signals`, `resolve_sub_
+/// signal_dispute`, `resolve_sub_dispute_timeout`), which need its
+/// own `disputer`/`alt_hash`/`opened_at` fields; this disposition
+/// check and `sub_peg_ratios_for_one_hour`'s own provisional read
+/// never touch that key at all, so a scan across many sub-epochs
+/// touches at most one key per hour (`HeldHour` or `Sub(asset)`), not
+/// one per sub-epoch, keeping footprint flat regardless of how many
+/// hours are scanned (R10).
 fn sub_disposition(
     env: &Env,
     asset: &Address,
@@ -1684,18 +1771,17 @@ fn sub_disposition(
     sub_epoch_secs: u64,
     now: u64,
 ) -> SubDisposition {
-    if storage::get_sub_dispute(env, asset, hour, sub).is_some() {
-        return SubDisposition::Disputed;
-    }
     if let Some(held) = storage::get_held_hour(env, asset, hour) {
         return match held.get(sub) {
             Some(slot) => {
+                if slot.state == sylox_types::SlotState::Disputed {
+                    return SubDisposition::Disputed;
+                }
                 let effective = effective_sub_state(slot.state, slot.pending_until, now);
+                let ring_slot = held_slot_to_ring_slot(hour, &slot);
                 match effective {
-                    sylox_types::SlotState::Final => {
-                        SubDisposition::Final(held_slot_to_ring_slot(hour, &slot))
-                    }
-                    _ => SubDisposition::NotReady,
+                    sylox_types::SlotState::Final => SubDisposition::Final(ring_slot),
+                    _ => SubDisposition::Pending(ring_slot),
                 }
             }
             None => SubDisposition::PermanentlyMissing,
@@ -1703,12 +1789,14 @@ fn sub_disposition(
     }
     match storage::get_sub_slot(env, asset, sub_start) {
         Some(slot) => {
+            if slot.state == sylox_types::SlotState::Disputed {
+                return SubDisposition::Disputed;
+            }
             let effective = effective_sub_state(slot.state, slot.pending_until, now);
+            let ring_slot = sub_slot_to_ring_slot(hour, &slot);
             match effective {
-                sylox_types::SlotState::Final => {
-                    SubDisposition::Final(sub_slot_to_ring_slot(hour, &slot))
-                }
-                _ => SubDisposition::NotReady,
+                sylox_types::SlotState::Final => SubDisposition::Final(ring_slot),
+                _ => SubDisposition::Pending(ring_slot),
             }
         }
         None => {
@@ -1746,6 +1834,13 @@ fn ensure_hour_held(env: &Env, asset: &Address, hour: u64, sub_epoch_secs: u64) 
     for sub in 0..per_hour {
         let sub_start = sub_start_of(hour, sub, sub_epoch_secs);
         if let Some(slot) = storage::get_sub_slot(env, asset, sub_start) {
+            // Defensive: in practice the ring never shows Disputed
+            // here except for the ONE sub whose own dispute_sub_
+            // signals call is what triggered this scan, and that
+            // sub's own held entry is inserted separately, right
+            // after this scan, with state forced to Disputed
+            // directly (not whatever this stale Pending read would
+            // otherwise capture).
             if slot.state == sylox_types::SlotState::Disputed {
                 continue;
             }
@@ -1772,13 +1867,15 @@ fn ensure_hour_held(env: &Env, asset: &Address, hour: u64, sub_epoch_secs: u64) 
 
 /// Converts a held sub-epoch's roll-up fields into `RingSlot`'s
 /// shape, the same conversion `sub_slot_to_ring_slot` gives a
-/// ring-read `SubRingSlot`. Only ever called once `sub_disposition`
-/// has already confirmed this slot reads effectively Final, so
-/// `state`/`pending_until` themselves are not carried into the
-/// result (`RingSlot::state` is set to `Final` directly); `endpoint`
-/// has no held equivalent (Section 5.9 S4: probes stay hourly), filled
-/// with a placeholder the roll-up never reads for a `Final(slot)`
-/// disposition.
+/// ring-read `SubRingSlot`. Called for both a Final and a Pending
+/// disposition (`sub_disposition`'s own caller decides which one this
+/// slot's data feeds into: the final build or the provisional
+/// roll-up); `state`/`pending_until` are never read back out of the
+/// result by either (`roll_up_sub_slots` only reads the roll-up
+/// fields themselves), so `RingSlot::state` here is a placeholder,
+/// not a real disposition. `endpoint` has no held equivalent (Section
+/// 5.9 S4: probes stay hourly), filled with its own placeholder for
+/// the same reason.
 fn held_slot_to_ring_slot(hour: u64, slot: &storage::HeldSubSlot) -> RingSlot {
     RingSlot {
         epoch: hour,
@@ -1792,6 +1889,8 @@ fn held_slot_to_ring_slot(hour: u64, slot: &storage::HeldSubSlot) -> RingSlot {
         clawback_amount: slot.clawback_amount,
         auth_revocations: slot.auth_revocations,
         endpoint: EndpointStatus::Unknown,
+        // A single sub-epoch's own data, same as sub_slot_to_ring_slot.
+        provisional_sub_coverage: None,
     }
 }
 
@@ -1800,17 +1899,33 @@ fn held_slot_to_ring_slot(hour: u64, slot: &storage::HeldSubSlot) -> RingSlot {
 /// sub-epoch post, dispute, resolution or timeout that could have
 /// changed the hour's own picture. Three outcomes:
 ///
-/// - Any sub-epoch Disputed: the hour's slot becomes `Disputed`,
-///   regardless of the others' state.
 /// - Every sub-epoch decided (Final, PermanentlyMissing, or genuinely
 ///   absent past its own backfill window) and none Disputed: attempts
 ///   the build (`try_build_hour`).
-/// - Otherwise (at least one sub-epoch still Pending or
-///   MissingWithinBackfill, none Disputed): the hour's slot becomes
-///   `Pending` with `pending_until = HOUR_PENDING_SENTINEL`, and its
-///   fields hold a provisional roll-up from whichever sub-epochs are
-///   currently Final, so a Pending-tolerant reader (the cover gate,
-///   display) sees real numbers while it waits.
+/// - Otherwise (at least one sub-epoch Disputed, still Pending, or
+///   MissingWithinBackfill): if at least one sub-epoch has actually
+///   been POSTED (Pending or Final; a currently Disputed sub-epoch is
+///   excluded from this list by the match arms below, same rule
+///   `sub_peg_ratios` uses), the hour's slot becomes `Pending` or
+///   `Disputed` (matching whether any sub-epoch is currently
+///   disputed) with `pending_until = HOUR_PENDING_SENTINEL`, and its
+///   fields hold a provisional roll-up computed from every posted,
+///   non-disputed sub-epoch, tagged with `provisional_sub_coverage =
+///   Some(posted_slots.len())`, so a Pending-tolerant reader (the
+///   cover gate, display) sees the real posted values immediately,
+///   not zeros waiting for the first sub-epoch to clear its own
+///   dispute window, AND NOT a zeroed slot just because one OTHER
+///   sub-epoch happens to be under dispute (Section 5.9 S5's own
+///   footprint-fix review: a disputed sub-epoch must only exclude
+///   itself, never its whole hour's other, healthy sub-epochs). If
+///   NOTHING has been posted for this hour at all yet (including the
+///   case where every posted sub-epoch is currently disputed, i.e.
+///   `provisional_sub_coverage` would be `Some(0)`), the hour's own
+///   ring slot is written (if disputed, so a dispute without ANY
+///   healthy sub-epoch is still visible as `Disputed`) or left
+///   untouched (if not disputed at all, genuinely `Empty`, not a
+///   `Pending` slot holding an all-zero roll-up a Pending-tolerant
+///   reader could mistake for real, if implausible, data).
 fn refresh_waiting_hour(
     env: &Env,
     config: &Config,
@@ -1825,15 +1940,26 @@ fn refresh_waiting_hour(
     let mut all_decided = true;
     let mut final_slots: Vec<RingSlot> = Vec::new(env);
     let mut final_subs: Vec<u32> = Vec::new(env);
+    // Every POSTED sub-epoch (Pending or Final, never Disputed), for
+    // the provisional roll-up only; `final_slots`/`final_subs` above
+    // stay Final-only, feeding the real build exactly as before.
+    let mut posted_slots: Vec<RingSlot> = Vec::new(env);
+    let mut posted_subs: Vec<u32> = Vec::new(env);
 
     for sub in 0..per_hour {
         let sub_start = sub_start_of(hour, sub, sub_epoch_secs);
         match sub_disposition(env, asset, hour, sub, sub_start, sub_epoch_secs, now) {
             SubDisposition::Final(slot) => {
-                final_slots.push_back(slot);
+                final_slots.push_back(slot.clone());
                 final_subs.push_back(sub);
+                posted_slots.push_back(slot);
+                posted_subs.push_back(sub);
             }
-            SubDisposition::NotReady => all_decided = false,
+            SubDisposition::Pending(slot) => {
+                all_decided = false;
+                posted_slots.push_back(slot);
+                posted_subs.push_back(sub);
+            }
             SubDisposition::Disputed => {
                 any_disputed = true;
                 all_decided = false;
@@ -1843,20 +1969,48 @@ fn refresh_waiting_hour(
         }
     }
 
-    if any_disputed {
-        storage::force_set_slot_disputed(env, asset, hour);
-        return Ok(());
-    }
-
-    if all_decided {
+    if all_decided && !any_disputed {
         return try_build_hour(env, config, asset, hour, &final_slots, &final_subs);
     }
 
-    // Still waiting on at least one sub-epoch: write the hour Pending
-    // with the sentinel, never Empty, and a provisional roll-up from
-    // whatever is Final so far.
-    let provisional = roll_up_sub_slots(env, config, asset, hour, &final_slots, &final_subs)?;
-    storage::write_ring_slot(env, asset, hour, &provisional, HOUR_PENDING_SENTINEL);
+    if posted_slots.is_empty() {
+        if any_disputed {
+            // Every posted sub-epoch is currently disputed: zero real
+            // coverage, but the dispute itself must still be visible
+            // (a brand-new hour's slot may never have been written at
+            // all, so force_set_slot_disputed's own unconditional
+            // write, not write_ring_slot's newer-wins-guarded one, is
+            // still needed here). Some(0), never a bare zero peg_ratio
+            // read as a real value: the gate treats this as no signal.
+            storage::force_set_slot_disputed(
+                env,
+                asset,
+                hour,
+                HOUR_PENDING_SENTINEL,
+                &empty_hour_signal_set(env, asset, hour),
+                Some(0),
+            );
+        }
+        // Nothing posted and nothing disputed either: leave the ring
+        // slot untouched rather than writing a Pending sentinel over
+        // genuinely no data.
+        return Ok(());
+    }
+
+    let provisional = roll_up_sub_slots(env, config, asset, hour, &posted_slots, &posted_subs)?;
+    let coverage = Some(posted_slots.len() as u32);
+    if any_disputed {
+        storage::force_set_slot_disputed(
+            env,
+            asset,
+            hour,
+            HOUR_PENDING_SENTINEL,
+            &provisional,
+            coverage,
+        );
+    } else {
+        storage::write_ring_slot(env, asset, hour, &provisional, HOUR_PENDING_SENTINEL, coverage);
+    }
     Ok(())
 }
 
@@ -2067,6 +2221,9 @@ fn try_build_hour(
             hour,
             &empty_hour_signal_set(env, asset, hour),
             0,
+            // Built (even below coverage, down to Empty): no longer a
+            // waiting hour, so no provisional coverage concept applies.
+            None,
         );
         storage::set_slot_overturned(env, asset, hour);
         // This hour's own held data (if any) is no longer needed once
@@ -2098,7 +2255,8 @@ fn try_build_hour(
     // it to Final in the same call, mirroring how resolve_signal_
     // dispute's keeper-wins path already composes these two calls for
     // the hourly path.
-    let wrote = storage::write_ring_slot(env, asset, hour, &built, 0);
+    // Built, Final: no longer a waiting hour.
+    let wrote = storage::write_ring_slot(env, asset, hour, &built, 0, None);
     if wrote {
         storage::set_slot_final(env, asset, hour);
     }

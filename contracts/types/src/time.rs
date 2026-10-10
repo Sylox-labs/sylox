@@ -104,3 +104,55 @@ const _: () = assert!(
 /// Build-time check (Section 5.9 S7, bullet 3): the cure window still
 /// fits `CureProgress`'s own `u128` bitmap, one bit per cure epoch.
 const _: () = assert!(MAX_CURE_EPOCHS <= 128);
+
+/// `EventRegistry.cover_gate`'s own `RecentDepeg` check: the most
+/// unbuilt hours in the trailing depeg window `depeg_check` may scan
+/// before it must instead return `UnbuiltBacklog` (Section 5.9 S5,
+/// R10), rather than making its own batched read at all.
+///
+/// Set at `RING_SLOTS - AGGREGATE_SLOTS_7D + 1 = 73`: the structural
+/// maximum a Depeg definition's own window can ever produce
+/// (`register_definition`'s own `window_epochs + BASELINE_EPOCHS <=
+/// RING_SLOTS` check, `BASELINE_EPOCHS == AGGREGATE_SLOTS_7D`, plus
+/// one for `depeg_check`'s own inclusive loop bound), so this cap
+/// never actually triggers `UnbuiltBacklog` in normal operation; it
+/// exists as a documented, enforced ceiling against anything that
+/// could widen that window later, not because 73 is itself close to
+/// risky.
+///
+/// Since the Section 5.9 S5 footprint-fix revision (the gate reads
+/// `Sub(asset)`, never `HeldHour`, plus `Ring(asset)`'s own
+/// `provisional_sub_coverage`-tagged roll-up outside the 5 hour
+/// span), `cover_gate`'s own footprint stays a FLAT 9 entries
+/// regardless of how many hours are unbuilt or disputed (measured at
+/// 1, 12, 72 and 73 unbuilt hours identically; see
+/// `event-registry/src/budget_test.rs`'s own
+/// `budget_cover_gate_footprint_is_constant_from_1_to_72_unbuilt_
+/// hours`), so footprint no longer constrains this cap at all.
+/// Memory is the one dimension that still scales with hour count, and
+/// is what actually sets this cap's own real margin: 73 unbuilt
+/// hours, every one also under an open dispute (the costlier of the
+/// two per-hour paths this cap has to account for), measures
+/// 8,065,785 bytes, about 19.2% of `TX_MEMORY_LIMIT_BYTES`
+/// (41,943,040), a roughly 5.2x margin — comfortable, but the
+/// binding constraint, not footprint or instructions (instructions:
+/// 24,400,161, about 6.1% of `TX_MAX_INSTRUCTIONS`, a roughly 16.4x
+/// margin, the least binding of the three). See
+/// `event-registry/src/budget_test.rs`'s own
+/// `budget_cover_gate_at_the_structural_cap_every_hour_disputed`.
+pub const MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE: u32 = 73;
+
+/// Build-time check: the cap above matches the structural ceiling
+/// `register_definition`'s own window-size check enforces
+/// (`RING_SLOTS - AGGREGATE_SLOTS_7D + 1`), so the two can never
+/// silently drift apart if either changes. The cap's own real memory
+/// margin under `TX_MEMORY_LIMIT_BYTES` (about 5.2x, see this
+/// constant's own doc comment) is empirical, not a formula a
+/// build-time assertion can check; that number is re-verified by
+/// `event-registry/src/budget_test.rs`'s own
+/// `budget_cover_gate_at_the_structural_cap_every_hour_disputed`
+/// every time the test suite runs, which is the actual guard against
+/// a regression here.
+const _: () = assert!(
+    MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE == (RING_SLOTS - AGGREGATE_SLOTS_7D + 1)
+);

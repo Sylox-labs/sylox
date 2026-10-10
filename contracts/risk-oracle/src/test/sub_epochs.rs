@@ -256,6 +256,82 @@ fn waiting_hour_holds_a_provisional_rollup_not_zeros() {
     );
 }
 
+/// Found on testnet (not caught by `waiting_hour_holds_a_provisional_
+/// rollup_not_zeros` above, which only exercises `live()`'s own
+/// per-sub-epoch read, never `Ring(asset)`'s own write path):
+/// `Ring(asset)`'s own provisional slot for a waiting hour must hold
+/// the real mean of whatever sub-epochs have POSTED (Pending or
+/// Final), not an all-zero roll-up, the instant nothing has cleared
+/// its own dispute window yet. Before the fix, `refresh_waiting_hour`
+/// only fed Final sub-epochs into the provisional roll-up, so a
+/// freshly posted (still Pending) sub-epoch's real data never reached
+/// `Ring(asset)` at all until SIGNAL_DISPUTE_SECS later, and any
+/// reader of `ring()` directly (`EventRegistry.cover_gate`'s own
+/// `any_epoch_below_threshold`) saw peg_ratio 0, a false depeg.
+#[test]
+fn waiting_hour_s_ring_slot_holds_real_values_before_any_sub_epoch_clears_its_window() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let keeper = Address::generate(&env);
+    let hour = REALISTIC_EPOCH_BASE;
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+
+    post_sub(
+        &env,
+        &fx.client,
+        &keeper,
+        &asset,
+        hour,
+        0,
+        sub_epoch_secs,
+        9_900_000,
+    );
+    post_sub(
+        &env,
+        &fx.client,
+        &keeper,
+        &asset,
+        hour,
+        1,
+        sub_epoch_secs,
+        10_100_000,
+    );
+
+    // Neither sub-epoch has cleared its own SIGNAL_DISPUTE_SECS
+    // window yet (post_sub leaves `now` at each sub-epoch's own
+    // close, never its own pending_until): both are still Pending.
+    let ring = fx.client.ring(&asset);
+    let slot = ring
+        .iter()
+        .find(|s| s.epoch == hour)
+        .expect("a waiting hour with at least one posted sub-epoch must have a ring slot");
+    assert_eq!(slot.state, SlotState::Pending);
+    assert_eq!(
+        slot.peg_ratio,
+        (9_900_000 + 10_100_000) / 2,
+        "the provisional roll-up must be the mean of the two POSTED (still Pending) \
+         sub-epochs, not zero"
+    );
+}
+
+/// Companion to the test above: with NOTHING posted for an hour at
+/// all yet, its `Ring(asset)` slot must stay genuinely absent
+/// (`epoch != hour`, the same representation a never-touched hour
+/// already has), never a `Pending` slot holding an all-zero roll-up
+/// that a reader could mistake for real (if implausible) data.
+#[test]
+fn an_hour_with_nothing_posted_yet_has_no_ring_slot_at_all() {
+    let env = Env::default();
+    let (fx, asset) = setup_with_asset(&env);
+    let hour = REALISTIC_EPOCH_BASE;
+
+    let ring = fx.client.ring(&asset);
+    assert!(
+        ring.iter().all(|s| s.epoch != hour),
+        "an hour nobody has posted anything for must not appear in the ring at all"
+    );
+}
+
 /// S4: with full coverage, `build_hour` writes Final with the
 /// correctly computed roll-up for each field.
 #[test]

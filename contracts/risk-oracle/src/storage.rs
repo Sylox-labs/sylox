@@ -473,6 +473,7 @@ pub fn write_ring_slot(
     epoch: u64,
     signals: &SignalSet,
     pending_until: u64,
+    provisional_sub_coverage: Option<u32>,
 ) -> bool {
     let mut packed = get_ring_packed(env, asset);
     let index = position_of(epoch);
@@ -493,6 +494,7 @@ pub fn write_ring_slot(
         clawback_amount: signals.issuer_actions.clawback_amount,
         auth_revocations: signals.issuer_actions.auth_revocations,
         endpoint: signals.endpoint,
+        provisional_sub_coverage,
     };
     // A fresh post always starts unannounced: either this epoch has
     // never been posted before, or it is a repost after an overturn
@@ -667,10 +669,28 @@ pub fn set_slot_disputed(env: &Env, asset: &Address, epoch: u64) {
 /// a brand-new hour can arrive while that hour's own slot has never
 /// been written at all; this function is what lets that first dispute
 /// still mark the hour `Disputed` rather than being silently dropped.
-/// `pending_until` is set to `HOUR_PENDING_SENTINEL` by the caller
-/// (`lib.rs`), never derived here, matching every other waiting-hour
-/// write.
-pub fn force_set_slot_disputed(env: &Env, asset: &Address, epoch: u64) -> bool {
+///
+/// Unlike the old all-zero write this replaces, `signals` carries the
+/// REAL provisional roll-up of this hour's other, non-disputed
+/// sub-epochs (`refresh_waiting_hour`'s own `roll_up_sub_slots` call,
+/// or `empty_hour_signal_set` when every posted sub-epoch happens to
+/// be disputed): a disputed sub-epoch must exclude only itself, never
+/// zero out its whole hour's otherwise-healthy data (the footprint-fix
+/// review's own finding). `provisional_sub_coverage` is the explicit
+/// marker a reader uses instead of inferring from `peg_ratio` or
+/// `pending_until`: `Some(0)` means zero real coverage (every posted
+/// sub-epoch disputed), `Some(n > 0)` means `n` non-disputed
+/// sub-epochs contributed to `signals`. `pending_until` is set to
+/// `HOUR_PENDING_SENTINEL` by the caller (`lib.rs`), never derived
+/// here, matching every other waiting-hour write.
+pub fn force_set_slot_disputed(
+    env: &Env,
+    asset: &Address,
+    epoch: u64,
+    pending_until: u64,
+    signals: &SignalSet,
+    provisional_sub_coverage: Option<u32>,
+) -> bool {
     let mut packed = get_ring_packed(env, asset);
     let index = position_of(epoch);
     let existing = read_slot(&packed, index);
@@ -684,7 +704,16 @@ pub fn force_set_slot_disputed(env: &Env, asset: &Address, epoch: u64) -> bool {
     let slot = RingSlot {
         epoch,
         state: SlotState::Disputed,
-        ..empty_slot()
+        pending_until,
+        peg_ratio: signals.peg_ratio,
+        liquidity_2pct: signals.liquidity_2pct,
+        redemption_net: signals.redemption_net,
+        supply: signals.supply,
+        supply_change_bps: signals.supply_change_bps,
+        clawback_amount: signals.issuer_actions.clawback_amount,
+        auth_revocations: signals.issuer_actions.auth_revocations,
+        endpoint: signals.endpoint,
+        provisional_sub_coverage,
     };
     write_slot(&mut packed, index, &slot, false);
     env.storage()
@@ -827,6 +856,7 @@ fn empty_slot() -> RingSlot {
         clawback_amount: 0,
         auth_revocations: 0,
         endpoint: EndpointStatus::Unknown,
+        provisional_sub_coverage: None,
     }
 }
 
@@ -845,6 +875,35 @@ fn byte_state(b: u8) -> SlotState {
         2 => SlotState::Disputed,
         3 => SlotState::Final,
         _ => SlotState::Empty,
+    }
+}
+
+/// Packs `RingSlot.provisional_sub_coverage` into byte 107 (one of the
+/// slot's spare padding bytes, alongside byte 106's `final_announced`).
+/// `0xFF` means `None`; every other byte value is the coverage count
+/// itself, so the valid range is 0 to 12 (`sub_epochs_per_hour`'s own
+/// maximum, `SUB_EPOCH_SECS_MIN`'s own 300s giving `3,600 / 300 = 12`).
+/// Panics on a value above 12, the same "decode what was written, or
+/// trap" contract `read_slot`'s own doc comment already states for
+/// this file: nothing in this contract can ever WRITE more than 12
+/// here, so a value above it on read means storage corruption, not a
+/// case to silently coerce.
+fn coverage_byte(coverage: Option<u32>) -> u8 {
+    match coverage {
+        None => 0xFF,
+        Some(n) => {
+            assert!(n <= 12, "provisional_sub_coverage out of range: {n}");
+            n as u8
+        }
+    }
+}
+
+fn byte_coverage(b: u8) -> Option<u32> {
+    if b == 0xFF {
+        None
+    } else {
+        assert!(b <= 12, "stored provisional_sub_coverage byte out of range: {b}");
+        Some(b as u32)
     }
 }
 
@@ -907,6 +966,7 @@ fn write_slot(packed: &mut Bytes, index: u32, slot: &RingSlot, final_announced: 
     buf[101..105].copy_from_slice(&slot.auth_revocations.to_le_bytes());
     buf[105] = endpoint_byte(slot.endpoint);
     buf[106] = final_announced as u8;
+    buf[107] = coverage_byte(slot.provisional_sub_coverage);
 
     packed.copy_from_slice(base, &buf);
 }
@@ -936,6 +996,7 @@ fn read_slot(packed: &Bytes, index: u32) -> RingSlot {
         clawback_amount: read_i128(&buf, 85),
         auth_revocations: read_u32(&buf, 101),
         endpoint: byte_endpoint(buf[105]),
+        provisional_sub_coverage: byte_coverage(buf[107]),
     }
 }
 
@@ -1458,15 +1519,18 @@ pub fn insert_held_sub_slot(
         .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
 }
 
-/// Marks `sub`'s own held entry Final (the keeper-wins resolution
-/// path): mirrors `set_sub_slot_state`'s role for the ring, needed
-/// because `sub_disposition` prefers `HeldHour` over the ring once it
-/// exists for `hour`, so the ring's OWN `set_sub_slot_state(Final)`
-/// write is no longer the source of truth for this sub-epoch once it
-/// has been copied out. A no-op if `hour` has no held entry at all
-/// (the ordinary case: most disputes resolve long before the ring
-/// ever needs `HeldHour` in the first place, so nothing to update).
-pub fn set_held_sub_slot_final(env: &Env, asset: &Address, hour: u64, sub: u32) {
+/// Sets `sub`'s own held entry's `state` directly: mirrors
+/// `set_sub_slot_state`'s role for the ring, needed because every
+/// reader of a held hour's sub-epoch disposition (`sub_disposition`,
+/// `sub_peg_ratios_for_one_hour`'s own provisional read, the cover
+/// gate via the batched read) now trusts THIS stored `state` alone,
+/// never a separate `SubDispute` lookup, so `Sub(asset)`'s own ring
+/// write is no longer the source of truth for a sub-epoch once it has
+/// been copied out into `HeldHour`. A no-op if `hour` has no held
+/// entry at all (the ordinary case: most disputes resolve long before
+/// the ring ever needs `HeldHour` in the first place, so nothing to
+/// update).
+pub fn set_held_sub_slot_state(env: &Env, asset: &Address, hour: u64, sub: u32, state: SlotState) {
     let key = DataKey::HeldHour(asset.clone(), hour);
     if let Some(mut map) = env
         .storage()
@@ -1474,7 +1538,7 @@ pub fn set_held_sub_slot_final(env: &Env, asset: &Address, hour: u64, sub: u32) 
         .get::<_, soroban_sdk::Map<u32, HeldSubSlot>>(&key)
     {
         if let Some(mut slot) = map.get(sub) {
-            slot.state = SlotState::Final;
+            slot.state = state;
             map.set(sub, slot);
             env.storage().persistent().set(&key, &map);
         }

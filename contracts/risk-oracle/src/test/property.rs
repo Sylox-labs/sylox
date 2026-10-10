@@ -128,10 +128,10 @@ proptest! {
 
         env.as_contract(&contract_id, || {
             let s1 = signal_set(first_epoch);
-            let wrote_first = crate::storage::write_ring_slot(&env, &asset, first_epoch, &s1, 1_000_000);
+            let wrote_first = crate::storage::write_ring_slot(&env, &asset, first_epoch, &s1, 1_000_000, None);
 
             let s2 = signal_set(second_epoch);
-            let wrote_second = crate::storage::write_ring_slot(&env, &asset, second_epoch, &s2, 2_000_000);
+            let wrote_second = crate::storage::write_ring_slot(&env, &asset, second_epoch, &s2, 2_000_000, None);
 
             if crate::storage::position_of(first_epoch) == crate::storage::position_of(second_epoch)
                 && first_epoch != second_epoch

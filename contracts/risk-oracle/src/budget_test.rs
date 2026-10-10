@@ -283,6 +283,65 @@ fn budget_finality_backward_scan_across_a_full_backfill_window() {
     );
 }
 
+/// The sub-epoch path's own exposure to the SAME `try_advance_
+/// finality` sweep the hourly path's own
+/// `budget_finality_backward_scan_across_a_full_backfill_window`
+/// (above) measures: `post_sub_signals` calls the identical
+/// `try_advance_finality(&env, &config, &asset,
+/// FINALITY_LOOKBACK_EPOCHS)` inline, over the SAME `Ring(asset)`
+/// (the hourly ring, never `Sub(asset)`, since finality is always an
+/// hourly concept), so a 71 epoch missing gap costs the sub-epoch
+/// path exactly as much as it costs the hourly one. No separate
+/// bound is needed (the sweep is already capped at
+/// `FINALITY_LOOKBACK_EPOCHS`, shared by both paths), but this proves
+/// the sub-epoch path's own call site is not secretly worse (e.g. an
+/// extra per-hour cost stacking on top of the shared scan).
+#[test]
+fn budget_post_sub_signals_finality_scan_across_a_full_backfill_window() {
+    let env = Env::default();
+    let (client, asset) = setup(&env);
+    let next_epoch = warm_full_ring(&env, &client, &asset);
+    let keeper = Address::generate(&env);
+
+    env.ledger().set_timestamp((next_epoch + 1) * 3_600);
+    client.post_signals(&keeper, &asset, &signal_set(&env, next_epoch, 9_900_000));
+    // The next 71 hours intentionally never posted at all (neither
+    // path), leaving Ring(asset)'s own gap for the sweep to walk.
+    let gap_start = next_epoch + 1;
+    let resume_hour = gap_start + 71;
+
+    env.ledger().set_timestamp(resume_hour * 3_600 + 300);
+    client.post_sub_signals(
+        &keeper,
+        &asset,
+        &resume_hour,
+        &0u32,
+        &sub_signal_set(&env, resume_hour, 9_900_000),
+    );
+
+    let estimate = env.cost_estimate();
+    print_resources(
+        "post_sub_signals, full ring, try_advance_finality scanning a 71 epoch missing gap",
+        &estimate,
+    );
+
+    assert_eq!(
+        client.score(&asset).epoch,
+        next_epoch - 2,
+        "the measured call's backward scan must walk nearly the full 71 epoch gap, \
+         not stop early; a different result here means this test is not actually \
+         measuring the scenario it claims to"
+    );
+
+    let resources = estimate.resources();
+    assert!(
+        (resources.instructions as u64) < TX_MAX_INSTRUCTIONS / 2,
+        "must stay under 50% of tx_max_instructions ({TX_MAX_INSTRUCTIONS}) even at \
+         this scan's worst case; got {}",
+        resources.instructions
+    );
+}
+
 /// Issue #11 fix (feat/treasury): the worst case for
 /// `reward_posters_for_newly_final_epochs` is a FULL backfill window
 /// (`FINALITY_LOOKBACK_EPOCHS`, 73 at the defaults) becoming Final in
