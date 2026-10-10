@@ -102,3 +102,33 @@ jobs:
             fi
           done
           exit $status
+
+  web:
+    name: web workspace (typecheck, lint, test, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      # Installs both web/landing and web/shared/ui (npm workspaces
+      # declared in the repo-root package.json) in one pass.
+      - run: npm ci
+      - name: Typecheck web/shared/ui
+        run: npx tsc --noEmit
+        working-directory: web/shared/ui
+      - name: Typecheck web/landing
+        run: npx tsc --noEmit
+        working-directory: web/landing
+      - name: Lint web/landing
+        run: npm run lint
+        working-directory: web/landing
+      - name: Unit tests, web/shared/ui
+        run: npm test
+        working-directory: web/shared/ui
+      - name: Unit tests, web/landing
+        run: npm test
+        working-directory: web/landing
+      - name: Build web/landing
+        run: npm run build -w web/landing
