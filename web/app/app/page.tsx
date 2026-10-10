@@ -90,12 +90,8 @@ export default function ExplorerPage() {
 }
 
 function AssetCard({ row }: { row: ExplorerAssetRow }) {
-  // No Asset screen exists yet (Phase A stops after Explorer), so this
-  // isn't a link yet - a card that goes to a 404 is worse than a card
-  // that doesn't go anywhere. Swap back to Card href={`/asset/${row.asset}`}
-  // once that route exists.
   return (
-    <Card className="flex flex-col gap-4">
+    <Card href={`/asset/${row.asset}`} className="flex flex-col gap-4">
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
           <p className="truncate font-display text-xl text-silo-oatmeal">{row.code}</p>
