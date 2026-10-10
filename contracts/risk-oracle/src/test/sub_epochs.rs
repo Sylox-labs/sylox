@@ -1447,28 +1447,46 @@ mod property {
     const PROPERTY_HOUR: u64 = REALISTIC_EPOCH_BASE;
     const MAX_SUBS_AT_300S: u32 = 12;
 
-    /// One step of the random sequence. `sub` is taken modulo
-    /// whatever `per_hour` actually is at the time the step runs (the
-    /// strategy below generates it in `0..MAX_SUBS_AT_300S`, the
-    /// widest range any allowed interval needs, so a step is never
-    /// silently impossible to generate regardless of the current
-    /// interval).
-    #[derive(Clone, Debug)]
+    /// Which sub-epoch a step targets. Resolved against RUNTIME
+    /// state (which sub was most recently overturned or reposted),
+    /// never decided at strategy-generation time: `proptest`
+    /// generates every step's own data upfront, before the sequence
+    /// runs, so there is no way for a literal `sub: u32` field to
+    /// "know" what happened in an earlier step. `Focus` defers that
+    /// decision to the execution loop instead.
+    #[derive(Clone, Copy, Debug)]
+    enum SubChoice {
+        /// Target whichever sub-epoch the execution loop's own
+        /// `focus_sub` currently points at (the one most recently
+        /// overturned or successfully reposted), falling back to
+        /// `fallback` if nothing has been focused on yet.
+        Focus { fallback: u32 },
+        /// Target this exact sub-epoch, ignoring any current focus.
+        Explicit(u32),
+    }
+
+    /// One step of the random sequence. A literal `sub: u32` field
+    /// (via `SubChoice::Explicit`) is taken modulo whatever `per_hour`
+    /// actually is at the time the step runs (the strategy below
+    /// generates it in `0..MAX_SUBS_AT_300S`, the widest range any
+    /// allowed interval needs, so a step is never silently impossible
+    /// to generate regardless of the current interval).
+    #[derive(Clone, Copy, Debug)]
     enum Step {
         /// Post `sub` with `peg_ratio`, if it has not already been
         /// posted for the current hour/interval and the window
         /// accepts it.
-        Post { sub: u32, peg_ratio: i128 },
+        Post { sub: SubChoice, peg_ratio: i128 },
         /// Dispute `sub`, if it is currently Pending and within its
         /// own dispute window.
-        Dispute { sub: u32 },
+        Dispute { sub: SubChoice },
         /// Resolve `sub`'s own open dispute, if any, via committee
         /// ruling.
-        Rule { sub: u32, keeper_wins: bool },
+        Rule { sub: SubChoice, keeper_wins: bool },
         /// Resolve `sub`'s own open dispute via the timeout path
         /// (ADR-010's default-favors-the-data outcome), if its ruling
         /// deadline has passed.
-        Timeout { sub: u32 },
+        Timeout { sub: SubChoice },
         /// Advance the ledger clock forward by `secs`.
         AdvanceTime { secs: u64 },
         /// Call the permissionless `build_hour` trigger directly.
@@ -1477,21 +1495,60 @@ mod property {
         ChangeInterval { secs_index: u8 },
     }
 
-    /// `Dispute`/`Rule`/`Timeout` all draw `sub` from this much
-    /// narrower pool (not the full `0..MAX_SUBS_AT_300S`): a dispute
-    /// opened on one random sub-epoch and a later ruling against a
-    /// SEPARATELY, independently random sub-epoch almost never
-    /// target the same one across a short sequence, which starves
-    /// this property of the exact cross-step correlation (dispute,
-    /// then a later rule/timeout against THAT SAME sub) it exists to
-    /// exercise. A pool of 3 keeps the generator still exploring
-    /// which of several sub-epochs gets disputed, while making a
-    /// dispute/rule or two-disputes-in-one-hour collision likely
-    /// within a 40 step sequence. `Post` keeps the full range: an
-    /// un-posted, never-disputed sub-epoch (one of the other 9 at the
-    /// 300s default) is exactly how `MissingWithinBackfill`/
+    /// `Dispute`/`Rule`/`Timeout`'s own `fallback` (used only until
+    /// `focus_sub` is set by a first overturn or repost) draws from
+    /// this much narrower pool (not the full `0..MAX_SUBS_AT_300S`):
+    /// a dispute opened on one random sub-epoch and a later ruling
+    /// against a SEPARATELY, independently random sub-epoch almost
+    /// never target the same one across a short sequence, which
+    /// starves this property of the exact cross-step correlation
+    /// (dispute, then a later rule/timeout against THAT SAME sub) it
+    /// exists to exercise. A pool of 3 keeps the generator still
+    /// exploring which of several sub-epochs gets disputed before any
+    /// focus exists, while making a dispute/rule or two-disputes-in-
+    /// one-hour collision likely within a 40 step sequence. `Post`
+    /// keeps the full range for its own fallback: an un-posted,
+    /// never-disputed sub-epoch (one of the other 9 at the 300s
+    /// default) is exactly how `MissingWithinBackfill`/
     /// `PermanentlyMissing` get exercised.
     const DISPUTE_SUB_POOL: u32 = 3;
+
+    /// How often `Dispute`/`Rule`/`Post` target `focus_sub` (the most
+    /// recently overturned or reposted sub-epoch) instead of a fresh,
+    /// independently random one: weighted 70/30 via `prop_oneof!`'s
+    /// own relative-weight mechanism (7 against 3), matching the
+    /// engineer's own "with high probability (say 70%)" instruction.
+    /// Without this bias, reaching the specific 6-step chain a
+    /// repost's own second overturn needs (dispute sub X, reject,
+    /// repost X, dispute X again, reject again, attempt a third post)
+    /// requires the SAME sub to be independently redrawn for
+    /// `Dispute`/`Rule` twice in a row out of the 3-sub fallback pool,
+    /// which empirically never happened within 300 cases of up to 80
+    /// steps each (verified by hand, reintroducing the exact
+    /// one-repost-per-overturn bug and confirming this test did NOT
+    /// catch it before this bias was added).
+    fn sub_choice(fallback_pool: u32) -> impl Strategy<Value = SubChoice> {
+        prop_oneof![
+            19 => (0..fallback_pool).prop_map(|fallback| SubChoice::Focus { fallback }),
+            1 => (0..fallback_pool).prop_map(SubChoice::Explicit),
+        ]
+    }
+
+    /// `Rule`'s own `keeper_wins` outcome, biased toward `false`
+    /// (the disputer winning, overturning the sub-epoch) at the same
+    /// 70/30 ratio as `sub_choice`'s own Focus bias: the repost
+    /// double-overturn chain needs TWO rejecting rulings in a row
+    /// against the focused sub, not just two rulings, so leaving
+    /// `keeper_wins` at a uniform 50/50 would still make that chain
+    /// roughly `0.7^4 * 0.5^2 ≈ 6%` likely per attempt (needing
+    /// Focus to hit 4 times AND both rulings to land `false`), far
+    /// below what reliably reproduces within the default case count.
+    fn keeper_wins_choice() -> impl Strategy<Value = bool> {
+        prop_oneof![
+            3 => Just(true),
+            7 => Just(false),
+        ]
+    }
 
     /// Named jumps, each tied to a specific protocol boundary, rather
     /// than a continuous random range: a uniform range wide enough to
@@ -1535,12 +1592,12 @@ mod property {
     /// through a window boundary when the sequence needs to.
     fn step_strategy() -> impl Strategy<Value = Step> {
         prop_oneof![
-            6 => (0..MAX_SUBS_AT_300S, 9_000_000i128..=10_100_000i128)
+            6 => (sub_choice(MAX_SUBS_AT_300S), 9_000_000i128..=10_100_000i128)
                 .prop_map(|(sub, peg_ratio)| Step::Post { sub, peg_ratio }),
-            6 => (0..DISPUTE_SUB_POOL).prop_map(|sub| Step::Dispute { sub }),
-            6 => (0..DISPUTE_SUB_POOL, any::<bool>())
+            6 => sub_choice(DISPUTE_SUB_POOL).prop_map(|sub| Step::Dispute { sub }),
+            6 => (sub_choice(DISPUTE_SUB_POOL), keeper_wins_choice())
                 .prop_map(|(sub, keeper_wins)| Step::Rule { sub, keeper_wins }),
-            3 => (0..DISPUTE_SUB_POOL).prop_map(|sub| Step::Timeout { sub }),
+            3 => sub_choice(DISPUTE_SUB_POOL).prop_map(|sub| Step::Timeout { sub }),
             2 => advance_time_secs().prop_map(|secs| Step::AdvanceTime { secs }),
             3 => Just(Step::Build),
             2 => (0u8..6u8).prop_map(|secs_index| Step::ChangeInterval { secs_index }),
@@ -1609,7 +1666,16 @@ mod property {
         /// rejected (`EpochAlreadyPosted`), regardless of which of
         /// those three states it is actually in right now, since all
         /// three share the same "already posted" rejection.
-        Live { value: i128 },
+        /// `was_repost` mirrors `storage::SubRepostUsed` exactly:
+        /// true if THIS live posting is itself a repost, so that IF
+        /// it is later overturned too, the model's own `Rule` handler
+        /// knows to start that new `Overturned` record already
+        /// `reposted: true` (never resetting to `false` the way a
+        /// model that only inspected the PRIOR state's own `reposted`
+        /// flag would, which is exactly the shape of bug this model
+        /// exists to catch, and the shape it would otherwise share
+        /// with the one found by hand).
+        Live { value: i128, was_repost: bool },
         /// Overturned (a dispute the disputer won), its own repost
         /// window still open or already closed, `reposted` tracking
         /// whether the ONE allowed repost has already been used.
@@ -1722,6 +1788,11 @@ mod property {
             // dispute open, which this check catches directly.
             let mut open_disputes = [false; MAX_SUBS_AT_300S as usize];
             let mut decided: Option<Decided> = None;
+            // The sub-epoch most recently overturned or successfully
+            // reposted: what SubChoice::Focus resolves to. None until
+            // the first overturn happens, in which case Focus falls
+            // back to its own, separately random `fallback` sub.
+            let mut focus_sub: Option<u32> = None;
 
             for step in steps {
                 let now = env.ledger().timestamp();
@@ -1735,14 +1806,23 @@ mod property {
                     })
                     .unwrap_or(SUB_EPOCH_SECS_DEFAULT);
                 let per_hour = (EPOCH_SECS / sub_epoch_secs) as u32;
+                let resolve = |choice: SubChoice| -> u32 {
+                    match choice {
+                        SubChoice::Focus { fallback } => focus_sub.unwrap_or(fallback),
+                        SubChoice::Explicit(sub) => sub,
+                    }
+                };
 
                 match step {
                     Step::Post { sub, peg_ratio } => {
+                        let sub = resolve(sub);
                         if sub >= per_hour {
                             continue;
                         }
                         let sub_close = sub_start(hour, sub, sub_epoch_secs) + sub_epoch_secs;
                         let hour_is_final = client.is_final(&asset, &hour);
+                        let was_overturned =
+                            matches!(model[sub as usize], ModelSub::Overturned { .. });
                         let predicted =
                             model[sub as usize].predict_post_accepted(sub_close, now, hour_is_final);
 
@@ -1767,10 +1847,24 @@ mod property {
                             // (never keeps tagging it as overturned):
                             // the final check below must know the
                             // real, current value, not stale history.
-                            model[sub as usize] = ModelSub::Live { value: peg_ratio };
+                            model[sub as usize] = ModelSub::Live {
+                                value: peg_ratio,
+                                was_repost: was_overturned,
+                            };
+                            if was_overturned {
+                                // A successful REPOST (not a
+                                // genuinely fresh first post) keeps
+                                // this sub-epoch in focus, so the
+                                // generator's own bias toward Focus
+                                // naturally keeps producing a SECOND
+                                // dispute/rule against the SAME sub
+                                // the repost just landed on.
+                                focus_sub = Some(sub);
+                            }
                         }
                     }
                     Step::Dispute { sub } => {
+                        let sub = resolve(sub);
                         if sub >= per_hour {
                             continue;
                         }
@@ -1786,6 +1880,7 @@ mod property {
                         }
                     }
                     Step::Rule { sub, keeper_wins } => {
+                        let sub = resolve(sub);
                         if sub >= per_hour {
                             continue;
                         }
@@ -1808,30 +1903,44 @@ mod property {
                                 // Overturned: the sub's repost window
                                 // opens now, anchored to whichever is
                                 // later, its own original close or
-                                // this overturn. If this posting was
-                                // ITSELF already a repost (the model's
-                                // own prior state was Overturned with
-                                // reposted: true), the one-repost-
-                                // per-original-overturn rule means no
-                                // further repost either, so the new
+                                // this overturn. If the LIVE posting
+                                // being overturned right now was
+                                // itself already a repost (mirroring
+                                // storage::SubRepostUsed, which is
+                                // exactly what the real
+                                // overturn_sub_signals checks, never
+                                // the PRIOR Overturned record's own
+                                // stale `reposted` flag, which is
+                                // exactly the gap that let the real
+                                // one-repost-per-original-overturn
+                                // bug through undetected), the new
                                 // record starts already `reposted:
-                                // true` too, mirroring storage::
-                                // overturn_sub_signals exactly.
+                                // true` too, so no further repost is
+                                // predicted to be accepted.
                                 let sub_close =
                                     sub_start(hour, sub, sub_epoch_secs) + sub_epoch_secs;
                                 let already_used_its_repost = matches!(
                                     model[sub as usize],
-                                    ModelSub::Overturned { reposted: true, .. }
+                                    ModelSub::Live { was_repost: true, .. }
                                 );
                                 model[sub as usize] = ModelSub::Overturned {
                                     sub_close,
                                     overturned_at: now,
                                     reposted: already_used_its_repost,
                                 };
+                                // Keep the generator's own Focus bias
+                                // pointed at this sub, so a repost
+                                // attempt (Post with Focus) and a
+                                // second dispute/rule against THAT
+                                // SAME sub are both likely next,
+                                // without needing the fallback pool
+                                // to happen to redraw it.
+                                focus_sub = Some(sub);
                             }
                         }
                     }
                     Step::Timeout { sub } => {
+                        let sub = resolve(sub);
                         if sub >= per_hour {
                             continue;
                         }
@@ -1901,7 +2010,7 @@ mod property {
 
                     let live_values: std::vec::Vec<i128> = (0..per_hour)
                         .filter_map(|sub| match model[sub as usize] {
-                            ModelSub::Live { value } => Some(value),
+                            ModelSub::Live { value, .. } => Some(value),
                             _ => None,
                         })
                         .collect();
