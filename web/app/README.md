@@ -33,9 +33,9 @@ The generated bindings are committed (not gitignored): CI has no network path to
 
 ## Deployment
 
-Served from Railway as its own service (`web/app/railway.json`), separate from the `web/landing` service - `web/app` needs a live `next start` process (dynamic server-streamed content on `/asset/[id]`), not a static export. Build is `npm ci && npm run build -w web/app`; start is `npm run start -w web/app -- -p $PORT`, both run from the repo root so the `web/shared/ui` workspace member resolves.
+Served from Railway as its own service (`web/app/railway.json`), separate from the `web/landing` service - `web/app` needs a live `next start` process (dynamic server-streamed content on `/asset/[id]`), not a static export. Build is `npm run build -w web/app`; start is `npm run start -w web/app -- -p $PORT`, both run from the repo root so the `web/shared/ui` workspace member resolves. `PORT` is set automatically by Railway; set `NODE_ENV=production` on the service.
 
-**Environment variables:** none beyond what Railway sets automatically (`PORT`, `NODE_ENV=production`). The app has no server-side secrets, API keys, or other runtime config - every contract address it reads comes from the committed `deployments/testnet.json`, and all RPC calls go straight from the browser to the public Soroban RPC endpoint (see "No backend" above).
+**Environment variables:** none beyond `NODE_ENV=production` and `PORT` (Railway sets `PORT` automatically). The app has no server-side secrets, API keys, or other runtime config - every contract address it reads comes from the committed `deployments/testnet.json`, and all RPC calls go straight from the browser to the public Soroban RPC endpoint (see "No backend" above).
 
 ## Rules this app follows
 

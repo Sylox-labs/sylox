@@ -1,12 +1,14 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "build": {
-    "buildCommand": "npm ci && npm run build -w web/app",
+    "buildCommand": "npm run build -w web/app",
     "watchPatterns": [
       "/web/app/**",
       "/web/shared/**",
       "/deployments/**",
-      "/package-lock.json"
+      "/package.json",
+      "/package-lock.json",
+      "/railpack.json"
     ]
   },
   "deploy": {
