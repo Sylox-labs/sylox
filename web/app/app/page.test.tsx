@@ -33,7 +33,7 @@ describe("ExplorerPage", () => {
   it("always shows the testnet banner", async () => {
     fetchExplorerData.mockResolvedValue({ rows: [], errors: [] });
     render(<ExplorerPage />);
-    expect(screen.getByText(/testnet\. live testnet data/i)).toBeInTheDocument();
+    expect(screen.getByText(/testnet\. prices are sample data/i)).toBeInTheDocument();
   });
 
   it("shows a loading state before data arrives", () => {
