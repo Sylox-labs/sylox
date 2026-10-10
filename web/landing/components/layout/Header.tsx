@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
+import { ButtonLink } from "@sylox/ui/components";
 import { ArrowUpRight, Menu, X } from "lucide-react";
 import { nav } from "@/content";
 import { setMobileMenuOpen } from "@/lib/motion/useMobileMenuOpen";
@@ -192,6 +193,17 @@ export function Header() {
           </nav>
 
           <div className="flex items-center gap-4">
+            <ButtonLink
+              href={nav.launchApp.href}
+              variant="primary"
+              className="hidden items-center gap-2 md:inline-flex"
+            >
+              {nav.launchApp.label}
+              <span className="rounded-full border border-slate-black/30 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wide text-slate-black/70">
+                {nav.launchApp.tag}
+              </span>
+            </ButtonLink>
+
             <button
               ref={menuButtonRef}
               type="button"
@@ -231,6 +243,20 @@ export function Header() {
         style={{ visibility: "hidden" }}
         className="fixed inset-x-0 top-[72px] bottom-0 z-50 flex flex-col gap-6 bg-slate-black p-8 md:hidden"
       >
+        <ButtonLink
+          href={nav.launchApp.href}
+          variant="primary"
+          data-menu-item
+          tabIndex={isMenuOpen ? 0 : -1}
+          className="inline-flex w-fit items-center gap-2"
+          onClick={() => setIsMenuOpen(false)}
+        >
+          {nav.launchApp.label}
+          <span className="rounded-full border border-slate-black/30 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wide text-slate-black/70">
+            {nav.launchApp.tag}
+          </span>
+        </ButtonLink>
+
         {nav.links.map((link) => (
           <a
             key={link.href}
