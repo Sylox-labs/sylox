@@ -31,6 +31,13 @@ pub trait RiskOracle {
     /// relative to when this asset actually started posting, not
     /// against the newest epoch's own (always large) absolute number.
     fn first_epoch(env: Env, asset: Address) -> Option<u64>;
+    /// technical-doc.md Section 5.9 S5 (v1.5): each of `hour`'s
+    /// sub-epochs' own `peg_ratio`, in `sub` order, `None` for a
+    /// sub-epoch not posted or not Pending-or-Final. `cover_gate`'s
+    /// `RecentDepeg` check calls this for an hour that `ring()`'s own
+    /// slot reports not yet effectively Final, so it can see a depeg
+    /// still forming in the current, unbuilt hour.
+    fn sub_peg_ratios(env: Env, asset: Address, hour: u64) -> Vec<Option<i128>>;
 }
 
 /// The slice of `Staking`'s API (Section 12.3) that `EventRegistry`

@@ -10,6 +10,7 @@ pub mod network_limits;
 pub mod score;
 pub mod series;
 pub mod staking;
+pub mod time;
 pub mod treasury;
 
 pub use assets::*;

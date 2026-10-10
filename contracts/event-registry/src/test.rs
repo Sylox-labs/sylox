@@ -5,6 +5,7 @@ extern crate std;
 
 mod integration;
 mod property;
+mod sub_epochs;
 
 use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Symbol};
@@ -36,13 +37,41 @@ impl MockStaking {
         true
     }
 
-    pub fn aggregate(_env: Env, _asset: Address, _epoch: u64) -> EndpointStatus {
-        EndpointStatus::Up
+    /// Overrides `aggregate`'s return for one `(asset, epoch)`, for
+    /// the handful of tests that need a specific endpoint status
+    /// (e.g. `RecentEndpointOutage`). Every other `(asset, epoch)`
+    /// keeps the existing hardcoded `Up` default, so no existing test
+    /// is affected by this method merely existing.
+    pub fn set_aggregate(env: Env, asset: Address, epoch: u64, status: EndpointStatus) {
+        env.storage()
+            .temporary()
+            .set(&StakingKey::Aggregate(asset, epoch), &status);
+    }
+
+    pub fn aggregate(env: Env, asset: Address, epoch: u64) -> EndpointStatus {
+        env.storage()
+            .temporary()
+            .get(&StakingKey::Aggregate(asset, epoch))
+            .unwrap_or(EndpointStatus::Up)
     }
 
     pub fn settle_probes(_env: Env, _asset: Address, _epoch: u64) {}
 
     pub fn reward_keeper(_env: Env, _keeper: Address, _epochs: u32) -> i128 {
+        0
+    }
+
+    /// Section 5.9 S6 (v1.5): `RiskOracle.try_build_hour`'s own reward
+    /// call for a built hour's distinct posters. A no-op return, same
+    /// as `reward_keeper`: no event-registry test asserts anything
+    /// about keeper reward amounts, only that a built hour's other
+    /// effects (ring state, cover_gate) land correctly.
+    pub fn reward_keeper_sub_epochs(
+        _env: Env,
+        _keeper: Address,
+        _sub_epoch_count: u32,
+        _sub_epoch_secs: u64,
+    ) -> i128 {
         0
     }
 
@@ -91,6 +120,7 @@ impl MockStaking {
 #[soroban_sdk::contracttype]
 enum StakingKey {
     Bond(sylox_types::BondKey),
+    Aggregate(Address, u64),
 }
 
 #[contract]

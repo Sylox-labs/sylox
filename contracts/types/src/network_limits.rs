@@ -31,3 +31,11 @@ pub const TX_MAX_WRITE_LEDGER_ENTRIES: u32 = 200;
 /// alongside the others so every size check in this workspace (budget
 /// tests and CI's own `CONTRACT_MAX_SIZE_BYTES`) traces to one place.
 pub const CONTRACT_MAX_SIZE_BYTES: u64 = 131_072;
+
+/// `max_entry_size` (`ConfigSettingId::ContractDataEntrySizeBytes`): the
+/// largest a single `LedgerEntry` may be. technical-doc.md Section 5.8,
+/// 5.9. Previously a bare literal in `risk-oracle/src/budget_test.rs`
+/// and `sylox_types::time`'s own build-time ring-size assertions; moved
+/// here so both trace to the same queried source as every other limit
+/// in this file.
+pub const CONTRACT_DATA_ENTRY_SIZE_BYTES: u64 = 65_536;

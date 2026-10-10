@@ -2,6 +2,7 @@ extern crate std;
 
 mod golden_vectors;
 mod property;
+mod sub_epochs;
 
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},

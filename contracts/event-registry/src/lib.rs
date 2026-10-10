@@ -93,7 +93,10 @@ const WINDOW_SECS: u64 = 259_200;
 /// `register_definition`'s own "window plus baseline fits the ring"
 /// check needs a number to check against before any asset has ever
 /// posted (so no real `ring()` call to measure against exists yet).
-const RING_SLOTS: u32 = 240;
+/// Moved to `sylox_types::time` (Section 5.9 S7) so this and
+/// `risk-oracle`'s own copy trace to one shared constant instead of
+/// two private, independently-maintained ones.
+use sylox_types::time::RING_SLOTS;
 
 /// IssuerFreeze's own fixed 7 day window (Section 8.2), and the Depeg
 /// liquidity baseline immediately before its own window (ADR-005):
@@ -118,8 +121,9 @@ const _: () = assert!(MIN_BASELINE_FINAL_EPOCHS > 0);
 /// epochs (`challenge_secs / EPOCH_SECS`) `validate_definition_params`
 /// will accept, 72 hours' worth. Keeps `storage::CureProgress`'s own
 /// `recorded: u128` bitmap comfortably sized for every definition
-/// this build can register, with headroom to spare.
-const MAX_CURE_EPOCHS: u64 = 72;
+/// this build can register, with headroom to spare. Moved to
+/// `sylox_types::time` (Section 5.9 S7).
+use sylox_types::time::MAX_CURE_EPOCHS;
 
 // `SIGNAL_DISPUTE_SECS` and `SIGNAL_DISPUTE_RULING_SECS` (ADR-010)
 // are not needed by this contract's own production logic (it only
@@ -576,6 +580,28 @@ impl EventRegistry {
 
         let depeg_epochs = (depeg_window_secs / EPOCH_SECS) as u32;
         if any_epoch_below_threshold(&ring, newest_epoch, depeg_epochs, depeg_threshold) {
+            return Ok(CoverGate::RecentDepeg);
+        }
+        // Since v1.5 (Section 5.9 S5): also scan the posted sub-epochs
+        // (Pending or Final) of every hour in the window that has not
+        // built yet, so a depeg is visible within one sub_epoch_secs
+        // of starting, not diluted into the hour's own averaged
+        // provisional peg_ratio (which any_epoch_below_threshold above
+        // already reads, but only as a mean across however many
+        // sub-epochs have posted so far). An already-built hour
+        // (ring()'s own slot reports it effectively Final) is never
+        // re-read at sub-epoch level: a wick that hour's own roll-up
+        // already absorbed into its average cannot be read back out
+        // once built, since Sub(asset) is no longer consulted for it.
+        if any_unbuilt_sub_epoch_below_threshold(
+            &env,
+            &oracle,
+            &asset,
+            &ring,
+            newest_epoch,
+            depeg_epochs,
+            depeg_threshold,
+        ) {
             return Ok(CoverGate::RecentDepeg);
         }
 
@@ -1206,6 +1232,49 @@ fn any_epoch_below_threshold(
         if let Some(slot) = slot_for_epoch(ring, newest_epoch, epoch) {
             if slot.state != SlotState::Empty && slot.peg_ratio < threshold {
                 return true;
+            }
+        }
+        epoch += 1;
+    }
+    false
+}
+
+/// Since v1.5 (Section 5.9 S5): for every hour in
+/// `[newest_epoch - window_epochs, newest_epoch]` that `ring`'s own
+/// slot does NOT report effectively Final (a waiting hour, Section
+/// 5.9 S4), reads that hour's individual sub-epoch `peg_ratio`s
+/// directly (`RiskOracle.sub_peg_ratios`) and checks each one against
+/// `threshold`. An already-built hour (`effective_state_of` reports
+/// it Final) is skipped entirely: its own data is already covered by
+/// `any_epoch_below_threshold`'s existing hourly scan, at its own
+/// built, averaged `peg_ratio`, exactly as before this revision. This
+/// keeps the gate's own sensitivity fixed at every `sub_epoch_secs`:
+/// a wick a built hour's roll-up already absorbed into its average
+/// can never be read back out at sub-epoch granularity once that
+/// hour builds.
+fn any_unbuilt_sub_epoch_below_threshold(
+    env: &Env,
+    oracle: &RiskOracleClient,
+    asset: &Address,
+    ring: &Vec<sylox_types::RingSlot>,
+    newest_epoch: u64,
+    window_epochs: u32,
+    threshold: i128,
+) -> bool {
+    let start = newest_epoch.saturating_sub(window_epochs as u64);
+    let now = env.ledger().timestamp();
+    let mut epoch = start;
+    while epoch <= newest_epoch {
+        let slot = slot_for_epoch(ring, newest_epoch, epoch);
+        let is_built = matches!(
+            slot.as_ref().map(|s| effective_state_of(s, now)),
+            Some(SlotState::Final)
+        );
+        if !is_built {
+            for peg_ratio in oracle.sub_peg_ratios(asset, &epoch).iter().flatten() {
+                if peg_ratio < threshold {
+                    return true;
+                }
             }
         }
         epoch += 1;

@@ -930,6 +930,52 @@ impl Staking {
         Ok(accrued)
     }
 
+    /// technical-doc.md Section 5.9 S6 (v1.5): pays per accepted
+    /// sub-epoch at `keeper_reward * sub_epoch_secs / 3,600`, so the
+    /// total paid per hour of real coverage is unchanged regardless of
+    /// `sub_epoch_secs`. Additive to `reward_keeper`, not a replacement:
+    /// the hourly reward path (`reward_keeper`, called from
+    /// `RiskOracle`'s existing finality scan) is untouched, satisfying
+    /// I22 ("existing suite passes unchanged at `sub_epoch_secs =
+    /// 3,600`") by construction, since nothing calls this new function
+    /// unless an asset is actually using sub-epoch posting.
+    pub fn reward_keeper_sub_epochs(
+        env: Env,
+        keeper: Address,
+        sub_epoch_count: u32,
+        sub_epoch_secs: u64,
+    ) -> Result<i128, Error> {
+        let config = Self::require_config(&env)?;
+        Self::require_oracle_caller(&env, &config)?;
+        let Some(info) = storage::get_keeper(&env, &keeper) else {
+            return Err(Error::NotKeeper);
+        };
+        if info.suspended || info.removed_at.is_some() || info.bond < params::KEEPER_BOND {
+            return Ok(0);
+        }
+        if sub_epoch_count == 0 {
+            return Ok(0);
+        }
+        // keeper_reward * sub_epoch_secs / 3,600 per accepted
+        // sub-epoch: scaling down from the hourly default so the SUM
+        // across one hour's worth of sub-epochs always equals exactly
+        // one hourly reward, never more or less because of how finely
+        // an asset's posting interval happens to be divided.
+        let per_sub_epoch = params::KEEPER_REWARD_PER_ACCEPTED_EPOCH
+            .checked_mul(sub_epoch_secs as i128)
+            .ok_or(Error::MathOverflow)?
+            / params::EPOCH_SECS as i128;
+        let amount = per_sub_epoch
+            .checked_mul(sub_epoch_count as i128)
+            .ok_or(Error::MathOverflow)?;
+        let accrued = TreasuryClient::new(&env, &config.treasury).accrue_reward(
+            &keeper,
+            &TreasuryBucket::KeeperRewards,
+            &amount,
+        );
+        Ok(accrued)
+    }
+
     /// technical-doc.md Section 7.8, 12.3: pays refunds and winnings
     /// from bond settlement. Probe and keeper rewards are claimed
     /// from `Treasury.claim_reward` instead (feat/treasury): a

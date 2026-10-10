@@ -66,6 +66,37 @@ pub enum FxRateSource {
     Market,
 }
 
+/// Per asset sub-epoch configuration. technical-doc.md Section 15.1
+/// `SubEpochConfig(asset)`, Section 5.9 S1. `sub_epoch_secs` is the
+/// value currently in effect; `pending_sub_epoch_secs` and
+/// `effective_from_hour` describe a queued change that has not yet
+/// taken effect (both `None` when no change is pending). A change
+/// never applies before `effective_from_hour`, so no sub-epoch
+/// already posted, or postable before that boundary, is ever
+/// reinterpreted under a different length.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubEpochConfig {
+    pub sub_epoch_secs: u64,
+    pub pending_sub_epoch_secs: Option<u64>,
+    pub effective_from_hour: Option<u64>,
+}
+
+/// Identifies one sub-epoch at the posting/dispute API boundary:
+/// `hour`, and `sub`, its position within that hour under whichever
+/// `sub_epoch_secs` governed it. technical-doc.md Section 5.9 S2.
+/// `Sub(asset)`'s own ring stores a different identity internally
+/// (`sub_start`, the sub-epoch's absolute start time, Section 5.9 S3),
+/// since what `sub` means depends on an interval that can later
+/// change; `SubEpoch` is the human-meaningful pair a keeper posts
+/// against, converted internally to `sub_start`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubEpoch {
+    pub hour: u64,
+    pub sub: u32,
+}
+
 /// One epoch's measured signals for one asset. technical-doc.md Section 4.1.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

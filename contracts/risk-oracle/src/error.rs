@@ -50,4 +50,18 @@ pub enum Error {
     /// dispute opened. Named to match ADR-002's `RulingDeadlineNotReached`
     /// precedent for the analogous event-ruling timeout.
     RulingDeadlineNotReached = 112,
+    /// technical-doc.md Section 5.9 S1: `sub_epoch_secs` set to a value
+    /// outside the allowed set, or one that does not divide 3,600
+    /// evenly.
+    InvalidSubEpochInterval = 113,
+    /// technical-doc.md Section 5.9 S4: `build_hour` called while at
+    /// least one of the hour's sub-epochs is still Pending or Disputed,
+    /// i.e. not yet Final, permanently missing, or rejected.
+    SubEpochNotReady = 114,
+    /// technical-doc.md Section 5.9 S2: an hour is posted through
+    /// exactly one path, sub-epoch or hourly fallback, never both. A
+    /// sub-epoch post against an hour already posted through the
+    /// fallback path, or a fallback post against an hour that already
+    /// has a sub-epoch posted, both return this.
+    HourAlreadyPosted = 115,
 }

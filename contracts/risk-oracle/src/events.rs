@@ -116,3 +116,78 @@ pub struct AssetStale {
     pub asset: Address,
     pub last_epoch: u64,
 }
+
+/// technical-doc.md Section 5.9 (v1.5), Section 13.
+#[contractevent(topics = ["sylox", "sub_signals_posted"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubSignalsPosted {
+    #[topic]
+    pub asset: Address,
+    pub hour: u64,
+    pub sub: u32,
+    pub keeper: Address,
+    pub inputs_hash: BytesN<32>,
+    pub pending_until: u64,
+}
+
+#[contractevent(topics = ["sylox", "sub_signals_final"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubSignalsFinal {
+    #[topic]
+    pub asset: Address,
+    pub hour: u64,
+    pub sub: u32,
+}
+
+#[contractevent(topics = ["sylox", "sub_signals_disputed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubSignalsDisputed {
+    #[topic]
+    pub asset: Address,
+    pub hour: u64,
+    pub sub: u32,
+    pub disputer: Address,
+    pub alt_hash: BytesN<32>,
+}
+
+#[contractevent(topics = ["sylox", "sub_signals_resolved"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubSignalsResolved {
+    #[topic]
+    pub asset: Address,
+    pub hour: u64,
+    pub sub: u32,
+    pub keeper_wins: bool,
+}
+
+#[contractevent(topics = ["sylox", "sub_signal_dispute_timed_out"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubSignalDisputeTimedOut {
+    #[topic]
+    pub asset: Address,
+    pub hour: u64,
+    pub sub: u32,
+    pub disputer: Address,
+    pub committee: Address,
+}
+
+/// technical-doc.md Section 5.9 S4, Section 13.
+#[contractevent(topics = ["sylox", "hour_built"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HourBuilt {
+    #[topic]
+    pub asset: Address,
+    pub hour: u64,
+    pub sub_count_final: u32,
+    pub coverage_bps: u32,
+}
+
+/// technical-doc.md Section 5.9 S1, Section 13.
+#[contractevent(topics = ["sylox", "sub_epoch_secs_changed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubEpochSecsChanged {
+    #[topic]
+    pub asset: Address,
+    pub sub_epoch_secs: u64,
+    pub effective_from_hour: u64,
+}
