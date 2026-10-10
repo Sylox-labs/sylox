@@ -363,7 +363,40 @@ impl RiskOracle {
             return Err(Error::InvalidSubEpochInterval);
         }
         let sub_start = sub_start_of(hour, sub, sub_epoch_secs);
-        check_sub_epoch_window(sub_start, sub_epoch_secs, now)?;
+        let sub_close = sub_start + sub_epoch_secs;
+
+        // A repost of an overturned sub-epoch (ADR-005, extended to
+        // sub-epochs) is accepted only while the hour itself is still
+        // unbuilt: once built, a built hour never changes (I12), so a
+        // repost at this point must fail the same way any other post
+        // against an already-committed hour does, never silently
+        // succeed into a slot nothing reads any more. Checked before
+        // either window check below, since a built hour must reject a
+        // repost even if its own repost window is technically still
+        // open.
+        if storage::is_final(&env, &asset, hour, now) {
+            return Err(Error::HourAlreadyPosted);
+        }
+
+        let overturn = storage::get_overturned_sub_signals(&env, &asset, hour, sub);
+        let is_repost = match &overturn {
+            Some(record) if !record.reposted => {
+                // One repost per overturn (Section 5.9 S2): a second
+                // overturn of this same original posting gets its OWN
+                // fresh SubOverturned record (written by resolve_sub_
+                // signal_dispute, never this check), so reaching here
+                // with `reposted` already true only happens for the
+                // SAME overturn being reposted twice, which this
+                // rejects.
+                check_sub_epoch_repost_window(sub_close, record.overturned_at, now)?;
+                true
+            }
+            Some(_) => return Err(Error::EpochAlreadyPosted),
+            None => {
+                check_sub_epoch_window(sub_start, sub_epoch_secs, now)?;
+                false
+            }
+        };
 
         if storage::get_sub_signals(&env, &asset, hour, sub).is_some() {
             return Err(Error::EpochAlreadyPosted);
@@ -389,42 +422,75 @@ impl RiskOracle {
         storage::set_first_epoch_if_unset(&env, &asset, hour);
 
         let pending_until = now + SIGNAL_DISPUTE_SECS;
-        let wrote = storage::write_sub_slot_entry(
-            &env,
-            &asset,
-            sub_start,
-            &s,
-            sylox_types::SlotState::Pending,
+        let held_slot = storage::HeldSubSlot {
+            state: sylox_types::SlotState::Pending,
             pending_until,
-        );
-        if !wrote {
-            return Err(Error::WrongEpoch);
-        }
-        storage::extend_sub_ring_ttl(&env, &asset, 100, SUB_DISPUTE_TTL_LEDGERS);
+            peg_ratio: s.peg_ratio,
+            liquidity_2pct: s.liquidity_2pct,
+            redemption_net: s.redemption_net,
+            supply: s.supply,
+            clawback_amount: s.issuer_actions.clawback_amount,
+            auth_revocations: s.issuer_actions.auth_revocations,
+        };
 
-        // Section 5.9 S3: if this hour already has an open dispute
-        // (HeldHour exists), capture this sub-epoch's own data too,
-        // so it survives the ring rotating past it even if that
-        // happens before this specific sub-epoch's own dispute window
-        // closes.
-        if storage::get_held_hour(&env, &asset, hour).is_some() {
+        if is_repost && !storage::sub_slot_still_belongs_to(&env, &asset, sub_start) {
+            // The ring has rotated past this sub-epoch's own position
+            // since it was overturned (a slow ruling, Section 5.9 S2):
+            // the repost goes into HeldHour directly, never overwrite
+            // whatever newer sub-epoch's data now occupies that ring
+            // position. sub_slot_still_belongs_to is the one check
+            // that decides this; the ring write below is skipped
+            // entirely on this path, by construction, not by relying
+            // on write_sub_slot_entry's own newer-wins guard to refuse
+            // it after the fact.
             storage::insert_held_sub_slot(
                 &env,
                 &asset,
                 hour,
                 sub,
-                &storage::HeldSubSlot {
-                    state: sylox_types::SlotState::Pending,
-                    pending_until,
-                    peg_ratio: s.peg_ratio,
-                    liquidity_2pct: s.liquidity_2pct,
-                    redemption_net: s.redemption_net,
-                    supply: s.supply,
-                    clawback_amount: s.issuer_actions.clawback_amount,
-                    auth_revocations: s.issuer_actions.auth_revocations,
-                },
+                &held_slot,
                 SUB_DISPUTE_TTL_LEDGERS,
             );
+        } else {
+            let wrote = storage::write_sub_slot_entry(
+                &env,
+                &asset,
+                sub_start,
+                &s,
+                sylox_types::SlotState::Pending,
+                pending_until,
+            );
+            if !wrote {
+                // sub_slot_still_belongs_to already confirmed this
+                // position is safe for a repost; for a fresh post
+                // (is_repost false), the window check above already
+                // bounds how stale sub_start can be relative to now,
+                // so reaching here would mean the two checks have
+                // drifted apart (the same invariant post_signals's
+                // own equivalent comment states for the hourly ring).
+                return Err(Error::WrongEpoch);
+            }
+            storage::extend_sub_ring_ttl(&env, &asset, 100, SUB_DISPUTE_TTL_LEDGERS);
+
+            // Section 5.9 S3: if this hour already has an open dispute
+            // (HeldHour exists), capture this sub-epoch's own data too,
+            // so it survives the ring rotating past it even if that
+            // happens before this specific sub-epoch's own dispute window
+            // closes.
+            if storage::get_held_hour(&env, &asset, hour).is_some() {
+                storage::insert_held_sub_slot(
+                    &env,
+                    &asset,
+                    hour,
+                    sub,
+                    &held_slot,
+                    SUB_DISPUTE_TTL_LEDGERS,
+                );
+            }
+        }
+
+        if is_repost {
+            storage::mark_sub_overturn_reposted(&env, &asset, hour, sub);
         }
 
         events::SubSignalsPosted {
@@ -737,6 +803,7 @@ impl RiskOracle {
 
         let dispute =
             storage::get_sub_dispute(&env, &asset, hour, sub).ok_or(Error::DisputeWindowClosed)?;
+        let now = env.ledger().timestamp();
         let sub_epoch_secs = current_sub_epoch_secs(&env, &asset, hour);
         let sub_start = sub_start_of(hour, sub, sub_epoch_secs);
         let signals = storage::get_sub_signals(&env, &asset, hour, sub).ok_or(Error::WrongEpoch)?;
@@ -775,6 +842,15 @@ impl RiskOracle {
             // Overturned: this sub-epoch must never contribute to the
             // roll-up, including from HeldHour (Section 5.9 S4, I23).
             storage::remove_held_sub_slot(&env, &asset, hour, sub);
+            // ADR-005, extended to sub-epochs: move the overturned
+            // posting to history so get_sub_signals no longer finds
+            // it, unblocking post_sub_signals's own EpochAlreadyPosted
+            // check for a repost of this exact (hour, sub). Without
+            // this, a rejected dispute would permanently kill the
+            // sub-epoch: it could never be reposted, so every
+            // successful dispute would permanently cost the hour that
+            // one sub-epoch's worth of coverage.
+            storage::overturn_sub_signals(&env, &asset, hour, sub, now);
         }
         storage::clear_sub_dispute(&env, &asset, hour, sub);
 
@@ -1170,6 +1246,7 @@ impl RiskOracle {
                 SubDisposition::Pending(_) => return Err(Error::SubEpochNotReady),
                 SubDisposition::Disputed => return Err(Error::SubEpochNotReady),
                 SubDisposition::MissingWithinBackfill => return Err(Error::SubEpochNotReady),
+                SubDisposition::AwaitingRepost => return Err(Error::SubEpochNotReady),
                 SubDisposition::PermanentlyMissing => any_posted = true,
             }
         }
@@ -1692,6 +1769,31 @@ fn check_sub_epoch_window(sub_start: u64, sub_epoch_secs: u64, now: u64) -> Resu
     Ok(())
 }
 
+/// Section 5.9 S2 (v1.5, footprint-fix revision): a repost of an
+/// overturned sub-epoch gets its OWN window, anchored to whichever
+/// is later, the sub-epoch's own original close or the ruling that
+/// overturned it: `max(sub_close, overturned_at) + sub_backfill_secs`.
+/// A ruling can take up to `signal_dispute_ruling_secs` (6 days),
+/// far longer than `sub_backfill_secs` (2 hours), so anchoring to the
+/// original close alone (`check_sub_epoch_window`'s own rule) would
+/// make a repost unreachable for any ruling slower than the backfill
+/// window itself; anchoring to the overturn instead keeps a repost
+/// reliably reachable regardless of how long the ruling took, the
+/// same guarantee ADR-005 already gives the hourly path (where no
+/// such race exists, since an hourly epoch has no separate backfill
+/// window racing its own dispute timeline the way a sub-epoch does).
+fn check_sub_epoch_repost_window(
+    sub_close: u64,
+    overturned_at: u64,
+    now: u64,
+) -> Result<(), Error> {
+    let anchor = sub_close.max(overturned_at);
+    if now.saturating_sub(anchor) > SUB_BACKFILL_SECS {
+        return Err(Error::WrongEpoch);
+    }
+    Ok(())
+}
+
 /// Section 5.9 S4: one sub-epoch's disposition, within the hour-build
 /// and provisional-roll-up logic. Distinct from (but structurally the
 /// same shape as) `EventRegistry`'s own `epoch_disposition`: this one
@@ -1708,17 +1810,30 @@ enum SubDisposition {
     /// "recomputed on every sub-epoch post") can use a Pending
     /// sub-epoch's real values instead of treating it as absent.
     Pending(RingSlot),
-    /// An open `SubDispute` exists for this sub-epoch. Checked
-    /// directly against `SubDispute`, so this reads correctly even
-    /// once `Sub(asset)`'s own ring has rotated past this sub-epoch's
-    /// slot and would otherwise misreport it `PermanentlyMissing`.
+    /// `state == Disputed` on the already-fetched slot (`HeldHour` or
+    /// the ring, whichever `sub_disposition` is currently reading):
+    /// never a separate `SubDispute` lookup (the Section 5.9 S5
+    /// footprint fix), so this reads correctly even once `Sub(asset)`'s
+    /// own ring has rotated past this sub-epoch's slot and would
+    /// otherwise misreport it `PermanentlyMissing`.
     Disputed,
     /// Never posted, still within `sub_backfill_secs` of its own
     /// close: could still be backfilled.
     MissingWithinBackfill,
-    /// Never posted (or posted then overturned and never reposted),
-    /// past `sub_backfill_secs`: permanently missing, exactly the
-    /// hourly ring's own `PermanentlyMissing` concept.
+    /// Overturned (a dispute the disputer won), with its own
+    /// `SubOverturned` record present and not yet `reposted`, and
+    /// still within its OWN repost window (`check_sub_epoch_
+    /// repost_window`, anchored to the later of the original close
+    /// or the overturn itself, Section 5.9 S2). Distinct from
+    /// `PermanentlyMissing`: an hour must NOT build while any
+    /// sub-epoch is awaiting a possible repost, the same way it must
+    /// not build while one is still `MissingWithinBackfill`.
+    AwaitingRepost,
+    /// Never posted (or posted, then overturned, with no repost
+    /// either within its own repost window or at all), past
+    /// `sub_backfill_secs` AND past the repost window if an overturn
+    /// exists: permanently missing, exactly the hourly ring's own
+    /// `PermanentlyMissing` concept.
     PermanentlyMissing,
 }
 
@@ -1790,7 +1905,13 @@ fn sub_disposition(
                     _ => SubDisposition::Pending(ring_slot),
                 }
             }
-            None => SubDisposition::PermanentlyMissing,
+            // Removed from HeldHour by resolve_sub_signal_dispute's
+            // rejection branch (remove_held_sub_slot): an overturn, not
+            // simply never-held. Same missing-vs-awaiting-repost check
+            // as the ring's own fallback below.
+            None => {
+                sub_disposition_for_missing(env, asset, hour, sub, sub_start, sub_epoch_secs, now)
+            }
         };
     }
     match storage::get_sub_slot(env, asset, sub_start) {
@@ -1805,14 +1926,41 @@ fn sub_disposition(
                 _ => SubDisposition::Pending(ring_slot),
             }
         }
-        None => {
-            let sub_close = sub_start + sub_epoch_secs;
-            if now.saturating_sub(sub_close) > SUB_BACKFILL_SECS {
-                SubDisposition::PermanentlyMissing
-            } else {
-                SubDisposition::MissingWithinBackfill
-            }
+        None => sub_disposition_for_missing(env, asset, hour, sub, sub_start, sub_epoch_secs, now),
+    }
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): shared by both of
+/// `sub_disposition`'s own "nothing here" branches (no `HeldHour`
+/// entry for this sub, no ring slot for this `sub_start` either): a
+/// sub-epoch with no live data anywhere is either genuinely never
+/// posted, or was posted and then overturned. An overturned sub-epoch
+/// not yet reposted, still within its own repost window, must read
+/// `AwaitingRepost`, never `PermanentlyMissing`: the hour must not
+/// build (treating the overturned value as finally, permanently
+/// absent) while a correction could still arrive.
+fn sub_disposition_for_missing(
+    env: &Env,
+    asset: &Address,
+    hour: u64,
+    sub: u32,
+    sub_start: u64,
+    sub_epoch_secs: u64,
+    now: u64,
+) -> SubDisposition {
+    let sub_close = sub_start + sub_epoch_secs;
+    if let Some(record) = storage::get_overturned_sub_signals(env, asset, hour, sub) {
+        if !record.reposted
+            && check_sub_epoch_repost_window(sub_close, record.overturned_at, now).is_ok()
+        {
+            return SubDisposition::AwaitingRepost;
         }
+        return SubDisposition::PermanentlyMissing;
+    }
+    if now.saturating_sub(sub_close) > SUB_BACKFILL_SECS {
+        SubDisposition::PermanentlyMissing
+    } else {
+        SubDisposition::MissingWithinBackfill
     }
 }
 
@@ -1971,6 +2119,7 @@ fn refresh_waiting_hour(
                 all_decided = false;
             }
             SubDisposition::MissingWithinBackfill => all_decided = false,
+            SubDisposition::AwaitingRepost => all_decided = false,
             SubDisposition::PermanentlyMissing => {}
         }
     }

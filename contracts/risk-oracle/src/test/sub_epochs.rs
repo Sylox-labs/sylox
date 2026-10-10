@@ -752,12 +752,19 @@ fn a_dispute_outliving_the_ring_upheld_at_day_6_still_builds_final_with_all_12()
     assert_eq!(slot_again.state, SlotState::Final);
 }
 
-/// Section 21.3, Section 5.9 S3: the same scenario, but the ruling at
-/// day 6 OVERTURNS the disputed sub-epoch. `HeldHour`'s own entry for
-/// it is removed on resolution (I23: an overturned sub-epoch never
-/// contributes), and the hour builds from the remaining 11 — still
-/// above the 7,500 bps coverage threshold (11 of 12 = 9,166 bps) — so
-/// it reads Final, built from 11 values, not 12, and not Empty.
+/// Section 21.3, Section 5.9 S2, S3: the same scenario, but the
+/// ruling at day 6 OVERTURNS the disputed sub-epoch. `HeldHour`'s own
+/// entry for it is removed on resolution (I23: an overturned
+/// sub-epoch never contributes), but the hour does NOT build the
+/// instant it is overturned: the overturned sub-epoch's own repost
+/// window (anchored to the overturn itself, not its long-past
+/// original close, Section 5.9 S2) is still open, so it reads
+/// AwaitingRepost, not PermanentlyMissing, and the hour must wait.
+/// Only once that window closes with no repost does it settle to
+/// PermanentlyMissing and the hour builds from the remaining 11 —
+/// still above the 7,500 bps coverage threshold (11 of 12 = 9,166
+/// bps) — so it reads Final, built from 11 values, not 12, and not
+/// Empty.
 #[test]
 fn a_dispute_outliving_the_ring_overturned_at_day_6_builds_from_the_other_11() {
     let env = Env::default();
@@ -805,8 +812,24 @@ fn a_dispute_outliving_the_ring_overturned_at_day_6_builds_from_the_other_11() {
 
     env.ledger()
         .set_timestamp(sub_start(hour, 0, sub_epoch_secs) + sub_epoch_secs + 6 * 86_400);
-    // Disputer wins: sub 0 is overturned.
+    // Disputer wins: sub 0 is overturned. The hour does NOT build yet
+    // (Section 5.9 S2, footprint-fix revision): sub 0 is now
+    // AwaitingRepost, not PermanentlyMissing, since its own repost
+    // window (anchored to this overturn, not its long-past original
+    // close) has just opened.
     client.resolve_sub_signal_dispute(&asset, &hour, &0u32, &false, &dummy_hash(&env));
+    assert!(
+        !client.is_final(&asset, &hour),
+        "the hour must wait out sub 0's own repost window before building, not build \
+         the instant it is overturned"
+    );
+
+    // Past sub 0's own repost window (sub_backfill_secs past the
+    // overturn) with no repost: sub 0 settles to PermanentlyMissing,
+    // and the hour is free to build without it.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 7_200 + 1);
+    client.build_hour(&asset, &hour);
 
     assert!(
         client.is_final(&asset, &hour),
@@ -826,6 +849,437 @@ fn a_dispute_outliving_the_ring_overturned_at_day_6_builds_from_the_other_11() {
     let slot_again = ring_again.iter().find(|s| s.epoch == hour).unwrap();
     assert_eq!(slot_again.peg_ratio, 10_000_000);
     assert_eq!(slot_again.state, SlotState::Final);
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): a FAST ruling, well
+/// within `sub_backfill_secs` of both the original close and the
+/// overturn itself, so the repost lands while `Sub(asset)`'s own ring
+/// still holds sub 0's position. The repost goes into the ring
+/// directly (not `HeldHour`), and the hour builds with the corrected
+/// value once the repost's own Pending window clears.
+#[test]
+fn a_fast_ruling_repost_lands_in_the_ring_and_the_hour_builds_corrected() {
+    let env = Env::default();
+    let (client, governor, asset) = setup_with_governor_and_asset(&env);
+    let keeper = Address::generate(&env);
+    let committee = Address::generate(&env);
+    crate::mocks::MockGovernorClient::new(&env, &governor).set_committee(&committee);
+    let hour = REALISTIC_EPOCH_BASE;
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+    let per_hour = (EPOCH_SECS / sub_epoch_secs) as u32;
+
+    // Sub 0 posts wrong first (earliest timestamp), then subs 1..11
+    // post normally: the clock only ever moves forward, the same
+    // convention every other test in this file relies on.
+    post_sub(&env, &client, &keeper, &asset, hour, 0, sub_epoch_secs, 1);
+    let disputer = Address::generate(&env);
+    client.dispute_sub_signals(&disputer, &asset, &hour, &0u32, &dummy_hash(&env));
+    client.resolve_sub_signal_dispute(&asset, &hour, &0u32, &false, &dummy_hash(&env));
+    assert!(
+        !client.is_final(&asset, &hour),
+        "sub 0 is awaiting repost; the hour must not build yet"
+    );
+
+    // Repost immediately (0 seconds past the overturn, well within
+    // sub_backfill_secs), still earlier than sub 1's own close, so
+    // the clock still only moves forward from here.
+    let mut corrected = signal_set(&env, hour, 10_000_000);
+    corrected.liquidity_2pct = 500_000_000_000;
+    corrected.supply_change_bps = 0;
+    client.post_sub_signals(&keeper, &asset, &hour, &0u32, &corrected);
+    assert!(
+        !client.is_final(&asset, &hour),
+        "the repost is freshly Pending; the hour must wait for it too"
+    );
+
+    for sub in 1..per_hour {
+        post_sub(
+            &env,
+            &client,
+            &keeper,
+            &asset,
+            hour,
+            sub,
+            sub_epoch_secs,
+            10_000_000,
+        );
+    }
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + crate::SIGNAL_DISPUTE_SECS + 1);
+    client.build_hour(&asset, &hour);
+
+    assert!(client.is_final(&asset, &hour));
+    let ring = client.ring(&asset);
+    let slot = ring.iter().find(|s| s.epoch == hour).unwrap();
+    assert_eq!(
+        slot.peg_ratio, 10_000_000,
+        "all 12 sub-epochs, including the corrected repost, must contribute"
+    );
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): a SLOW ruling,
+/// landing well after `Sub(asset)`'s own 5 hour ring span has rotated
+/// past sub 0's own position. The repost must go into `HeldHour`
+/// instead (the ring position now belongs to someone else), and the
+/// hour still builds with the corrected value once the repost's own
+/// Pending window clears.
+#[test]
+fn a_slow_ruling_repost_lands_in_heldhour_and_the_hour_builds_corrected() {
+    let env = Env::default();
+    let (client, governor, asset) = setup_with_governor_and_asset(&env);
+    let keeper = Address::generate(&env);
+    let committee = Address::generate(&env);
+    crate::mocks::MockGovernorClient::new(&env, &governor).set_committee(&committee);
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+    let per_hour = (EPOCH_SECS / sub_epoch_secs) as u32;
+    let hour = REALISTIC_EPOCH_BASE;
+
+    for sub in 1..per_hour {
+        post_sub(
+            &env,
+            &client,
+            &keeper,
+            &asset,
+            hour,
+            sub,
+            sub_epoch_secs,
+            10_000_000,
+        );
+    }
+    post_sub(&env, &client, &keeper, &asset, hour, 0, sub_epoch_secs, 1);
+    let disputer = Address::generate(&env);
+    client.dispute_sub_signals(&disputer, &asset, &hour, &0u32, &dummy_hash(&env));
+
+    // Rotate Sub(asset) a full 5 hours past hour's own slots via
+    // later hours' own prompt posts, exactly the convention the
+    // existing "outliving the ring" tests already use.
+    for later_hour in (hour + 1)..=(hour + 5) {
+        for sub in 0..per_hour {
+            post_sub(
+                &env,
+                &client,
+                &keeper,
+                &asset,
+                later_hour,
+                sub,
+                sub_epoch_secs,
+                10_000_000,
+            );
+        }
+    }
+
+    // The ruling lands at day 6, well past the ring's own 5 hour span
+    // AND past sub 0's own original close + sub_backfill_secs.
+    env.ledger()
+        .set_timestamp(sub_start(hour, 0, sub_epoch_secs) + sub_epoch_secs + 6 * 86_400);
+    client.resolve_sub_signal_dispute(&asset, &hour, &0u32, &false, &dummy_hash(&env));
+    assert!(!client.is_final(&asset, &hour));
+
+    // Repost immediately (0 seconds past the overturn): accepted,
+    // since the window is anchored to the overturn, not the
+    // long-past original close.
+    let mut corrected = signal_set(&env, hour, 10_000_000);
+    corrected.liquidity_2pct = 500_000_000_000;
+    corrected.supply_change_bps = 0;
+    client.post_sub_signals(&keeper, &asset, &hour, &0u32, &corrected);
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + crate::SIGNAL_DISPUTE_SECS + 1);
+    client.build_hour(&asset, &hour);
+
+    assert!(client.is_final(&asset, &hour));
+    let ring = client.ring(&asset);
+    let slot = ring.iter().find(|s| s.epoch == hour).unwrap();
+    assert_eq!(
+        slot.peg_ratio, 10_000_000,
+        "the HeldHour repost must contribute the corrected value, same as a ring repost would"
+    );
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): no repost arrives
+/// at all. The hour waits out sub 0's own repost window
+/// (`overturned_at + sub_backfill_secs`), then builds without it,
+/// from the other 11.
+#[test]
+fn no_repost_the_hour_builds_without_the_overturned_sub_epoch_once_its_window_closes() {
+    let env = Env::default();
+    let (client, governor, asset) = setup_with_governor_and_asset(&env);
+    let keeper = Address::generate(&env);
+    let committee = Address::generate(&env);
+    crate::mocks::MockGovernorClient::new(&env, &governor).set_committee(&committee);
+    let hour = REALISTIC_EPOCH_BASE;
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+    let per_hour = (EPOCH_SECS / sub_epoch_secs) as u32;
+
+    post_sub(&env, &client, &keeper, &asset, hour, 0, sub_epoch_secs, 1);
+    let disputer = Address::generate(&env);
+    client.dispute_sub_signals(&disputer, &asset, &hour, &0u32, &dummy_hash(&env));
+    client.resolve_sub_signal_dispute(&asset, &hour, &0u32, &false, &dummy_hash(&env));
+    let overturned_at = env.ledger().timestamp();
+    assert!(
+        !client.is_final(&asset, &hour),
+        "awaiting repost, must not build yet"
+    );
+
+    for sub in 1..per_hour {
+        post_sub(
+            &env,
+            &client,
+            &keeper,
+            &asset,
+            hour,
+            sub,
+            sub_epoch_secs,
+            10_000_000,
+        );
+    }
+    // Past every other sub's own pending_until AND sub 0's own
+    // repost window (the later of the two): both must have cleared
+    // before the hour is free to build.
+    let last_sub_pending_until =
+        sub_start(hour, per_hour - 1, sub_epoch_secs) + sub_epoch_secs + crate::SIGNAL_DISPUTE_SECS;
+    let deadline = (overturned_at + 7_200).max(last_sub_pending_until);
+
+    env.ledger().set_timestamp(deadline);
+    assert!(
+        !client.is_final(&asset, &hour),
+        "right at the deadline (not yet past it): must not build yet"
+    );
+
+    env.ledger().set_timestamp(deadline + 1);
+    client.build_hour(&asset, &hour);
+    assert!(
+        client.is_final(&asset, &hour),
+        "every other sub is settled and sub 0's own repost window has closed with no \
+         repost; the hour must build without it"
+    );
+    let ring = client.ring(&asset);
+    let slot = ring.iter().find(|s| s.epoch == hour).unwrap();
+    assert_eq!(slot.peg_ratio, 10_000_000);
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): a repost attempted
+/// AFTER its own window has closed is rejected, not silently
+/// accepted into a slot the build has already moved past.
+#[test]
+fn a_repost_after_its_own_deadline_is_rejected() {
+    let env = Env::default();
+    let (client, governor, asset) = setup_with_governor_and_asset(&env);
+    let keeper = Address::generate(&env);
+    let committee = Address::generate(&env);
+    crate::mocks::MockGovernorClient::new(&env, &governor).set_committee(&committee);
+    let hour = REALISTIC_EPOCH_BASE;
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+    let per_hour = (EPOCH_SECS / sub_epoch_secs) as u32;
+
+    for sub in 1..per_hour {
+        post_sub(
+            &env,
+            &client,
+            &keeper,
+            &asset,
+            hour,
+            sub,
+            sub_epoch_secs,
+            10_000_000,
+        );
+    }
+    post_sub(&env, &client, &keeper, &asset, hour, 0, sub_epoch_secs, 1);
+    let disputer = Address::generate(&env);
+    client.dispute_sub_signals(&disputer, &asset, &hour, &0u32, &dummy_hash(&env));
+    client.resolve_sub_signal_dispute(&asset, &hour, &0u32, &false, &dummy_hash(&env));
+    let overturned_at = env.ledger().timestamp();
+
+    env.ledger().set_timestamp(overturned_at + 7_200 + 1);
+    let mut corrected = signal_set(&env, hour, 10_000_000);
+    corrected.liquidity_2pct = 500_000_000_000;
+    corrected.supply_change_bps = 0;
+    let result = client.try_post_sub_signals(&keeper, &asset, &hour, &0u32, &corrected);
+    assert!(
+        result.is_err(),
+        "a repost past its own window must be rejected, not accepted"
+    );
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): the repost itself
+/// is overturned a second time. No further repost is accepted for
+/// this sub-epoch: the longest the hour can wait on it is two dispute
+/// cycles (post, dispute, overturn, repost, dispute, overturn again),
+/// never more.
+#[test]
+fn a_repost_overturned_a_second_time_gets_no_further_repost() {
+    let env = Env::default();
+    let (client, governor, asset) = setup_with_governor_and_asset(&env);
+    let keeper = Address::generate(&env);
+    let committee = Address::generate(&env);
+    crate::mocks::MockGovernorClient::new(&env, &governor).set_committee(&committee);
+    let hour = REALISTIC_EPOCH_BASE;
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+    let per_hour = (EPOCH_SECS / sub_epoch_secs) as u32;
+
+    for sub in 1..per_hour {
+        post_sub(
+            &env,
+            &client,
+            &keeper,
+            &asset,
+            hour,
+            sub,
+            sub_epoch_secs,
+            10_000_000,
+        );
+    }
+    post_sub(&env, &client, &keeper, &asset, hour, 0, sub_epoch_secs, 1);
+    let disputer = Address::generate(&env);
+    client.dispute_sub_signals(&disputer, &asset, &hour, &0u32, &dummy_hash(&env));
+    client.resolve_sub_signal_dispute(&asset, &hour, &0u32, &false, &dummy_hash(&env));
+
+    // First repost: also wrong, immediately disputed and overturned
+    // again.
+    let mut wrong_again = signal_set(&env, hour, 2);
+    wrong_again.liquidity_2pct = 500_000_000_000;
+    wrong_again.supply_change_bps = 0;
+    client.post_sub_signals(&keeper, &asset, &hour, &0u32, &wrong_again);
+    client.dispute_sub_signals(&disputer, &asset, &hour, &0u32, &dummy_hash(&env));
+    client.resolve_sub_signal_dispute(&asset, &hour, &0u32, &false, &dummy_hash(&env));
+    let second_overturned_at = env.ledger().timestamp();
+
+    // A second repost attempt, immediately, well within what would
+    // have been a fresh window: must still be rejected, since this
+    // overturn's own record belongs to the REPOST, which has no
+    // repost of its own.
+    let mut corrected = signal_set(&env, hour, 10_000_000);
+    corrected.liquidity_2pct = 500_000_000_000;
+    corrected.supply_change_bps = 0;
+    let result = client.try_post_sub_signals(&keeper, &asset, &hour, &0u32, &corrected);
+    assert!(
+        result.is_err(),
+        "the repost's own overturn gets no second repost"
+    );
+
+    let last_sub_pending_until =
+        sub_start(hour, per_hour - 1, sub_epoch_secs) + sub_epoch_secs + crate::SIGNAL_DISPUTE_SECS;
+    env.ledger()
+        .set_timestamp((second_overturned_at + 7_200).max(last_sub_pending_until) + 1);
+    client.build_hour(&asset, &hour);
+    assert!(
+        client.is_final(&asset, &hour),
+        "the hour must build without sub 0 once its own (second) repost window closes"
+    );
+    let ring = client.ring(&asset);
+    let slot = ring.iter().find(|s| s.epoch == hour).unwrap();
+    assert_eq!(slot.peg_ratio, 10_000_000);
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): the slot-ownership
+/// check (`storage::sub_slot_still_belongs_to`) must correctly refuse
+/// a direct ring write once a DIFFERENT, newer sub-epoch has rotated
+/// into that exact ring position. Verified directly against the
+/// storage layer (not through `post_sub_signals`, which never
+/// reaches this unsafe path once the ownership check is in place):
+/// this test is the one that would fail loudly if that check were
+/// ever removed or bypassed.
+#[test]
+fn slot_ownership_check_refuses_a_write_into_a_rotated_slot() {
+    let env = Env::default();
+    let (client, _governor, asset) = setup_with_governor_and_asset(&env);
+    let contract_id = client.address.clone();
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+    let hour = REALISTIC_EPOCH_BASE;
+    let original_sub_start = sub_start(hour, 0, sub_epoch_secs);
+
+    env.as_contract(&contract_id, || {
+        // Nothing posted yet: the position is Empty, so it belongs
+        // to the original sub-epoch (nothing else could own it).
+        assert!(crate::storage::sub_slot_still_belongs_to(
+            &env,
+            &asset,
+            original_sub_start
+        ));
+
+        // A newer sub-epoch, one full ring rotation (5 hours) later,
+        // claims the SAME ring position.
+        let rotated_sub_start = original_sub_start + 5 * EPOCH_SECS;
+        let mut s = signal_set(&env, hour, 10_000_000);
+        s.liquidity_2pct = 500_000_000_000;
+        s.supply_change_bps = 0;
+        let wrote = crate::storage::write_sub_slot_entry(
+            &env,
+            &asset,
+            rotated_sub_start,
+            &s,
+            SlotState::Pending,
+            rotated_sub_start + sub_epoch_secs,
+        );
+        assert!(wrote, "the newer sub-epoch's own write must succeed");
+
+        assert!(
+            !crate::storage::sub_slot_still_belongs_to(&env, &asset, original_sub_start),
+            "the original sub-epoch's own position now belongs to the newer one; a \
+             repost must never be allowed to overwrite it"
+        );
+    });
+}
+
+/// Section 5.9 S6: keeper pay for an overturned-then-reposted
+/// sub-epoch. The overturned post is never paid (its own keeper is
+/// slashed, not rewarded); the repost is paid exactly once, when the
+/// hour builds with it included.
+#[test]
+fn keeper_pay_never_pays_the_overturned_post_and_pays_the_repost_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let staking = env.register(crate::mocks::MockStaking, ());
+    let governor = env.register(MockGovernor, ());
+    let contract_id = env.register(RiskOracle, ());
+    let client = RiskOracleClient::new(&env, &contract_id);
+    let registry = Address::generate(&env);
+    client.initialize(&governor, &registry, &staking);
+    let committee = Address::generate(&env);
+    crate::mocks::MockGovernorClient::new(&env, &governor).set_committee(&committee);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    client.add_asset(&super::asset_config(&env, &asset, &issuer));
+    let staking_client = crate::mocks::MockStakingClient::new(&env, &staking);
+
+    let hour = REALISTIC_EPOCH_BASE;
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+    let per_hour = (EPOCH_SECS / sub_epoch_secs) as u32;
+    let keeper = Address::generate(&env);
+
+    post_sub(&env, &client, &keeper, &asset, hour, 0, sub_epoch_secs, 1);
+    let disputer = Address::generate(&env);
+    client.dispute_sub_signals(&disputer, &asset, &hour, &0u32, &dummy_hash(&env));
+    client.resolve_sub_signal_dispute(&asset, &hour, &0u32, &false, &dummy_hash(&env));
+
+    let mut corrected = signal_set(&env, hour, 10_000_000);
+    corrected.liquidity_2pct = 500_000_000_000;
+    corrected.supply_change_bps = 0;
+    client.post_sub_signals(&keeper, &asset, &hour, &0u32, &corrected);
+
+    for sub in 1..per_hour {
+        post_sub(
+            &env,
+            &client,
+            &keeper,
+            &asset,
+            hour,
+            sub,
+            sub_epoch_secs,
+            10_000_000,
+        );
+    }
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + crate::SIGNAL_DISPUTE_SECS + 1);
+    client.build_hour(&asset, &hour);
+    assert!(client.is_final(&asset, &hour));
+
+    assert_eq!(
+        staking_client.reward_keeper_sub_epoch_count(&keeper),
+        per_hour,
+        "exactly {per_hour} sub-epochs paid: 11 original posts plus the one repost, \
+         never the overturned original on top of it"
+    );
 }
 
 /// Section 5.9 S3: two sub-epochs of the SAME hour disputed at once,
@@ -898,8 +1352,19 @@ fn two_disputes_in_the_same_hour_resolve_independently() {
         "sub 1's own dispute is still open; the hour must not build yet"
     );
 
-    // Sub 1 overturned (disputer wins).
+    // Sub 1 overturned (disputer wins). The hour does NOT build yet
+    // (Section 5.9 S2, footprint-fix revision): sub 1 is now
+    // AwaitingRepost, not PermanentlyMissing, since its own repost
+    // window (anchored to this overturn) has just opened.
     client.resolve_sub_signal_dispute(&asset, &hour, &1u32, &false, &dummy_hash(&env));
+    assert!(
+        !client.is_final(&asset, &hour),
+        "sub 1 is awaiting repost; the hour must wait out its own repost window first"
+    );
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 7_200 + 1);
+    client.build_hour(&asset, &hour);
 
     assert!(
         client.is_final(&asset, &hour),

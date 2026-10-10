@@ -145,6 +145,30 @@ pub enum DataKey {
     /// hourly ring), never `inputs_hash` or `poster`, which have no
     /// fixed-width packed encoding; this key is where those live.
     SubSignals(Address, u64, u32),
+    /// Mirrors `Overturned(Address, u64)`'s own role for the sub-epoch
+    /// path (ADR-005, extended to sub-epochs by the Section 5.9 S5
+    /// footprint-fix review): history for an overturned sub-epoch's
+    /// `SignalSet`, moved here from `SubSignals(asset, hour, sub)` by
+    /// `resolve_sub_signal_dispute`'s rejection branch, so
+    /// `get_sub_signals` no longer finds it and `post_sub_signals` can
+    /// accept a fresh posting for the same `(hour, sub)`, while the
+    /// overturned data stays available for audit.
+    SubOverturned(Address, u64, u32),
+    /// Section 5.9 S2 (v1.5, footprint-fix revision): set the moment
+    /// `post_sub_signals` accepts a REPOST for this `(hour, sub)`
+    /// (never on an ordinary first post). Checked by `overturn_sub_
+    /// signals` if THIS posting is later overturned too: the one
+    /// repost per original overturn rule means that second overturn
+    /// must start its own `SubOverturnedRecord` already `reposted:
+    /// true`, not `false`, so a third posting attempt is refused.
+    /// Removed by `overturn_sub_signals` once consumed, so a FUTURE
+    /// original post (after this sub-epoch's entire two-cycle history
+    /// has played out and the hour has moved on) never misreads a
+    /// stale flag from a previous, unrelated hour reusing this key
+    /// (sub-epoch keys are never reused across different `(hour,
+    /// sub)` pairs in practice, but this still keeps the key's own
+    /// lifetime bounded to the one repost it describes).
+    SubRepostUsed(Address, u64, u32),
     /// Section 5.9 S3: the packed sub-epoch ring, fixed at
     /// `SUB_RING_SLOTS` slots, same encoding as `Ring(asset)` but
     /// keyed by each slot's own `sub_start` identity, not `epoch`.
@@ -1279,6 +1303,25 @@ pub fn get_sub_slot(env: &Env, asset: &Address, sub_start: u64) -> Option<SubRin
     }
 }
 
+/// Section 5.9 S2 (v1.5, footprint-fix revision): whether `sub_start`'s
+/// own ring position in `Sub(asset)` still belongs to it, i.e. is safe
+/// to write a repost into directly. True if the position is `Empty`
+/// (this sub-epoch's own slot, already cleared by the overturn) OR
+/// still holds `sub_start`'s own identity (not yet overwritten by a
+/// later sub-epoch's rotation). False if the position holds a
+/// DIFFERENT `sub_start` (always a strictly newer one, by `position_
+/// of_sub`'s own wraparound and the ring's existing newer-wins write
+/// guard): the slot has rotated out from under this sub-epoch, and a
+/// repost must go to `HeldHour` instead, never overwrite someone
+/// else's data. A repost's own caller must check this BEFORE writing,
+/// never write first and check after.
+pub fn sub_slot_still_belongs_to(env: &Env, asset: &Address, sub_start: u64) -> bool {
+    let packed = get_sub_ring_packed(env, asset);
+    let index = position_of_sub(sub_start);
+    let slot = read_sub_slot(&packed, index);
+    slot.state == SlotState::Empty || slot.sub_start == sub_start
+}
+
 /// Writes `sub_start`'s slot. Refuses to overwrite a position that
 /// currently holds a strictly newer `sub_start`, the same ring
 /// protection `write_ring_slot` gives the hourly ring. Returns `false`
@@ -1402,6 +1445,112 @@ pub fn set_sub_signals(env: &Env, asset: &Address, hour: u64, sub: u32, signals:
     env.storage()
         .persistent()
         .set(&DataKey::SubSignals(asset.clone(), hour, sub), signals);
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): one overturned
+/// sub-epoch's own history record, mirroring `Overturned(asset,
+/// epoch)`'s role for the hourly path, extended with the two fields
+/// a sub-epoch's own repost window needs that an hourly epoch's
+/// equivalent (ADR-005) never had to track:
+/// - `overturned_at`: when the ruling landed, so a repost's own
+///   window can be anchored to it (`max(original_close +
+///   sub_backfill_secs, overturned_at + sub_backfill_secs)`), not
+///   just to the sub-epoch's original close, which a slow (up to
+///   `signal_dispute_ruling_secs`, 6 days) ruling could easily land
+///   well past.
+/// - `reposted`: whether this exact overturn has already been
+///   reposted once. A repost's own dispute, if also overturned, is
+///   its OWN new `SubOverturned` record (never this one, mutated),
+///   with THIS record's `reposted` staying `true` forever, so no
+///   second repost of this original overturn is ever accepted: the
+///   longest a hour can wait on one sub-epoch is two dispute cycles
+///   (post, dispute, overturn, repost, dispute again, overturn
+///   again), never more.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubOverturnedRecord {
+    pub signals: SignalSet,
+    pub overturned_at: u64,
+    pub reposted: bool,
+}
+
+/// Mirrors `overturn_signals`'s own move-to-history shape, for one
+/// sub-epoch: moves `SubSignals(asset, hour, sub)` to the
+/// `SubOverturned` history key (tagged with `overturned_at = now`,
+/// `reposted = false`) and removes the live entry, so `get_sub_
+/// signals` reports it missing (unblocking a repost for this exact
+/// `(hour, sub)`, within its own window) while the overturned data
+/// stays retrievable via `get_overturned_sub_signals`. A no-op if
+/// there was no `SubSignals` entry for this sub-epoch (defensive;
+/// `resolve_sub_signal_dispute`'s caller already checked one exists
+/// before calling this).
+pub fn overturn_sub_signals(env: &Env, asset: &Address, hour: u64, sub: u32, now: u64) {
+    let key = DataKey::SubSignals(asset.clone(), hour, sub);
+    if let Some(signals) = env.storage().persistent().get::<_, SignalSet>(&key) {
+        let repost_used_key = DataKey::SubRepostUsed(asset.clone(), hour, sub);
+        // One repost per ORIGINAL overturn: if the posting being
+        // overturned right now was itself already a repost, this new
+        // record starts `reposted: true` from the moment it is
+        // written, so a third posting attempt is refused outright,
+        // never reset to false the way a fresh SubOverturnedRecord
+        // otherwise would be.
+        let already_used_its_repost = env.storage().persistent().has(&repost_used_key);
+        env.storage().persistent().remove(&repost_used_key);
+        env.storage().persistent().set(
+            &DataKey::SubOverturned(asset.clone(), hour, sub),
+            &SubOverturnedRecord {
+                signals,
+                overturned_at: now,
+                reposted: already_used_its_repost,
+            },
+        );
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// The history record an overturned sub-epoch was moved to by
+/// `overturn_sub_signals`. `None` if that sub-epoch was never
+/// overturned (or a repost of it was itself overturned again, which
+/// overwrites this entry with the newer attempt's own record, same
+/// as `get_overturned_signals`'s own convention: only the most
+/// recent overturn stays on record).
+pub fn get_overturned_sub_signals(
+    env: &Env,
+    asset: &Address,
+    hour: u64,
+    sub: u32,
+) -> Option<SubOverturnedRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubOverturned(asset.clone(), hour, sub))
+}
+
+/// Marks the overturn record for `(hour, sub)` as having now been
+/// reposted once, so a second repost of the SAME overturn is refused
+/// (`SubEpochAlreadyReposted`-equivalent, enforced by the caller via
+/// this flag, not a separate error code: a repost is accepted or not
+/// based on whether an overturn record exists and is not yet
+/// reposted, so this flag's own check happens inline in `post_sub_
+/// signals`, not here). A no-op if there is no overturn record for
+/// this sub-epoch at all (defensive; the caller already found one
+/// before calling this).
+pub fn mark_sub_overturn_reposted(env: &Env, asset: &Address, hour: u64, sub: u32) {
+    let key = DataKey::SubOverturned(asset.clone(), hour, sub);
+    if let Some(mut record) = env
+        .storage()
+        .persistent()
+        .get::<_, SubOverturnedRecord>(&key)
+    {
+        record.reposted = true;
+        env.storage().persistent().set(&key, &record);
+    }
+    // Tags the just-accepted repost itself, so IF it is later
+    // overturned too, that overturn's own fresh record starts
+    // already `reposted: true` (see `overturn_sub_signals`): the one
+    // repost per original overturn rule.
+    env.storage()
+        .persistent()
+        .set(&DataKey::SubRepostUsed(asset.clone(), hour, sub), &true);
 }
 
 // -- sub-epoch config (Section 5.9 S1) --
