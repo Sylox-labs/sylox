@@ -348,6 +348,43 @@ describe("fetchEventsPaginated (backward-chunked scan, incrementally cached)", (
     expect(second.stoppedAtRequestCap).toBe(true);
   });
 
+  it("replaces (never merges onto) the cache when an incremental refresh stops at its OWN event limit before reaching the old cache's floor, even though the request cap was never hit", async () => {
+    const fake = makeFakeServer({
+      latestLedger: 100_000,
+      initialOldestLedger: 100_000 - 120_960,
+      driftPerHealthCall: 0,
+      eventLedgers: [99_990],
+    });
+    fakeServerInstance.instance = fake as never;
+
+    const { fetchEventsPaginated } = await import("./stellar-rpc-events");
+    const first = await fetchEventsPaginated({ ...TEST_QUERY, limit: 50 });
+    expect(first.events.map((e) => e.ledger)).toEqual([99_990]);
+
+    // New ledgers close, with enough new events packed into the very
+    // first new chunk that the incremental refresh's own `limit: 1`
+    // below is satisfied immediately - it stops right there (well
+    // under REQUEST_CAP=20 requests, so stoppedAtRequestCap would be
+    // false if that were still the only trigger), long before
+    // reaching back down to the old cache's floor.
+    fake.advanceLatestLedger(20_000);
+    fake.addEventLedger(119_999);
+    fake.addEventLedger(119_998);
+
+    const second = await fetchEventsPaginated({ ...TEST_QUERY, limit: 1 });
+
+    // Only the newest event (from the freshly-scanned slice) comes
+    // back - the old cached event at 99_990 is correctly dropped,
+    // because the gap between where this refresh stopped (having
+    // satisfied its own limit) and the old cache's floor was never
+    // actually scanned. The result still honestly reports that more
+    // history wasn't scanned, even though REQUEST_CAP itself was
+    // never approached.
+    expect(second.events.map((e) => e.ledger)).toEqual([119_999]);
+    expect(second.stoppedAtRequestCap).toBe(true);
+    expect(fake.callCounts.healthCallCount + fake.callCounts.getEventsCallCount).toBeLessThan(20);
+  });
+
   it("keys the sessionStorage cache by contract id, so a different contract never serves another's events", async () => {
     const fake = makeFakeServer({
       latestLedger: 100_000,

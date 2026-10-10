@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import EventsPage from "./page";
 import { WalletProvider } from "@/lib/wallet/WalletContext";
 import type { EventListRow } from "@/lib/events-list-data";
@@ -111,7 +111,9 @@ describe("EventsPage", () => {
     renderEventsPage();
     expect(screen.getByText(/loading events from the registry/i)).toBeInTheDocument();
 
-    capturedOnRowProgress?.(baseRow);
+    act(() => {
+      capturedOnRowProgress?.(baseRow);
+    });
 
     // The row is visible WHILE the scan is still "loading" - the
     // outer listRegistryEvents() promise hasn't resolved yet.
@@ -127,6 +129,38 @@ describe("EventsPage", () => {
 
     await screen.findByText(/events in the last/i);
     expect(screen.getByText("USDC")).toBeInTheDocument();
+  });
+
+  it("renders partialRows newest-first (by proposedAt), even when rows resolve out of that order", async () => {
+    let capturedOnRowProgress: ((row: EventListRow) => void) | undefined;
+    listRegistryEvents.mockImplementation(
+      (opts: { onRowProgress?: (row: EventListRow) => void }) =>
+        new Promise((resolve) => {
+          capturedOnRowProgress = opts.onRowProgress;
+          void resolve; // Deliberately never resolved - this test only cares about the loading-state partialRows ordering.
+        }),
+    );
+
+    renderEventsPage();
+
+    const older = { ...baseRow, id: BigInt(1), assetCode: "OLDER", proposedAt: BigInt(1_000) };
+    const newest = { ...baseRow, id: BigInt(2), assetCode: "NEWEST", proposedAt: BigInt(3_000) };
+    const middle = { ...baseRow, id: BigInt(3), assetCode: "MIDDLE", proposedAt: BigInt(2_000) };
+
+    // Resolved deliberately out of chronological order - onRowProgress
+    // fires in whatever order each id's event() read actually settles
+    // in (see events-list-data.ts), which this simulates directly:
+    // the OLDEST of the three resolves first, then the NEWEST, then
+    // the one in between.
+    act(() => {
+      capturedOnRowProgress?.(older);
+      capturedOnRowProgress?.(newest);
+      capturedOnRowProgress?.(middle);
+    });
+
+    await screen.findByText("OLDER");
+    const assetCodes = screen.getAllByText(/^(OLDER|NEWEST|MIDDLE)$/).map((el) => el.textContent);
+    expect(assetCodes).toEqual(["NEWEST", "MIDDLE", "OLDER"]);
   });
 
   it("renders a row with asset code, kind, state, and a countdown, linking to its Event screen", async () => {

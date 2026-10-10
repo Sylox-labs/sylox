@@ -55,7 +55,13 @@ export default function EventsPage() {
       onRowProgress: (row) => {
         if (cancelled) return;
         seen.set(row.id.toString(), row);
-        setPartialRows(Array.from(seen.values()));
+        // Rows resolve in whatever order their event(id) reads happen
+        // to settle in (see events-list-data.ts's onRowProgress doc
+        // comment - a later id can resolve before an earlier one), so
+        // insertion order alone isn't newest-first. Sorted by
+        // proposedAt descending on every update instead, matching the
+        // order the final, resolved rows are shown in.
+        setPartialRows(Array.from(seen.values()).sort((a, b) => Number(b.proposedAt - a.proposedAt)));
       },
     })
       .then(({ rows, oldestLedgerScanned, latestLedger, stoppedAtRequestCap }) => {

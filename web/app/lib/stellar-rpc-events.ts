@@ -83,7 +83,7 @@ export interface PaginatedEventsResult {
   latestLedger: number;
   latestLedgerCloseTime: number;
   requestCount: number;
-  /** True if the hard request cap was hit before the floor or the event limit - the result is still correct (newest-first, no gaps), just possibly short of `limit` even though more history might exist further back. The label this feeds must say so (see components/EventsList's "Loading older events"/"No events in the last N days scanned" copy). */
+  /** True if the scan stopped before reaching the floor it was asked to cover - whether because the hard request cap was hit, the event limit was collected first, or the one bounded out-of-range retry failed. The result is still correct (newest-first, no gaps up to oldestLedgerScanned), just possibly short of real history further back. The label this feeds must say so (see components/EventsList's "Loading older events"/"No events in the last N days scanned" copy). */
   stoppedAtRequestCap: boolean;
 }
 
@@ -351,17 +351,24 @@ export async function fetchEventsPaginated(
     const incremental = await scanBackward(query, health.latestLedger, incrementalFloor, options.onProgress);
     requestCount += incremental.requestCount;
 
-    if (incremental.stoppedAtRequestCap && incremental.oldestLedgerScanned > incrementalFloor) {
+    if (incremental.oldestLedgerScanned > incrementalFloor) {
       // The new slice itself didn't make it all the way back down to
-      // incrementalFloor before hitting the request cap - the gap
-      // between where it stopped (oldestLedgerScanned) and
-      // incrementalFloor was never actually scanned. Recording
+      // incrementalFloor - the gap between where it stopped
+      // (oldestLedgerScanned) and incrementalFloor was never actually
+      // scanned. This happens not only when the request cap is hit,
+      // but also when the incremental scan collects query.limit
+      // events before reaching incrementalFloor, or when the one
+      // bounded out-of-range retry (see scanBackward) fails or has
+      // nothing left after re-clamping - none of those set
+      // stoppedAtRequestCap, but all of them leave the same real,
+      // unscanned gap above incrementalFloor. Recording
       // latestLedgerCovered as health.latestLedger below would claim
-      // that untouched gap as covered on the next call, so this
-      // replaces the cache with only what THIS scan really saw rather
-      // than merging it onto the old (now unverifiable) cached
-      // events - the old events's own coverage claim can no longer be
-      // trusted once a gap like this exists above them.
+      // that gap as covered on the next call regardless of why the
+      // scan stopped short, so this replaces the cache with only what
+      // THIS scan really saw rather than merging it onto the old (now
+      // unverifiable) cached events - the old events's own coverage
+      // claim can no longer be trusted once a gap like this exists
+      // above them.
       events = incremental.events;
       oldestLedgerScanned = incremental.oldestLedgerScanned;
       latestLedgerCloseTime = incremental.latestLedgerCloseTime;
