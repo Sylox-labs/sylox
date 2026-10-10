@@ -74,6 +74,61 @@ describe("EventsPage", () => {
     expect(screen.queryByText(/^no events yet\.?$/i)).not.toBeInTheDocument();
   });
 
+  it("says history wasn't fully scanned (never 'no events found') when the cap was hit but rows did come back", async () => {
+    listRegistryEvents.mockResolvedValue({
+      rows: [baseRow],
+      oldestLedgerScanned: 100_000,
+      latestLedger: 100_000 + Math.round((1.5 * 86400) / 5),
+      stoppedAtRequestCap: true,
+    });
+    renderEventsPage();
+
+    expect(await screen.findByText("USDC")).toBeInTheDocument();
+    expect(
+      screen.getByText(/showing events from the last 1\.5 days; older history not scanned/i),
+    ).toBeInTheDocument();
+    // The list right below clearly has a row - the top label must
+    // never contradict it by claiming nothing was found.
+    expect(screen.queryByText(/no events found/i)).not.toBeInTheDocument();
+  });
+
+  it("renders rows as they're resolved via onRowProgress, before the whole scan finishes", async () => {
+    let capturedOnRowProgress: ((row: EventListRow) => void) | undefined;
+    let resolveScan!: (value: {
+      rows: EventListRow[];
+      oldestLedgerScanned: number;
+      latestLedger: number;
+      stoppedAtRequestCap: boolean;
+    }) => void;
+    listRegistryEvents.mockImplementation(
+      (opts: { onRowProgress?: (row: EventListRow) => void }) =>
+        new Promise((resolve) => {
+          capturedOnRowProgress = opts.onRowProgress;
+          resolveScan = resolve;
+        }),
+    );
+
+    renderEventsPage();
+    expect(screen.getByText(/loading events from the registry/i)).toBeInTheDocument();
+
+    capturedOnRowProgress?.(baseRow);
+
+    // The row is visible WHILE the scan is still "loading" - the
+    // outer listRegistryEvents() promise hasn't resolved yet.
+    expect(await screen.findByText("USDC")).toBeInTheDocument();
+    expect(screen.getByText(/loading older events/i)).toBeInTheDocument();
+
+    resolveScan({
+      rows: [baseRow],
+      oldestLedgerScanned: 100_000,
+      latestLedger: 200_000,
+      stoppedAtRequestCap: false,
+    });
+
+    await screen.findByText(/events in the last/i);
+    expect(screen.getByText("USDC")).toBeInTheDocument();
+  });
+
   it("renders a row with asset code, kind, state, and a countdown, linking to its Event screen", async () => {
     listRegistryEvents.mockResolvedValue({
       rows: [baseRow],

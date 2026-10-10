@@ -40,21 +40,22 @@ function formatCountdown(windowClosesAt: bigint | null): string | null {
 
 export default function EventsPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
-  const [partialRows, setPartialRows] = useState<EventListRow[] | null>(null);
+  // Rows resolved so far during a still-running scan - each one has
+  // already had its CURRENT state read via event(event_id) (see
+  // lib/events-list-data.ts's onRowProgress), so these are real,
+  // final rows, just not yet the complete set. Replaced wholesale by
+  // state.rows once the scan resolves, at which point this is cleared
+  // (its job is only to cover the loading gap).
+  const [partialRows, setPartialRows] = useState<EventListRow[]>([]);
 
   useEffect(() => {
     let cancelled = false;
+    const seen = new Map<string, EventListRow>();
     listRegistryEvents({
-      onProgress: () => {
-        // The newest events are what onProgress reports first (see
-        // lib/stellar-rpc-events.ts) - this just flags that SOME
-        // results have started landing, so the UI can swap its
-        // "Loading" message for "Loading older events" while the
-        // scan keeps walking further back. The final row list still
-        // comes from the resolved listRegistryEvents() call below,
-        // which has already read each event's current state via
-        // event(event_id) - onProgress's own raw events haven't.
-        if (!cancelled) setPartialRows((prev) => prev ?? []);
+      onRowProgress: (row) => {
+        if (cancelled) return;
+        seen.set(row.id.toString(), row);
+        setPartialRows(Array.from(seen.values()));
       },
     })
       .then(({ rows, oldestLedgerScanned, latestLedger, stoppedAtRequestCap }) => {
@@ -85,9 +86,12 @@ export default function EventsPage() {
 
         <div className="mt-12">
           {state.status === "loading" && (
-            <p className="font-mono text-sm text-cyber-tin" role="status">
-              {partialRows ? "Loading older events…" : "Loading events from the registry…"}
-            </p>
+            <>
+              <p className="font-mono text-sm text-cyber-tin" role="status">
+                {partialRows.length > 0 ? "Loading older events…" : "Loading events from the registry…"}
+              </p>
+              {partialRows.length > 0 && <EventRows rows={partialRows} className="mt-6" />}
+            </>
           )}
 
           {state.status === "error" && (
@@ -99,9 +103,7 @@ export default function EventsPage() {
           {state.status === "ready" && (
             <>
               <p className="font-mono text-xs text-cyber-tin">
-                {state.stoppedAtRequestCap
-                  ? `No events found in ${describeScannedWindow(state.latestLedger, state.oldestLedgerScanned)} scanned.`
-                  : `Events in ${describeScannedWindow(state.latestLedger, state.oldestLedgerScanned)}.`}
+                {windowLabel(state.rows.length, state.stoppedAtRequestCap, state.latestLedger, state.oldestLedgerScanned)}
               </p>
 
               {state.rows.length === 0 ? (
@@ -111,32 +113,54 @@ export default function EventsPage() {
                     : "No events yet."}
                 </p>
               ) : (
-                <div className="mt-6 flex flex-col gap-3">
-                  {state.rows.map((row) => {
-                    const countdown = formatCountdown(row.windowClosesAt);
-                    return (
-                      <Card key={row.id.toString()} href={`/event/${row.id}`} className="flex items-center justify-between gap-4">
-                        <div className="min-w-0">
-                          <p className="truncate font-display text-lg text-silo-oatmeal">{row.assetCode}</p>
-                          <p className="font-mono text-xs text-cyber-tin">{row.kind}</p>
-                        </div>
-                        <div className="flex shrink-0 items-center gap-3">
-                          {countdown && (
-                            <span className="font-mono text-xs text-cyber-tin">{countdown}</span>
-                          )}
-                          <span className="rounded-full border border-risk-crimson/40 bg-risk-crimson/10 px-3 py-1 font-mono text-xs uppercase tracking-wide text-risk-crimson-tint">
-                            {STATE_LABEL[row.state]}
-                          </span>
-                        </div>
-                      </Card>
-                    );
-                  })}
-                </div>
+                <EventRows rows={state.rows} className="mt-6" />
               )}
             </>
           )}
         </div>
       </main>
     </DashboardShell>
+  );
+}
+
+/**
+ * The top-of-page summary label. "No events found in..." is only ever
+ * honest with zero rows - with rows AND a cap stop, the scan did find
+ * real events, just not necessarily all of them, so the label says
+ * that instead of contradicting the list rendered right below it.
+ */
+function windowLabel(
+  rowCount: number,
+  stoppedAtRequestCap: boolean,
+  latestLedger: number,
+  oldestLedgerScanned: number,
+): string {
+  const window = describeScannedWindow(latestLedger, oldestLedgerScanned);
+  if (!stoppedAtRequestCap) return `Events in ${window}.`;
+  if (rowCount === 0) return `No events found in ${window} scanned.`;
+  return `Showing events from ${window}; older history not scanned.`;
+}
+
+function EventRows({ rows, className }: { rows: EventListRow[]; className?: string }) {
+  return (
+    <div className={`flex flex-col gap-3 ${className ?? ""}`}>
+      {rows.map((row) => {
+        const countdown = formatCountdown(row.windowClosesAt);
+        return (
+          <Card key={row.id.toString()} href={`/event/${row.id}`} className="flex items-center justify-between gap-4">
+            <div className="min-w-0">
+              <p className="truncate font-display text-lg text-silo-oatmeal">{row.assetCode}</p>
+              <p className="font-mono text-xs text-cyber-tin">{row.kind}</p>
+            </div>
+            <div className="flex shrink-0 items-center gap-3">
+              {countdown && <span className="font-mono text-xs text-cyber-tin">{countdown}</span>}
+              <span className="rounded-full border border-risk-crimson/40 bg-risk-crimson/10 px-3 py-1 font-mono text-xs uppercase tracking-wide text-risk-crimson-tint">
+                {STATE_LABEL[row.state]}
+              </span>
+            </div>
+          </Card>
+        );
+      })}
+    </div>
   );
 }

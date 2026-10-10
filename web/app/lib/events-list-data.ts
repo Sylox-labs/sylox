@@ -1,7 +1,7 @@
 import { scValToNative, nativeToScVal } from "@stellar/stellar-sdk";
 import { eventRegistryClient } from "./contracts/event-registry";
 import { assetDisplayName } from "./contracts/token";
-import { fetchEventsPaginated, type FetchEventsOptions } from "./stellar-rpc-events";
+import { fetchEventsPaginated, type EventRecordRaw } from "./stellar-rpc-events";
 import { testnetDeployment } from "./contracts/deployment";
 import type { EventRecord } from "./contracts/event-registry";
 
@@ -85,23 +85,75 @@ async function rowFor(
   };
 }
 
-export async function listRegistryEvents(options: FetchEventsOptions = {}): Promise<EventListResult> {
+function eventIdFor(raw: EventRecordRaw): bigint {
+  const decoded = scValToNative(raw.value as never) as DecodedEventProposed;
+  return decoded.event_id;
+}
+
+export interface ListRegistryEventsOptions {
+  /**
+   * Called with a newly-resolved row as soon as its current state has
+   * been read via event(event_id) - not batched until the whole scan
+   * finishes. Rows arrive in the same newest-first order the
+   * underlying ledger scan finds their ids in, but resolution itself
+   * is per-id (not strictly serialized against the scan's own
+   * chunking), so a later id can occasionally resolve before an
+   * earlier one; the final `rows` from the resolved promise is always
+   * the complete, correctly-ordered list regardless. A null row (the
+   * log mentioned an id a read then raced past, see rowFor) is never
+   * reported - exactly the ids the final result itself filters out.
+   */
+  onRowProgress?: (row: EventListRow) => void;
+}
+
+export async function listRegistryEvents(options: ListRegistryEventsOptions = {}): Promise<EventListResult> {
   const registry = eventRegistryClient();
+  // Keyed by event id: the SAME in-flight (or settled) promise every
+  // caller of resolveFor awaits, so a row started early by
+  // resolveNewIds (below) is never re-fetched by the final batch just
+  // because that fetch hadn't settled yet when the scan resolved.
+  const inFlight = new Map<string, Promise<EventListRow | null>>();
+
+  const resolveFor = (id: bigint): Promise<EventListRow | null> => {
+    const key = id.toString();
+    const existing = inFlight.get(key);
+    if (existing) return existing;
+    const promise = rowFor(registry, id);
+    inFlight.set(key, promise);
+    return promise;
+  };
+
+  const resolveNewIds = (raws: EventRecordRaw[]): void => {
+    if (!options.onRowProgress) return;
+    for (const raw of raws) {
+      const id = eventIdFor(raw);
+      if (inFlight.has(id.toString())) continue;
+      // Fire-and-forget: resolving a row never blocks the scan itself
+      // from walking further chunks, so the newest rows a visitor can
+      // already see don't wait on an older, still-in-flight one. A
+      // failed read here is never fatal - the final Promise.all below
+      // awaits this SAME promise and correctly surfaces a real
+      // rejection there, so this only needs to avoid an unhandled
+      // rejection, not report the error itself.
+      void resolveFor(id)
+        .then((row) => {
+          if (row !== null) options.onRowProgress?.(row);
+        })
+        .catch(() => {});
+    }
+  };
+
   const scan = await fetchEventsPaginated(
     {
       contractId: testnetDeployment.contracts.event_registry.id,
       topics: [topicXdr("sylox"), topicXdr("event_proposed"), "*"],
       limit: 50,
     },
-    options,
+    { onProgress: resolveNewIds },
   );
 
-  const eventIds = scan.events.map((raw) => {
-    const decoded = scValToNative(raw.value as never) as DecodedEventProposed;
-    return decoded.event_id;
-  });
-
-  const rows = (await Promise.all(eventIds.map((id) => rowFor(registry, id)))).filter(
+  const eventIds = scan.events.map(eventIdFor);
+  const rows = (await Promise.all(eventIds.map((id) => resolveFor(id)))).filter(
     (r): r is EventListRow => r !== null,
   );
 

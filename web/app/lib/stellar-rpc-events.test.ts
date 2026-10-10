@@ -258,23 +258,37 @@ describe("fetchEventsPaginated (backward-chunked scan, incrementally cached)", (
     expect(second.events.map((e) => e.ledger)).not.toContain(99_150);
   });
 
-  it("calls onProgress with events found so far during a cold scan, before the scan finishes", async () => {
+  it("calls onProgress after EVERY chunk during a cold scan, not just once at the end", async () => {
     const fake = makeFakeServer({
       latestLedger: 100_000,
       initialOldestLedger: 100_000 - 30_000,
       driftPerHealthCall: 0,
-      eventLedgers: [100_000 - 25_000], // ~3 chunks back - onProgress should fire more than once.
+      // Nothing found until the 3rd chunk back, and no limit that
+      // could let the scan stop early - forces it to walk all 3
+      // chunks in this window, so onProgress firing only once (at the
+      // very end) vs. once per chunk is actually distinguishable.
+      eventLedgers: [100_000 - 25_000],
     });
     fakeServerInstance.instance = fake as never;
 
     const { fetchEventsPaginated } = await import("./stellar-rpc-events");
     const progressCalls: number[][] = [];
     await fetchEventsPaginated(
-      { ...TEST_QUERY, limit: 1 },
+      { ...TEST_QUERY, limit: 50 },
       { onProgress: (events) => progressCalls.push(events.map((e) => e.ledger)) },
     );
 
-    expect(progressCalls.length).toBeGreaterThanOrEqual(1);
+    // 3 chunks back at CHUNK_SIZE=10,000 over a 30,000-ledger window -
+    // one onProgress call per chunk, landing before the scan as a
+    // whole resolves.
+    expect(progressCalls.length).toBe(3);
+    // The first two chunks found nothing yet; only the third (oldest)
+    // chunk actually contains the event - onProgress's own snapshots
+    // reflect that growth chunk by chunk, not just the final state
+    // repeated three times.
+    expect(progressCalls[0]).toEqual([]);
+    expect(progressCalls[1]).toEqual([]);
+    expect(progressCalls[2]).toEqual([100_000 - 25_000]);
   });
 
   it("persists across a fresh module import (simulating a page reload) via sessionStorage", async () => {
@@ -299,6 +313,39 @@ describe("fetchEventsPaginated (backward-chunked scan, incrementally cached)", (
 
     expect(afterReload.events.map((e) => e.ledger)).toEqual([99_990]);
     expect(fake.callCounts.getEventsCallCount).toBe(eventsCallsBeforeReload); // No new getEvents call needed - sessionStorage already had it.
+  });
+
+  it("replaces (never merges onto) the cache when an incremental refresh itself stops at the request cap before reaching the old cache's floor", async () => {
+    const fake = makeFakeServer({
+      latestLedger: 100_000,
+      initialOldestLedger: 100_000 - 120_960,
+      driftPerHealthCall: 0,
+      eventLedgers: [99_990],
+    });
+    fakeServerInstance.instance = fake as never;
+
+    const { fetchEventsPaginated } = await import("./stellar-rpc-events");
+    const first = await fetchEventsPaginated({ ...TEST_QUERY, limit: 50 });
+    expect(first.events.map((e) => e.ledger)).toEqual([99_990]);
+
+    // New ledgers close - far more of them than REQUEST_CAP * CHUNK_SIZE
+    // can cover in one incremental refresh (cap=20, chunk=10,000 -> a
+    // 500,000-ledger-wide new slice forces the refresh itself to stop
+    // at the cap well before it reaches back down to the old cache's
+    // floor, cached.latestLedgerCovered+1). A new event lands just
+    // inside the part of that new slice the refresh DOES reach.
+    fake.advanceLatestLedger(500_000);
+    fake.addEventLedger(599_995);
+
+    const second = await fetchEventsPaginated({ ...TEST_QUERY, limit: 50 });
+
+    // The new event (within the freshly-scanned range) is present;
+    // the old cached event at 99_990 is NOT, because the gap between
+    // where this refresh stopped and the old cache's floor was never
+    // actually scanned - merging it back in would falsely claim that
+    // gap as covered.
+    expect(second.events.map((e) => e.ledger)).toEqual([599_995]);
+    expect(second.stoppedAtRequestCap).toBe(true);
   });
 
   it("keys the sessionStorage cache by contract id, so a different contract never serves another's events", async () => {

@@ -160,11 +160,20 @@ async function fetchChunk(
   return { events, latestLedgerCloseTimeSecs, requestCount };
 }
 
-/** Scans `[floor, latestLedger]` backward in fixed chunks, newest-first, stopping at `query.limit` events, the floor, or REQUEST_CAP. */
+/**
+ * Scans `[floor, latestLedger]` backward in fixed chunks, newest-first,
+ * stopping at `query.limit` events, the floor, or REQUEST_CAP. Calls
+ * `onChunk` with everything collected SO FAR (newest-first) after
+ * every chunk lands, including the first - the caller can render each
+ * batch of rows as it arrives instead of waiting for the whole scan,
+ * which can be several chunks (and several seconds) for an older
+ * event.
+ */
 async function scanBackward(
   query: EventQuery,
   latestLedger: number,
   floor: number,
+  onChunk?: (eventsSoFar: EventRecordRaw[]) => void,
 ): Promise<{
   events: EventRecordRaw[];
   oldestLedgerScanned: number;
@@ -214,6 +223,15 @@ async function scanBackward(
       if (seenIds.has(event.id)) continue; // Dedupe across chunk edges.
       seenIds.add(event.id);
       collected.push(event);
+    }
+
+    if (onChunk) {
+      // A stable newest-first snapshot after every chunk, not just at
+      // the end - cheap enough per chunk (at most REQUEST_CAP of
+      // them) that sorting on every call is simpler than maintaining
+      // a second incrementally-sorted structure.
+      const sortedSoFar = [...collected].sort((a, b) => b.ledger - a.ledger);
+      onChunk(sortedSoFar);
     }
 
     if (collected.length >= query.limit) break;
@@ -329,27 +347,43 @@ export async function fetchEventsPaginated(
   if (cached && cached.latestLedgerCovered >= floor) {
     // Warm, but behind the current tip - only scan the new slice,
     // normally 1 request, then merge with what's already cached.
-    const incremental = await scanBackward(query, health.latestLedger, cached.latestLedgerCovered + 1);
+    const incrementalFloor = cached.latestLedgerCovered + 1;
+    const incremental = await scanBackward(query, health.latestLedger, incrementalFloor, options.onProgress);
     requestCount += incremental.requestCount;
-    options.onProgress?.(incremental.events);
 
-    const seen = new Set(incremental.events.map((e) => e.id));
-    const merged = [
-      ...incremental.events,
-      ...cached.events.filter((e) => !seen.has(e.id) && e.ledger >= floor), // Drop anything that's since aged below the moving floor.
-    ];
-    merged.sort((a, b) => b.ledger - a.ledger);
+    if (incremental.stoppedAtRequestCap && incremental.oldestLedgerScanned > incrementalFloor) {
+      // The new slice itself didn't make it all the way back down to
+      // incrementalFloor before hitting the request cap - the gap
+      // between where it stopped (oldestLedgerScanned) and
+      // incrementalFloor was never actually scanned. Recording
+      // latestLedgerCovered as health.latestLedger below would claim
+      // that untouched gap as covered on the next call, so this
+      // replaces the cache with only what THIS scan really saw rather
+      // than merging it onto the old (now unverifiable) cached
+      // events - the old events's own coverage claim can no longer be
+      // trusted once a gap like this exists above them.
+      events = incremental.events;
+      oldestLedgerScanned = incremental.oldestLedgerScanned;
+      latestLedgerCloseTime = incremental.latestLedgerCloseTime;
+      stoppedAtRequestCap = true;
+    } else {
+      const seen = new Set(incremental.events.map((e) => e.id));
+      const merged = [
+        ...incremental.events,
+        ...cached.events.filter((e) => !seen.has(e.id) && e.ledger >= floor), // Drop anything that's since aged below the moving floor.
+      ];
+      merged.sort((a, b) => b.ledger - a.ledger);
 
-    events = merged;
-    oldestLedgerScanned = Math.min(cached.oldestLedgerScanned, incremental.oldestLedgerScanned);
-    latestLedgerCloseTime = incremental.latestLedgerCloseTime || cached.latestLedgerCloseTime;
-    stoppedAtRequestCap = incremental.stoppedAtRequestCap || cached.stoppedAtRequestCap;
+      events = merged;
+      oldestLedgerScanned = Math.min(cached.oldestLedgerScanned, incremental.oldestLedgerScanned);
+      latestLedgerCloseTime = incremental.latestLedgerCloseTime || cached.latestLedgerCloseTime;
+      stoppedAtRequestCap = incremental.stoppedAtRequestCap || cached.stoppedAtRequestCap;
+    }
   } else {
     // No usable cache (none at all, or its coverage has entirely aged
     // out below the floor) - a full cold scan.
-    const cold = await scanBackward(query, health.latestLedger, floor);
+    const cold = await scanBackward(query, health.latestLedger, floor, options.onProgress);
     requestCount += cold.requestCount;
-    options.onProgress?.(cold.events);
 
     events = cold.events;
     oldestLedgerScanned = cold.oldestLedgerScanned;
