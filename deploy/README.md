@@ -127,3 +127,38 @@ relevant here regardless of `challenge_secs`: it explicitly rejects
 any non-`Depeg` event (`WrongState`), so `finalize` is the only call
 that moves an `IssuerFreeze` event forward. Never change USDC's own
 definitions to match this short window.
+
+## DEMOUSD: real fields vs. sample fields, and running it once
+
+`deploy/demo-asset-trigger.sh` is a ONE-TIME script: it creates a
+holder, mints it DEMOUSD, and claws part of it back for real. Running
+it again does not "redo" the demo cleanly — minting a second time
+would corrupt the holder's own real balance relative to what the
+script's own math assumes (this happened once, see below), so the
+mint step only mints if the holder's real on-chain balance is still
+zero. Resetting the demo means a fresh holder identity and a fresh
+DEMOUSD asset (`deploy/demo-asset.sh` again, under a different
+issuer), not re-running this script.
+
+Which posted fields are REAL (read from the chain at posting time,
+never invented) and which are SAMPLE (plausible placeholders, since
+DEMOUSD has no real market):
+
+| Field | Real or sample |
+|---|---|
+| `supply` | Real. Read from Horizon's asset-stats endpoint (`authorized + authorized_to_maintain_liabilities + unauthorized`) immediately before each post. |
+| `issuer_actions.clawback_amount` | Real. Read back from the clawback transaction's own Horizon effects (`account_debited`), never the amount requested. |
+| `issuer_actions.auth_revocations` | Real: exactly one real `set-trustline-flags --clear-authorize` happened. |
+| `revoke_tx_hash`, `clawback_tx_hash` (folded into the posted inputs) | Real, stellar.expert-linkable transaction hashes. |
+| `peg_ratio`, `peg_ratio_p10`, `liquidity_2pct` | Sample. DEMOUSD has no real peg or liquidity to observe; same convention as `post-demo-signals.sh`'s own USDC backfill. |
+
+Review finding (this session): an earlier version of this script
+posted an invented `supply` of 1,000,000 units, unrelated to what was
+actually minted (100) and clawed back (50). `check_issuer_freeze`
+computes `clawback_amount * 10000 / supply` in INTEGER arithmetic; the
+real 50-of-100 (50%) became a fictional 50-of-1,000,000 (truncating to
+0 bps), so `propose_tier1` failed. The script now also refuses to post
+the triggering signal at all if the real numbers, checked against the
+registered definition's own `freeze_pct_bps` with the same integer
+arithmetic `check_issuer_freeze` uses, would not actually clear the
+threshold — so this specific mistake cannot happen silently again.
