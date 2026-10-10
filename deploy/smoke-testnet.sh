@@ -122,54 +122,81 @@ else
   fail "EventRegistry.active_event_count(asset) == $out, expected 0"
 fi
 
-# -- Write: post one not-yet-posted epoch, confirm it reads back --
+# -- Write: post one not-yet-posted epoch via the hourly path, confirm
+#    it reads back --
 #
-# "Post one fresh epoch and confirm it appears as the newest epoch"
-# is straightforward only when the tracked asset isn't already
-# caught up to the current hour. Right after
-# deploy/post-demo-signals.sh, it usually is: the freshest closed
-# epoch is already posted, and the next NEW one won't close for up
-# to an hour, which would make this smoke test impractically slow to
-# wait for. So: if there's a genuinely fresh (newer than
-# newest_epoch, already closed) epoch available, post that one and
-# confirm it becomes the newest, exactly as asked. Otherwise, fall
-# back to scanning backward for the newest already-closed epoch that
-# is NOT yet posted, and confirm that one round-trips correctly via
-# `signals` instead, since it proves the same write path without an
-# unbounded wait.
+# "Post one fresh epoch and confirm it appears as the newest epoch" is
+# straightforward only when the tracked asset isn't already caught up
+# to the current hour. Right after deploy/post-demo-signals.sh, it
+# usually is: the freshest closed epoch is already posted, and the
+# next NEW one won't close for up to an hour, which would make this
+# smoke test impractically slow to wait for. So: if there's a
+# genuinely fresh (newer than newest_epoch, already closed) epoch
+# available, post that one and confirm it becomes the newest, exactly
+# as asked. Otherwise, scan backward for an epoch the HOURLY path can
+# actually still accept.
+#
+# Review finding (this session): `signals(asset, epoch)` returning
+# `null` is NOT the same thing as "the hourly path can post this
+# epoch." Since v1.5 (Section 5.9), an hour whose sub-epochs were
+# posted through post_sub_signals never writes RiskOracle's own
+# Signals(asset, epoch) key at all (that only happens once build_hour
+# rolls the hour up) — signals() legitimately reads null for an hour
+# that is nonetheless already closed to the hourly path
+# (HourPostedVia::SubEpoch), which post_signals's own mutual-exclusion
+# guard rejects with HourAlreadyPosted (#115). Scanning by `signals()
+# == null` alone picked exactly such an hour and failed here. Instead,
+# ATTEMPT the hourly post on each candidate and treat
+# EpochAlreadyPosted (#103) / HourAlreadyPosted (#115) as "try an
+# older candidate," the only check that reflects post_signals's own
+# real acceptance rule.
 
 EPOCH_SECS=3600
 current_newest="$(invoke_view "$RO_ID" newest_epoch --asset "$ASSET_ID")"
 NOW="$(date +%s)"
 freshest_closed=$(( NOW / EPOCH_SECS - 1 ))
 
+try_post_hourly() {
+  local epoch="$1"
+  local inputs_json inputs_hash signal_set
+  inputs_json=$(jq -nc --arg epoch "$epoch" '{epoch: ($epoch|tonumber), smoke_test: true}')
+  inputs_hash="$(printf '%s' "$inputs_json" | shasum -a 256 | cut -d' ' -f1)"
+  signal_set="{\"epoch\":$epoch,\"posted_at\":0,\"peg_ratio\":\"10000000\",\"peg_ratio_p10\":\"9990000\",\"liquidity_2pct\":\"500000000000\",\"redemption_net\":\"0\",\"supply\":\"10000000000000\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
+  "$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
+    post_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --s "$signal_set" 2>&1
+}
+is_already_posted_error() {
+  [[ "$1" == *"Error(Contract, #103)"* || "$1" == *"Error(Contract, #115)"* ]]
+}
+
 FRESH_EPOCH=""
 EXPECT_NEWEST=0
+POST_OUT=""
 if [[ ! "$current_newest" =~ ^[0-9]+$ || "$current_newest" -lt "$freshest_closed" ]]; then
-  FRESH_EPOCH="$freshest_closed"
-  EXPECT_NEWEST=1
-else
+  if POST_OUT="$(try_post_hourly "$freshest_closed")"; then
+    FRESH_EPOCH="$freshest_closed"
+    EXPECT_NEWEST=1
+  elif ! is_already_posted_error "$POST_OUT"; then
+    fail "post_signals for epoch $freshest_closed failed: $POST_OUT"
+  fi
+fi
+if [[ -z "$FRESH_EPOCH" && "$FAILED" -eq 0 ]]; then
   for (( candidate = freshest_closed; candidate > freshest_closed - 72; candidate-- )); do
-    existing="$(invoke_view "$RO_ID" signals --asset "$ASSET_ID" --epoch "$candidate")"
-    if [[ "$existing" == "null" ]]; then
+    if POST_OUT="$(try_post_hourly "$candidate")"; then
       FRESH_EPOCH="$candidate"
       break
+    elif ! is_already_posted_error "$POST_OUT"; then
+      fail "post_signals for epoch $candidate failed: $POST_OUT"
+      break
     fi
+    # EpochAlreadyPosted/HourAlreadyPosted: try an older candidate.
   done
 fi
 
-if [[ -z "$FRESH_EPOCH" ]]; then
-  fail "every epoch in the last 72h is already posted; cannot find an unposted epoch to test a write with"
-else
-  inputs_json=$(jq -nc --arg epoch "$FRESH_EPOCH" '{epoch: ($epoch|tonumber), smoke_test: true}')
-  inputs_hash="$(printf '%s' "$inputs_json" | shasum -a 256 | cut -d' ' -f1)"
-  signal_set="{\"epoch\":$FRESH_EPOCH,\"posted_at\":0,\"peg_ratio\":\"10000000\",\"peg_ratio_p10\":\"9990000\",\"liquidity_2pct\":\"500000000000\",\"redemption_net\":\"0\",\"supply\":\"10000000000000\",\"supply_change_bps\":0,\"issuer_actions\":{\"clawbacks\":0,\"clawback_amount\":\"0\",\"auth_revocations\":0,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
-
-  post_out="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
-    post_signals --keeper "$KEEPER_ADDR" --asset "$ASSET_ID" --s "$signal_set" 2>&1)"
-  if [[ $? -ne 0 ]]; then
-    fail "post_signals for epoch $FRESH_EPOCH failed: $post_out"
-  elif (( EXPECT_NEWEST )); then
+if [[ -z "$FRESH_EPOCH" && "$FAILED" -eq 0 ]]; then
+  fail "every epoch in the last 72h already rejects the hourly path (EpochAlreadyPosted/HourAlreadyPosted); cannot find one to test a write with"
+elif [[ -n "$FRESH_EPOCH" ]]; then
+  if (( EXPECT_NEWEST )); then
     out="$(invoke_view "$RO_ID" newest_epoch --asset "$ASSET_ID")"
     if [[ "$out" == "$FRESH_EPOCH" ]]; then
       pass "a freshly posted epoch ($FRESH_EPOCH) appears as newest_epoch"

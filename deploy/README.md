@@ -20,9 +20,11 @@ to make getting this wrong harder.
    specifically to stop this script's own write check from becoming
    the asset's first-ever post (see below).
 
-4. Continuous posting (one epoch every 5 minutes), via
-   `deploy/post-demo-signals.sh testnet 1` on a loop, until a real
-   keeper service exists.
+4. Continuous posting, via `deploy/post-demo-signals.sh testnet --live`
+   on a 5-minute loop, first on a local machine as a stopgap, then as
+   a Railway cron job once this merges, until a real keeper service
+   exists. Never run alongside the backfill or smoke test on the same
+   asset; see `--live`'s own section below.
 
 ## Why the order matters: `first_epoch` is write-once
 
@@ -62,3 +64,38 @@ the time its own turn comes. The `epochs` argument is capped at 71, one
 less than the 72 hour backfill window `RiskOracle.check_epoch_window`
 enforces, so the oldest requested epoch always has at least one epoch
 of slack left when the run reaches it.
+
+A second, narrower version of the same timing issue exists one level
+down: each sub-epoch within an hour has its OWN close time, strictly
+earlier than the hour's close for every sub before the last, and its
+own `SUB_BACKFILL_SECS` (2h) staleness bound measured from THAT close,
+not the hour's. A long-running backfill can post through most of an
+hour's sub-epochs and have the earliest ones go stale before it gets
+to them, even while the hour itself is still safely within its own
+window — observed for real on the last hour of a 71-epoch run. Fixed
+the same way: skip (log it) an individual sub-epoch whose own window
+has closed, never abort the hour over it.
+
+## `--live` mode
+
+`deploy/post-demo-signals.sh testnet --live` runs ONE pass of ongoing
+posting, meant to be invoked on a fixed interval (every 5 minutes),
+never as a long-running process itself. Each pass posts every closed,
+not-yet-posted sub-epoch of the current hour and the previous hour (so
+a single missed tick still gets caught up on the next one), reading
+the asset's real `sub_epoch_secs` from `RiskOracle.sub_epoch_config`.
+It never falls back to the hourly path — hours build on their own once
+every one of their sub-epochs settles (technical-doc.md Section 5.9
+S4) — and treats a sub-epoch that is already posted as a normal,
+expected skip, not a failure, since most 5-minute ticks between a
+sub-epoch's own close times will hit exactly that.
+
+Do not run `--live` at the same time as a backfill (`post-demo-
+signals.sh testnet <epochs>`) or `smoke-testnet.sh`'s own write check
+against the same asset: both can post against the same hour `--live`
+is also targeting, and either order of two concurrent posts to the
+same sub-epoch is a race, not a correctness issue by itself (the
+contract's own `EpochAlreadyPosted`/`HourAlreadyPosted` guards make
+the loser a harmless, logged skip either way), but it makes a single
+run's own log confusing to read. Finish a backfill and smoke test
+fully before starting `--live`, same as the deploy order above.
