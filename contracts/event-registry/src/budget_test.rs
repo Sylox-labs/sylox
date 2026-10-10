@@ -45,6 +45,15 @@ impl MockStaking {
     pub fn reward_keeper(_env: Env, _keeper: Address, _epochs: u32) -> i128 {
         0
     }
+
+    pub fn reward_keeper_sub_epochs(
+        _env: Env,
+        _keeper: Address,
+        _sub_epoch_count: u32,
+        _sub_epoch_secs: u64,
+    ) -> i128 {
+        0
+    }
 }
 
 fn asset_config(env: &Env, asset: &Address, issuer: &Address) -> AssetConfig {
@@ -370,4 +379,68 @@ fn budget_finalize_cure_against_a_full_72_epoch_cure_window() {
         &estimate,
     );
     assert_under_half(&estimate, "finalize (full cure window)");
+}
+
+// -- Section 5.9 S5 (v1.5): cover_gate with sub-epoch reads --
+
+fn sub_signal_set(env: &Env, keeper: &Address, hour: u64, peg_ratio: i128) -> SignalSet {
+    SignalSet {
+        epoch: hour,
+        posted_at: 0,
+        peg_ratio,
+        peg_ratio_p10: peg_ratio,
+        liquidity_2pct: 500_000_000_000,
+        redemption_net: 0,
+        supply: 10_000_000_000_000,
+        supply_change_bps: 0,
+        issuer_actions: IssuerActions::default(),
+        endpoint: EndpointStatus::Unknown,
+        inputs_hash: BytesN::from_array(env, &[7u8; 32]),
+        poster: keeper.clone(),
+    }
+}
+
+/// `cover_gate`'s own worst case for its NEW sub-epoch read (Section
+/// 5.9 S5): the default Depeg window is 72 hours
+/// (`DEFAULT_DEPEG_WINDOW_SECS` / `EPOCH_SECS`), and
+/// `any_unbuilt_sub_epoch_below_threshold` calls `RiskOracle.
+/// sub_peg_ratios` once per hour in that window that has NOT built
+/// yet, so the worst case is every one of the 72 hours still unbuilt
+/// at once; one sub-epoch posted per hour is already enough (the
+/// function itself is `O(window_epochs)` cross-contract calls, not
+/// `O(sub-epochs within each hour)`, since `sub_peg_ratios` folds the
+/// per-hour scan into a single call).
+#[test]
+fn budget_cover_gate_against_72_unbuilt_hours_with_sub_epoch_reads() {
+    let env = Env::default();
+    let (client, oracle) = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    oracle.add_asset(&asset_config(&env, &asset, &issuer));
+    // No definition registered: the Section 23 default window
+    // (72h)/threshold applies, matching cover_gate_reports_recent_
+    // depeg's own convention in test.rs.
+
+    let keeper = Address::generate(&env);
+    const SUB_EPOCH_SECS: u64 = 300;
+    for hour in 0..72u64 {
+        let sub_start = hour * EPOCH_SECS;
+        env.ledger().set_timestamp(sub_start + SUB_EPOCH_SECS);
+        oracle.post_sub_signals(
+            &keeper,
+            &asset,
+            &hour,
+            &0u32,
+            &sub_signal_set(&env, &keeper, hour, 9_900_000),
+        );
+    }
+
+    client.cover_gate(&asset);
+
+    let estimate = env.cost_estimate();
+    print_resources(
+        "cover_gate, 72 unbuilt hours in the Depeg window, one sub-epoch read each",
+        &estimate,
+    );
+    assert_under_half(&estimate, "cover_gate (72 unbuilt hours, sub-epoch reads)");
 }
