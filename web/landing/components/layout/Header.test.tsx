@@ -18,6 +18,40 @@ describe("Header", () => {
     expect(desktopNav.getByText("GitHub")).toBeInTheDocument();
   });
 
+  it("renders a Launch app link to the live app, with a Testnet tag, opening in the same tab", () => {
+    render(<Header />);
+    // Two copies exist (desktop button + mobile menu's), same as every
+    // other nav item here - assert against the desktop one specifically,
+    // the one actually visible outside the mobile menu.
+    const desktopNav = screen.getByRole("navigation", { name: /primary/i });
+    const launchLinks = screen.getAllByRole("link", { name: /launch app/i });
+    expect(launchLinks.length).toBeGreaterThanOrEqual(1);
+    for (const link of launchLinks) {
+      expect(link).toHaveAttribute("href", "https://app.sylox.xyz");
+      // No target="_blank" - opens in the same tab, unlike the GitHub link.
+      expect(link).not.toHaveAttribute("target");
+    }
+    expect(desktopNav.parentElement).toHaveTextContent(/testnet/i);
+  });
+
+  it("unmounts the compact phone-header Launch app button once the mobile menu opens, so it isn't shown alongside the menu's own copy", async () => {
+    render(<Header />);
+
+    // The compact header button, the desktop button, and the menu
+    // panel's own copy all share the same accessible name ("Launch
+    // app"), so the compact one specifically is identified by its own
+    // data-compact-launch-app marker rather than by role/name.
+    expect(document.querySelector("[data-compact-launch-app]")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /open menu/i }));
+    await screen.findByRole("dialog", { name: /menu/i });
+
+    // Open: the compact header copy is gone entirely (conditionally
+    // unmounted, not just visually hidden) - only the desktop button
+    // and the menu panel's own copy remain.
+    expect(document.querySelector("[data-compact-launch-app]")).toBeNull();
+  });
+
   it("opens the mobile menu as a dialog and closes it on Escape", async () => {
     render(<Header />);
     const toggle = screen.getByRole("button", { name: /open menu/i });

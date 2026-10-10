@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { inter, spaceMono, bigShoulders } from "@sylox/ui/fonts";
+import { WalletProvider } from "@/lib/wallet/WalletContext";
 import "@sylox/ui/tokens.css";
 import "./globals.css";
 
@@ -18,7 +19,7 @@ export default function RootLayout({
       className={`${inter.variable} ${spaceMono.variable} ${bigShoulders.variable} h-full`}
     >
       <body className="flex min-h-full flex-col bg-slate-black text-silo-oatmeal antialiased">
-        {children}
+        <WalletProvider>{children}</WalletProvider>
       </body>
     </html>
   );

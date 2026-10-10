@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
+import { ButtonLink } from "@sylox/ui/components";
 import { ArrowUpRight, Menu, X } from "lucide-react";
 import { nav } from "@/content";
 import { setMobileMenuOpen } from "@/lib/motion/useMobileMenuOpen";
@@ -9,12 +10,17 @@ import { useActiveSection } from "@/lib/motion/useActiveSection";
 
 function Logo() {
   return (
+    // width/height set the image's own aspect ratio (1315:1139, the
+    // artwork's real proportions - see web/app/lib/.../DashboardShell.tsx
+    // for the matching fix); h-[3em] w-auto sizes by height only and
+    // lets width follow that ratio, so a future swap of the source art
+    // can't silently squash it again the way a fixed w-[4em] box did.
     <Image
       src="/brand/sylox-mark.webp"
       alt="Sylox"
-      width={100}
-      height={44}
-      className="h-[3em] w-[4em]"
+      width={1315}
+      height={1139}
+      className="h-[3em] w-auto"
       priority
     />
   );
@@ -191,7 +197,38 @@ export function Header() {
             </a>
           </nav>
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            {/* Desktop: full size next to the nav links, tag included. */}
+            <ButtonLink
+              href={nav.launchApp.href}
+              variant="primary"
+              className="hidden items-center gap-2 !px-4 !py-2 text-xs font-bold md:inline-flex"
+            >
+              {nav.launchApp.label}
+              <span className="rounded-full bg-slate-black px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-silo-oatmeal">
+                {nav.launchApp.tag}
+              </span>
+            </ButtonLink>
+
+            {/* Phone: the collapsed header only shows the logo and the
+                menu button otherwise, hiding the main CTA behind an extra
+                tap - a compact version (smaller padding, no tag - it
+                doesn't fit at this size) sits next to the menu toggle
+                instead. Hidden while the menu is open, since the open
+                menu has its own full-size copy of this same button -
+                showing both at once would be the button rendered twice
+                on screen simultaneously. */}
+            {!isMenuOpen && (
+              <ButtonLink
+                href={nav.launchApp.href}
+                variant="primary"
+                data-compact-launch-app
+                className="!px-3 !py-1.5 text-xs font-bold md:hidden"
+              >
+                {nav.launchApp.label}
+              </ButtonLink>
+            )}
+
             <button
               ref={menuButtonRef}
               type="button"
@@ -231,6 +268,20 @@ export function Header() {
         style={{ visibility: "hidden" }}
         className="fixed inset-x-0 top-[72px] bottom-0 z-50 flex flex-col gap-6 bg-slate-black p-8 md:hidden"
       >
+        <ButtonLink
+          href={nav.launchApp.href}
+          variant="primary"
+          data-menu-item
+          tabIndex={isMenuOpen ? 0 : -1}
+          className="inline-flex w-fit items-center gap-2 font-bold"
+          onClick={() => setIsMenuOpen(false)}
+        >
+          {nav.launchApp.label}
+          <span className="rounded-full bg-slate-black px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-silo-oatmeal">
+            {nav.launchApp.tag}
+          </span>
+        </ButtonLink>
+
         {nav.links.map((link) => (
           <a
             key={link.href}

@@ -25,6 +25,11 @@ export const nav = {
     label: "GitHub",
     href: "https://github.com/Sylox-labs",
   },
+  launchApp: {
+    label: "Launch app",
+    tag: "Testnet",
+    href: "https://app.sylox.xyz",
+  },
 };
 
 export const hero = {

@@ -376,7 +376,10 @@ const EVENT_KINDS: EventKind["tag"][] = [
   "Insolvency",
 ];
 
-function sentenceFor(kind: EventKind["tag"], def: NonNullable<Awaited<ReturnType<typeof fetchOneDefinition>>>): string {
+export function sentenceFor(
+  kind: EventKind["tag"],
+  def: NonNullable<Awaited<ReturnType<typeof fetchOneDefinition>>>,
+): string {
   switch (kind) {
     case "Depeg": {
       const threshold = Number(def.depeg_threshold) / PEG_RATIO_SCALE;
@@ -502,12 +505,29 @@ export async function fetchCoverGate(
 // 6. Active event
 // ---------------------------------------------------------------------------
 
+export interface ActiveEvents {
+  count: number;
+  /** The specific event ids currently InProgress, one per kind that has one - for linking straight to each from the Asset screen's active-event card. active_event_count() alone only gives a number, never which event(s); event_status(asset, kind) is checked per kind (same EVENT_KINDS list fetchFailureDefinitions already walks) to find them. */
+  eventIds: bigint[];
+}
+
 async function fetchActiveEventCount(
   registry: ReturnType<typeof eventRegistryClient>,
   asset: string,
-): Promise<number> {
-  const tx = await registry.active_event_count({ asset });
-  return tx.result;
+): Promise<ActiveEvents> {
+  const [countTx, statuses] = await Promise.all([
+    registry.active_event_count({ asset }),
+    Promise.all(
+      EVENT_KINDS.map((kind) => registry.event_status({ asset, kind: { tag: kind, values: undefined } })),
+    ),
+  ]);
+
+  const eventIds = statuses
+    .map((tx) => tx.result)
+    .filter((status) => status.tag === "InProgress")
+    .map((status) => status.values[0]);
+
+  return { count: countTx.result, eventIds };
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +541,7 @@ export interface AssetPageData {
   pegHistory: SectionResult<PegHistoryPoint[]>;
   failureDefinitions: SectionResult<FailureDefinition[]>;
   coverGate: SectionResult<CoverSalesStatus>;
-  activeEventCount: SectionResult<number>;
+  activeEventCount: SectionResult<ActiveEvents>;
 }
 
 export async function fetchAssetPageData(asset: string): Promise<AssetPageData> {

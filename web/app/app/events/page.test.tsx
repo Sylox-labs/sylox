@@ -1,0 +1,208 @@
+import { describe, expect, it, vi } from "vitest";
+import { act, render, screen } from "@testing-library/react";
+import EventsPage from "./page";
+import { WalletProvider } from "@/lib/wallet/WalletContext";
+import type { EventListRow } from "@/lib/events-list-data";
+
+const { listRegistryEvents } = vi.hoisted(() => ({
+  listRegistryEvents: vi.fn(),
+}));
+
+vi.mock("@/lib/events-list-data", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/events-list-data")>("@/lib/events-list-data");
+  return { ...actual, listRegistryEvents };
+});
+
+function renderEventsPage() {
+  return render(
+    <WalletProvider>
+      <EventsPage />
+    </WalletProvider>,
+  );
+}
+
+const baseRow: EventListRow = {
+  id: BigInt(1),
+  assetCode: "USDC",
+  kind: "Depeg",
+  state: "Proposed",
+  proposedAt: BigInt(1_790_000_000),
+  windowClosesAt: BigInt(Math.floor(Date.now() / 1000) + 3600),
+};
+
+describe("EventsPage", () => {
+  it("always shows the testnet banner", () => {
+    listRegistryEvents.mockReturnValue(new Promise(() => {}));
+    renderEventsPage();
+    expect(screen.getByText(/testnet\. prices are sample data/i)).toBeInTheDocument();
+  });
+
+  it("shows a loading state before data arrives", () => {
+    listRegistryEvents.mockReturnValue(new Promise(() => {}));
+    renderEventsPage();
+    expect(screen.getByText(/loading events from the registry/i)).toBeInTheDocument();
+  });
+
+  it("shows a page-wide error when the scan rejects", async () => {
+    listRegistryEvents.mockRejectedValue(new Error("RPC unreachable"));
+    renderEventsPage();
+    expect(await screen.findByRole("alert")).toHaveTextContent("RPC unreachable");
+  });
+
+  it("shows an honest empty state when nothing was found within the scanned window", async () => {
+    listRegistryEvents.mockResolvedValue({
+      rows: [],
+      oldestLedgerScanned: 100_000,
+      latestLedger: 100_000 + Math.round((2 * 86400) / 5),
+      stoppedAtRequestCap: false,
+    });
+    renderEventsPage();
+    expect(await screen.findByText(/no events yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/events in the last 2 days/i)).toBeInTheDocument();
+  });
+
+  it("labels the window as only-partially-scanned when the request cap was hit", async () => {
+    listRegistryEvents.mockResolvedValue({
+      rows: [],
+      oldestLedgerScanned: 100_000,
+      latestLedger: 100_000 + Math.round((1.5 * 86400) / 5),
+      stoppedAtRequestCap: true,
+    });
+    renderEventsPage();
+    expect(await screen.findByText(/no events found in the last 1.5 days scanned/i)).toBeInTheDocument();
+    // Never reads as if the whole claimed window was checked when it wasn't.
+    expect(screen.queryByText(/^no events yet\.?$/i)).not.toBeInTheDocument();
+  });
+
+  it("says history wasn't fully scanned (never 'no events found') when the cap was hit but rows did come back", async () => {
+    listRegistryEvents.mockResolvedValue({
+      rows: [baseRow],
+      oldestLedgerScanned: 100_000,
+      latestLedger: 100_000 + Math.round((1.5 * 86400) / 5),
+      stoppedAtRequestCap: true,
+    });
+    renderEventsPage();
+
+    expect(await screen.findByText("USDC")).toBeInTheDocument();
+    expect(
+      screen.getByText(/showing events from the last 1\.5 days; older history not scanned/i),
+    ).toBeInTheDocument();
+    // The list right below clearly has a row - the top label must
+    // never contradict it by claiming nothing was found.
+    expect(screen.queryByText(/no events found/i)).not.toBeInTheDocument();
+  });
+
+  it("renders rows as they're resolved via onRowProgress, before the whole scan finishes", async () => {
+    let capturedOnRowProgress: ((row: EventListRow) => void) | undefined;
+    let resolveScan!: (value: {
+      rows: EventListRow[];
+      oldestLedgerScanned: number;
+      latestLedger: number;
+      stoppedAtRequestCap: boolean;
+    }) => void;
+    listRegistryEvents.mockImplementation(
+      (opts: { onRowProgress?: (row: EventListRow) => void }) =>
+        new Promise((resolve) => {
+          capturedOnRowProgress = opts.onRowProgress;
+          resolveScan = resolve;
+        }),
+    );
+
+    renderEventsPage();
+    expect(screen.getByText(/loading events from the registry/i)).toBeInTheDocument();
+
+    act(() => {
+      capturedOnRowProgress?.(baseRow);
+    });
+
+    // The row is visible WHILE the scan is still "loading" - the
+    // outer listRegistryEvents() promise hasn't resolved yet.
+    expect(await screen.findByText("USDC")).toBeInTheDocument();
+    expect(screen.getByText(/loading older events/i)).toBeInTheDocument();
+
+    resolveScan({
+      rows: [baseRow],
+      oldestLedgerScanned: 100_000,
+      latestLedger: 200_000,
+      stoppedAtRequestCap: false,
+    });
+
+    await screen.findByText(/events in the last/i);
+    expect(screen.getByText("USDC")).toBeInTheDocument();
+  });
+
+  it("renders partialRows newest-first (by proposedAt), even when rows resolve out of that order", async () => {
+    let capturedOnRowProgress: ((row: EventListRow) => void) | undefined;
+    listRegistryEvents.mockImplementation(
+      (opts: { onRowProgress?: (row: EventListRow) => void }) =>
+        new Promise((resolve) => {
+          capturedOnRowProgress = opts.onRowProgress;
+          void resolve; // Deliberately never resolved - this test only cares about the loading-state partialRows ordering.
+        }),
+    );
+
+    renderEventsPage();
+
+    const older = { ...baseRow, id: BigInt(1), assetCode: "OLDER", proposedAt: BigInt(1_000) };
+    const newest = { ...baseRow, id: BigInt(2), assetCode: "NEWEST", proposedAt: BigInt(3_000) };
+    const middle = { ...baseRow, id: BigInt(3), assetCode: "MIDDLE", proposedAt: BigInt(2_000) };
+
+    // Resolved deliberately out of chronological order - onRowProgress
+    // fires in whatever order each id's event() read actually settles
+    // in (see events-list-data.ts), which this simulates directly:
+    // the OLDEST of the three resolves first, then the NEWEST, then
+    // the one in between.
+    act(() => {
+      capturedOnRowProgress?.(older);
+      capturedOnRowProgress?.(newest);
+      capturedOnRowProgress?.(middle);
+    });
+
+    await screen.findByText("OLDER");
+    const assetCodes = screen.getAllByText(/^(OLDER|NEWEST|MIDDLE)$/).map((el) => el.textContent);
+    expect(assetCodes).toEqual(["NEWEST", "MIDDLE", "OLDER"]);
+  });
+
+  it("renders a row with asset code, kind, state, and a countdown, linking to its Event screen", async () => {
+    listRegistryEvents.mockResolvedValue({
+      rows: [baseRow],
+      oldestLedgerScanned: 100_000,
+      latestLedger: 200_000,
+      stoppedAtRequestCap: false,
+    });
+    renderEventsPage();
+
+    expect(await screen.findByText("USDC")).toBeInTheDocument();
+    expect(screen.getByText("Depeg")).toBeInTheDocument();
+    expect(screen.getByText("Proposed")).toBeInTheDocument();
+    expect(screen.getByText(/h left|m left/)).toBeInTheDocument();
+
+    const link = screen.getByRole("link", { name: /USDC/ });
+    expect(link).toHaveAttribute("href", "/event/1");
+  });
+
+  it("shows 'Challenged' for the contract's Escalated state, matching the plain-language action", async () => {
+    listRegistryEvents.mockResolvedValue({
+      rows: [{ ...baseRow, state: "Escalated" }],
+      oldestLedgerScanned: 100_000,
+      latestLedger: 200_000,
+      stoppedAtRequestCap: false,
+    });
+    renderEventsPage();
+
+    expect(await screen.findByText("Challenged")).toBeInTheDocument();
+  });
+
+  it("shows no countdown for a row with no open window (Cured/Declared/Rejected)", async () => {
+    listRegistryEvents.mockResolvedValue({
+      rows: [{ ...baseRow, state: "Cured", windowClosesAt: null }],
+      oldestLedgerScanned: 100_000,
+      latestLedger: 200_000,
+      stoppedAtRequestCap: false,
+    });
+    renderEventsPage();
+
+    await screen.findByText("USDC");
+    expect(screen.queryByText(/h left|m left|d left/)).not.toBeInTheDocument();
+  });
+});
