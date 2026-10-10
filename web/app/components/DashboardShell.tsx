@@ -65,9 +65,16 @@ function ComingSoonItem({ label }: { label: string }) {
 function SidebarContent({ pathname }: { pathname: string | null }) {
   return (
     <div className="flex h-full flex-col">
-      <Link href="/" className="flex items-center gap-2 px-4 py-6" aria-label="Sylox home">
-        <Image src="/brand/sylox-mark.webp" alt="" width={32} height={14} className="h-7 w-auto" priority aria-hidden="true" />
-        <span className="font-display text-lg tracking-tight text-silo-oatmeal">Sylox</span>
+      <Link href="/" className="flex w-full items-center justify-center gap-3 px-4 py-6" aria-label="Sylox home">
+        {/* width/height set the image's own aspect ratio (1315:1139,
+            the artwork's real proportions after trimming its
+            transparent margin - see public/brand/sylox-mark.webp's
+            own history); h-10 w-auto sizes by height only and lets
+            width follow that ratio, so a future swap of the source
+            art can't silently squash it the way a mismatched fixed
+            box (previously 32x14, a different ratio entirely) did. */}
+        <Image src="/brand/sylox-mark.webp" alt="" width={1315} height={1139} className="h-10 w-auto" priority aria-hidden="true" />
+        <span className="font-display text-2xl tracking-tight text-silo-oatmeal">Sylox</span>
       </Link>
 
       <nav className="mt-4 flex flex-col gap-1" aria-label="Primary">
