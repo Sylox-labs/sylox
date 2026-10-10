@@ -3,14 +3,16 @@
 An npm workspace holding the JS/TS side of the repo, separate from the Rust/Soroban contracts at the repository root.
 
 - `web/landing` — the marketing landing page (Next.js, static export).
-- `web/shared/ui` — the design system (tokens, fonts, risk-band/contrast helpers, and shared components) that `web/landing` and future app code both import from.
+- `web/app` — the app people use to see an issuer's risk, provide cover, buy cover, and claim (Next.js, talks to the Soroban contracts directly through generated TypeScript bindings, no backend). See `web/app/README.md`.
+- `web/shared/ui` — the design system (tokens, fonts, risk-band/contrast helpers, and shared components) that `web/landing` and `web/app` both import from.
 
-Both are declared as workspaces in the repo-root `package.json`. Install and run everything from the repo root, not from inside `web/landing`:
+All three are declared as workspaces in the repo-root `package.json`. Install and run everything from the repo root, not from inside an individual package:
 
 ```bash
 npm install
 npm run build -w web/landing
 npm run dev -w web/landing
+npm run dev -w web/app
 ```
 
 ## Deployment (Railway)

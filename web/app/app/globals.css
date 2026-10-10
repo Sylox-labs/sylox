@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+/* @sylox/ui lives outside this app's own directory tree (a workspace
+   package resolved through node_modules), which Tailwind v4's automatic
+   content detection doesn't traverse into by default. Without this, any
+   utility class that's only ever written inside a shared component
+   would be silently dropped from the generated CSS (see web/landing's
+   globals.css for the design-system PR that found this). */
+@source "../../shared/ui/src";
+
+@theme inline {
+  --color-slate-black: var(--color-slate-black);
+  --color-silo-oatmeal: var(--color-silo-oatmeal);
+  --color-anchor-graphite: var(--color-anchor-graphite);
+  --color-cement-grey: var(--color-cement-grey);
+  --color-cyber-tin: var(--color-cyber-tin);
+  --color-risk-crimson: var(--color-risk-crimson);
+  --color-risk-crimson-tint: var(--color-risk-crimson-tint);
+
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-border: var(--border);
+  --color-border-hover: var(--border-hover);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-focus-ring: var(--focus-ring);
+
+  --font-sans: var(--font-sans-family);
+  --font-mono: var(--font-mono-family);
+  --font-display: var(--font-display);
+}
+
+body {
+  background: var(--color-slate-black);
+  color: var(--color-silo-oatmeal);
+  font-family: var(--font-sans);
+}
+
+/* Numbers that update or align use tabular figures, same rule as
+   web/landing (brief: scores, addresses, amounts, status tags all read
+   as data, so they get the mono numeral treatment). */
+.font-mono,
+[data-numeric] {
+  font-feature-settings: "tnum" 1;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--color-focus-ring, var(--color-risk-crimson));
+  outline-offset: 2px;
+}

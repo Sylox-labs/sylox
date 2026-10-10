@@ -21,3 +21,15 @@ web/landing/.next/
 web/landing/out/
 web/landing/node_modules/
 web/landing/tsconfig.tsbuildinfo
+
+# Sylox app. lib/contracts/*/src is generated but committed (see
+# web/app/README.md); only its own node_modules/out is ignored, same
+# as any other dependency.
+web/app/.next/
+web/app/out/
+web/app/node_modules/
+web/app/tsconfig.tsbuildinfo
+web/app/lib/contracts/*/node_modules/
+web/app/lib/contracts/*/out/
+
+web/shared/ui/node_modules/

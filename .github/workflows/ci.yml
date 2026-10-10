@@ -112,8 +112,13 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # Installs both web/landing and web/shared/ui (npm workspaces
-      # declared in the repo-root package.json) in one pass.
+      # Installs web/app, web/landing and web/shared/ui (npm workspaces
+      # declared in the repo-root package.json) in one pass. web/app's
+      # lib/contracts/*/src bindings are generated locally via
+      # `stellar contract bindings typescript` against live testnet and
+      # committed (see web/app/scripts/generate-bindings.mjs) - CI has
+      # no network path to regenerate them, so it builds against the
+      # committed copy like any other source file.
       - run: npm ci
       - name: Typecheck web/shared/ui
         run: npx tsc --noEmit
@@ -121,14 +126,25 @@ jobs:
       - name: Typecheck web/landing
         run: npx tsc --noEmit
         working-directory: web/landing
+      - name: Typecheck web/app
+        run: npx tsc --noEmit
+        working-directory: web/app
       - name: Lint web/landing
         run: npm run lint
         working-directory: web/landing
+      - name: Lint web/app
+        run: npm run lint
+        working-directory: web/app
       - name: Unit tests, web/shared/ui
         run: npm test
         working-directory: web/shared/ui
       - name: Unit tests, web/landing
         run: npm test
         working-directory: web/landing
+      - name: Unit tests, web/app
+        run: npm test
+        working-directory: web/app
       - name: Build web/landing
         run: npm run build -w web/landing
+      - name: Build web/app
+        run: npm run build -w web/app
