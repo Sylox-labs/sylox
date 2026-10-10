@@ -10,7 +10,7 @@ export function TestnetBanner() {
       role="status"
       className="rounded-sm border border-risk-crimson/40 bg-risk-crimson/10 px-4 py-2 font-mono text-xs uppercase tracking-wide text-risk-crimson-tint"
     >
-      Testnet. Sample and live testnet data, not production risk.
+      Testnet. Live testnet data, not production risk.
     </div>
   );
 }

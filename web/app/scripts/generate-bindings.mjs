@@ -95,11 +95,18 @@ const deployment = loadDeployment();
 const targets = {
   "risk-oracle": deployment.contracts?.risk_oracle?.id,
   "event-registry": deployment.contracts?.event_registry?.id,
+  // Every Stellar Asset Contract shares the same SEP-41 interface, so
+  // bindings generated once from any one of them (TUSD's, here) work
+  // as a client for any asset address at runtime - exactly like
+  // risk-oracle.ts/event-registry.ts already construct a Client with a
+  // runtime contractId from the one set of generated bindings. See
+  // lib/contracts/token.ts, the shared client built from this.
+  token: deployment.tusd?.contract_id,
 };
 
 for (const [name, contractId] of Object.entries(targets)) {
   if (!contractId) {
-    die(`deployments/testnet.json has no contracts.${name.replace("-", "_")}.id entry.`);
+    die(`deployments/testnet.json has no ${name === "token" ? "tusd.contract_id" : `contracts.${name.replace("-", "_")}.id`} entry.`);
   }
   generate(name, contractId, path.join(appRoot, "lib", "contracts", name));
 }
