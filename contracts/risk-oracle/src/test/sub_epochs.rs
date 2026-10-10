@@ -1189,12 +1189,15 @@ fn slot_ownership_check_refuses_a_write_into_a_rotated_slot() {
     let original_sub_start = sub_start(hour, 0, sub_epoch_secs);
 
     env.as_contract(&contract_id, || {
-        // Nothing posted yet: the position is Empty, so it belongs
-        // to the original sub-epoch (nothing else could own it).
+        // Nothing posted yet, still well within the original
+        // sub-epoch's own 5 hour span: the position is Empty, and
+        // belongs to the original sub-epoch (nothing else could own
+        // it yet).
         assert!(crate::storage::sub_slot_still_belongs_to(
             &env,
             &asset,
-            original_sub_start
+            original_sub_start,
+            original_sub_start,
         ));
 
         // A newer sub-epoch, one full ring rotation (5 hours) later,
@@ -1214,11 +1217,117 @@ fn slot_ownership_check_refuses_a_write_into_a_rotated_slot() {
         assert!(wrote, "the newer sub-epoch's own write must succeed");
 
         assert!(
-            !crate::storage::sub_slot_still_belongs_to(&env, &asset, original_sub_start),
+            !crate::storage::sub_slot_still_belongs_to(
+                &env,
+                &asset,
+                original_sub_start,
+                rotated_sub_start,
+            ),
             "the original sub-epoch's own position now belongs to the newer one; a \
              repost must never be allowed to overwrite it"
         );
     });
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): the ownership check
+/// must also refuse a position that is still `Empty` but whose own
+/// 5 hour span has already moved on to a LATER sub-epoch that simply
+/// was never posted. `HeldHour` keeps the repost safe either way
+/// (this is never a data-loss case), but the ring write itself must
+/// never land on a position that no longer belongs to the sub-epoch
+/// being reposted, posted or not.
+#[test]
+fn slot_ownership_check_refuses_an_empty_position_whose_span_has_moved_on() {
+    let env = Env::default();
+    let (client, _governor, asset) = setup_with_governor_and_asset(&env);
+    let contract_id = client.address.clone();
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+    let hour = REALISTIC_EPOCH_BASE;
+    let original_sub_start = sub_start(hour, 0, sub_epoch_secs);
+
+    env.as_contract(&contract_id, || {
+        // Nothing was ever posted to the position a later sub-epoch
+        // (one full 5 hour rotation on) would occupy: it reads
+        // Empty, same as it always has, but by the time `now` is
+        // past the ORIGINAL sub-epoch's own 5 hour span, this
+        // position no longer belongs to it.
+        let now = original_sub_start + 5 * EPOCH_SECS + 1;
+        assert!(
+            !crate::storage::sub_slot_still_belongs_to(&env, &asset, original_sub_start, now),
+            "an Empty position whose span has already moved on to a later, \
+             never-posted sub-epoch must not be treated as still belonging to the \
+             original one"
+        );
+    });
+}
+
+/// Section 5.9 S2 (v1.5, footprint-fix revision): the end-to-end
+/// version of the Empty-but-span-elapsed case above, through `post_
+/// sub_signals` itself rather than the storage layer directly. A
+/// slow ruling lands well past sub 0's own 5 hour ring span, but
+/// NOTHING was ever posted to the later sub-epoch that position now
+/// belongs to (unlike `a_slow_ruling_repost_lands_in_heldhour_and_
+/// the_hour_builds_corrected`, which rotates the ring with real,
+/// posted data): the position reads Empty, not occupied by a
+/// different sub_start, and the repost must still go to `HeldHour`,
+/// never write into that Empty-but-no-longer-owned position.
+#[test]
+fn a_slow_ruling_repost_still_uses_heldhour_when_the_newer_position_was_never_posted() {
+    let env = Env::default();
+    let (client, governor, asset) = setup_with_governor_and_asset(&env);
+    let keeper = Address::generate(&env);
+    let committee = Address::generate(&env);
+    crate::mocks::MockGovernorClient::new(&env, &governor).set_committee(&committee);
+    let sub_epoch_secs = SUB_EPOCH_SECS_DEFAULT;
+    let per_hour = (EPOCH_SECS / sub_epoch_secs) as u32;
+    let hour = REALISTIC_EPOCH_BASE;
+
+    for sub in 1..per_hour {
+        post_sub(
+            &env,
+            &client,
+            &keeper,
+            &asset,
+            hour,
+            sub,
+            sub_epoch_secs,
+            10_000_000,
+        );
+    }
+    post_sub(&env, &client, &keeper, &asset, hour, 0, sub_epoch_secs, 1);
+    let disputer = Address::generate(&env);
+    client.dispute_sub_signals(&disputer, &asset, &hour, &0u32, &dummy_hash(&env));
+
+    // Advance the clock directly past sub 0's own 5 hour ring span
+    // and well into the ruling deadline, WITHOUT posting anything
+    // else: the position sub 0 occupied is still Empty, just no
+    // longer within its own span.
+    let sub0_start = sub_start(hour, 0, sub_epoch_secs);
+    env.ledger().set_timestamp(sub0_start + 6 * 86_400);
+    client.resolve_sub_signal_dispute(&asset, &hour, &0u32, &false, &dummy_hash(&env));
+    assert!(!client.is_final(&asset, &hour));
+
+    // Repost immediately (0 seconds past the overturn): accepted, and
+    // must land in HeldHour, not overwrite whatever that Empty
+    // position's own current rotation would otherwise suggest.
+    let mut corrected = signal_set(&env, hour, 10_000_000);
+    corrected.liquidity_2pct = 500_000_000_000;
+    corrected.supply_change_bps = 0;
+    client.post_sub_signals(&keeper, &asset, &hour, &0u32, &corrected);
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + crate::SIGNAL_DISPUTE_SECS + 1);
+    client.build_hour(&asset, &hour);
+
+    assert!(client.is_final(&asset, &hour));
+    let ring = client.ring(&asset);
+    let slot = ring.iter().find(|s| s.epoch == hour).unwrap();
+    assert_eq!(
+        slot.peg_ratio, 10_000_000,
+        "the HeldHour repost must contribute the corrected value even when the ring \
+         position it would have otherwise used was merely Empty, not occupied by a \
+         different sub-epoch"
+    );
 }
 
 /// Section 5.9 S6: keeper pay for an overturned-then-reposted

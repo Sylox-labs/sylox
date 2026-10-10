@@ -681,18 +681,23 @@ fn budget_cover_gate_footprint_is_constant_from_1_to_72_unbuilt_hours() {
 
 /// `depeg_check`'s own cap boundary, called directly (a sibling
 /// module of `crate::depeg_check`, so this reaches the private
-/// function the same way `cover_gate` does) because the public
-/// `register_definition` path can never itself produce more than 73
-/// unbuilt hours (`window_epochs + BASELINE_EPOCHS <= RING_SLOTS`
-/// caps `window_epochs` at 72, so the inclusive scan covers at most
-/// 73 hours) — the cap can only be exercised at or under the
-/// structural ceiling through the public API, never past it. This
-/// test instead drives `depeg_check` at `window_epochs` one past that
-/// ceiling to confirm the `UnbuiltBacklog` path itself: at exactly
-/// `MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE` unbuilt hours it must
-/// still read Clear (the structural cap is not itself a backlog), and
-/// at one more it must read `UnbuiltBacklog`, never attempting the
-/// batched call at all.
+/// function the same way `cover_gate` does) because `UnbuiltBacklog`
+/// is, by review finding, UNREACHABLE through the public API today:
+/// `register_definition` caps `window_epochs` at `sylox_types::time::
+/// MAX_DEPEG_WINDOW_EPOCHS` (72), so the inclusive scan it can ever
+/// produce covers at most `MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE`
+/// (73) hours — exactly the cap, never past it, and the default
+/// (no-definition) window is the same 72 epochs. `UnbuiltBacklog`
+/// stays in `depeg_check` anyway as a defensive guard, failing closed
+/// if `MAX_DEPEG_WINDOW_EPOCHS` and this cap are ever changed out of
+/// step (the build-time assertion in `sylox_types::time` is the one
+/// that actually prevents that, not this test), so this is the one
+/// place that can still exercise it directly, with a constructed
+/// `window_epochs` the public API itself can never produce: at
+/// exactly `MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE` unbuilt hours it
+/// must still read Clear (the structural cap is not itself a
+/// backlog), and at one more it must read `UnbuiltBacklog`, never
+/// attempting the batched call at all.
 #[test]
 fn depeg_check_is_clear_at_the_cap_and_unbuilt_backlog_at_cap_plus_one() {
     use sylox_types::time::MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE as CAP;

@@ -433,7 +433,7 @@ impl RiskOracle {
             auth_revocations: s.issuer_actions.auth_revocations,
         };
 
-        if is_repost && !storage::sub_slot_still_belongs_to(&env, &asset, sub_start) {
+        if is_repost && !storage::sub_slot_still_belongs_to(&env, &asset, sub_start, now) {
             // The ring has rotated past this sub-epoch's own position
             // since it was overturned (a slow ruling, Section 5.9 S2):
             // the repost goes into HeldHour directly, never overwrite
@@ -1295,6 +1295,14 @@ impl RiskOracle {
         asset: Address,
         hours: Vec<u64>,
     ) -> Vec<Vec<Option<i128>>> {
+        // One fetch of Sub(asset)'s own packed entry for the WHOLE
+        // call, not one per (hour, sub) pair: the entry is small and
+        // fixed-size regardless of how many hours this call scans
+        // (Section 5.9 S3), so re-fetching it per sub-epoch (up to
+        // 876 times at the structural cap, 73 hours * 12 subs) was
+        // pure waste, never a real footprint or memory concern this
+        // call's own single-key read already avoids.
+        let packed = storage::get_sub_ring_packed_for_batch(&env, &asset);
         let mut out = Vec::new(&env);
         for hour in hours.iter() {
             let sub_epoch_secs = current_sub_epoch_secs(&env, &asset, hour);
@@ -1302,7 +1310,7 @@ impl RiskOracle {
             let mut ratios = Vec::new(&env);
             for sub in 0..per_hour {
                 let sub_start = sub_start_of(hour, sub, sub_epoch_secs);
-                match storage::get_sub_slot(&env, &asset, sub_start) {
+                match storage::get_sub_slot_from_packed(&packed, sub_start) {
                     Some(slot)
                         if slot.state != sylox_types::SlotState::Empty
                             && slot.state != sylox_types::SlotState::Disputed =>

@@ -1303,6 +1303,37 @@ pub fn get_sub_slot(env: &Env, asset: &Address, sub_start: u64) -> Option<SubRin
     }
 }
 
+/// `get_sub_ring_packed`'s own one-time fetch, exposed for a caller
+/// that needs to read many sub-epochs from the SAME `Sub(asset)` ring
+/// in one call (`sub_peg_ratios_in_span_batch`): fetching and decoding
+/// the whole packed entry once, then decoding every slot from this
+/// one copy via `get_sub_slot_from_packed`, instead of a separate
+/// `get_sub_slot` call (and so a separate storage fetch) per
+/// sub-epoch. The packed entry is small and fixed-size (`Sub(asset)`'s
+/// own 60 slot span, Section 5.9 S3) regardless of how many hours a
+/// caller scans, so reading it once per call, not once per
+/// sub-epoch, is both cheaper and the only read `cost_estimate()`
+/// should ever attribute to this.
+pub fn get_sub_ring_packed_for_batch(env: &Env, asset: &Address) -> Bytes {
+    get_sub_ring_packed(env, asset)
+}
+
+/// Mirrors `get_sub_slot`'s own identity check exactly, against an
+/// ALREADY-FETCHED packed entry (from `get_sub_ring_packed_for_
+/// batch`) instead of fetching it again: decodes `sub_start`'s own
+/// ring position and verifies its stored identity matches, the same
+/// "a mismatch means this sub-epoch is missing, never misread as a
+/// different sub-epoch's data" guarantee `get_sub_slot` gives.
+pub fn get_sub_slot_from_packed(packed: &Bytes, sub_start: u64) -> Option<SubRingSlot> {
+    let index = position_of_sub(sub_start);
+    let slot = read_sub_slot(packed, index);
+    if slot.state != SlotState::Empty && slot.sub_start == sub_start {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
 /// Section 5.9 S2 (v1.5, footprint-fix revision): whether `sub_start`'s
 /// own ring position in `Sub(asset)` still belongs to it, i.e. is safe
 /// to write a repost into directly. True if the position is `Empty`
@@ -1315,11 +1346,33 @@ pub fn get_sub_slot(env: &Env, asset: &Address, sub_start: u64) -> Option<SubRin
 /// repost must go to `HeldHour` instead, never overwrite someone
 /// else's data. A repost's own caller must check this BEFORE writing,
 /// never write first and check after.
-pub fn sub_slot_still_belongs_to(env: &Env, asset: &Address, sub_start: u64) -> bool {
+pub fn sub_slot_still_belongs_to(env: &Env, asset: &Address, sub_start: u64, now: u64) -> bool {
     let packed = get_sub_ring_packed(env, asset);
     let index = position_of_sub(sub_start);
     let slot = read_sub_slot(&packed, index);
-    slot.state == SlotState::Empty || slot.sub_start == sub_start
+    if slot.sub_start == sub_start {
+        return true;
+    }
+    if slot.state != SlotState::Empty {
+        // A DIFFERENT, non-Empty sub_start occupies this position:
+        // always a strictly newer one (position_of_sub's own
+        // wraparound and the ring's existing newer-wins write guard),
+        // so this position never belongs to sub_start any more.
+        return false;
+    }
+    // Empty does not, by itself, mean this position still belongs to
+    // sub_start: the position's own current rotation (whichever
+    // sub_start maps to it right now, via position_of_sub's modular
+    // arithmetic) could belong to a LATER sub-epoch that simply was
+    // never posted, not to sub_start itself. It still belongs to
+    // sub_start only while sub_start's own 5 hour span
+    // (SUB_RING_SLOTS * SUB_EPOCH_GRID_SECS) has not yet elapsed:
+    // past that point, some other, later sub_start now legitimately
+    // owns this position, even though nothing has been written to it
+    // yet. A repost reaching this branch after that point must go to
+    // HeldHour instead (the caller's own job), never write here.
+    let span_secs = SUB_RING_SLOTS as u64 * SUB_EPOCH_GRID_SECS;
+    now < sub_start + span_secs
 }
 
 /// Writes `sub_start`'s slot. Refuses to overwrite a position that

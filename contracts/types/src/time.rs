@@ -105,20 +105,37 @@ const _: () = assert!(
 /// fits `CureProgress`'s own `u128` bitmap, one bit per cure epoch.
 const _: () = assert!(MAX_CURE_EPOCHS <= 128);
 
+/// The largest `depeg_window_secs / EPOCH_SECS` a Depeg
+/// `EventDefinition` may register (`register_definition`'s own
+/// `window_epochs + BASELINE_EPOCHS <= RING_SLOTS` check,
+/// `BASELINE_EPOCHS == AGGREGATE_SLOTS_7D`), and the one, SHARED
+/// source for that limit: `register_definition` and the build-time
+/// assertion below both read this constant, never a separate copy of
+/// the number, so the two can never silently drift apart. Also the
+/// default depeg window (`DEFAULT_DEPEG_WINDOW_SECS / EPOCH_SECS`,
+/// `event-registry/src/lib.rs`), which is set at this same ceiling.
+/// technical-doc.md Section 5.9 S5, 9.4, 23.
+pub const MAX_DEPEG_WINDOW_EPOCHS: u64 = (RING_SLOTS - AGGREGATE_SLOTS_7D) as u64;
+
 /// `EventRegistry.cover_gate`'s own `RecentDepeg` check: the most
 /// unbuilt hours in the trailing depeg window `depeg_check` may scan
 /// before it must instead return `UnbuiltBacklog` (Section 5.9 S5,
 /// R10), rather than making its own batched read at all.
 ///
-/// Set at `RING_SLOTS - AGGREGATE_SLOTS_7D + 1 = 73`: the structural
-/// maximum a Depeg definition's own window can ever produce
-/// (`register_definition`'s own `window_epochs + BASELINE_EPOCHS <=
-/// RING_SLOTS` check, `BASELINE_EPOCHS == AGGREGATE_SLOTS_7D`, plus
-/// one for `depeg_check`'s own inclusive loop bound), so this cap
-/// never actually triggers `UnbuiltBacklog` in normal operation; it
-/// exists as a documented, enforced ceiling against anything that
-/// could widen that window later, not because 73 is itself close to
-/// risky.
+/// Set at `MAX_DEPEG_WINDOW_EPOCHS + 1 = 73`: the structural maximum
+/// a Depeg definition's own window can ever produce (one more than
+/// `MAX_DEPEG_WINDOW_EPOCHS`, for `depeg_check`'s own inclusive loop
+/// bound). Review finding: this means `UnbuiltBacklog` can NEVER
+/// actually be reached while `register_definition` enforces
+/// `MAX_DEPEG_WINDOW_EPOCHS` (no registered definition, nor the
+/// default window, can ever produce more than this many unbuilt
+/// hours in one scan) — the build-time assertion below is what keeps
+/// this true, failing the build rather than letting the two drift
+/// apart if either is ever changed without re-measuring the other.
+/// `depeg_check` still checks this cap at runtime (`event-registry/
+/// src/lib.rs`'s own doc comment there explains why: a defensive
+/// guard that fails closed if the limits ever do drift, not dead
+/// code to remove), it is just never reachable TODAY.
 ///
 /// Since the Section 5.9 S5 footprint-fix revision (the gate reads
 /// `Sub(asset)`, never `HeldHour`, plus `Ring(asset)`'s own
@@ -133,25 +150,28 @@ const _: () = assert!(MAX_CURE_EPOCHS <= 128);
 /// is what actually sets this cap's own real margin: 73 unbuilt
 /// hours, every one also under an open dispute (the costlier of the
 /// two per-hour paths this cap has to account for), measures
-/// 8,065,785 bytes, about 19.2% of `TX_MEMORY_LIMIT_BYTES`
-/// (41,943,040), a roughly 5.2x margin — comfortable, but the
+/// 1,762,761 bytes (re-measured after `sub_peg_ratios_in_span_batch`'s
+/// own single-fetch review fix), about 4.2% of `TX_MEMORY_LIMIT_BYTES`
+/// (41,943,040), a roughly 23.8x margin — comfortable, and the
 /// binding constraint, not footprint or instructions (instructions:
-/// 24,400,161, about 6.1% of `TX_MAX_INSTRUCTIONS`, a roughly 16.4x
+/// 9,602,712, about 2.4% of `TX_MAX_INSTRUCTIONS`, a roughly 41.7x
 /// margin, the least binding of the three). See
 /// `event-registry/src/budget_test.rs`'s own
 /// `budget_cover_gate_at_the_structural_cap_every_hour_disputed`.
 pub const MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE: u32 = 73;
 
-/// Build-time check: the cap above matches the structural ceiling
-/// `register_definition`'s own window-size check enforces
-/// (`RING_SLOTS - AGGREGATE_SLOTS_7D + 1`), so the two can never
-/// silently drift apart if either changes. The cap's own real memory
-/// margin under `TX_MEMORY_LIMIT_BYTES` (about 5.2x, see this
-/// constant's own doc comment) is empirical, not a formula a
-/// build-time assertion can check; that number is re-verified by
-/// `event-registry/src/budget_test.rs`'s own
-/// `budget_cover_gate_at_the_structural_cap_every_hour_disputed`
-/// every time the test suite runs, which is the actual guard against
-/// a regression here.
+/// Build-time check: the cap above matches `MAX_DEPEG_WINDOW_EPOCHS +
+/// 1`, the SAME shared constant `register_definition` enforces, so
+/// the two can never silently drift apart if either changes. If a
+/// future revision raises `MAX_DEPEG_WINDOW_EPOCHS` without
+/// re-measuring and raising this cap to match, the build fails here
+/// instead of `cover_gate` silently scanning past what was ever
+/// measured. The cap's own real memory margin under
+/// `TX_MEMORY_LIMIT_BYTES` (about 23.8x, see this constant's own doc
+/// comment) is empirical, not a formula a build-time assertion can
+/// check; that number is re-verified by `event-registry/src/budget_
+/// test.rs`'s own `budget_cover_gate_at_the_structural_cap_every_
+/// hour_disputed` every time the test suite runs, which is the actual
+/// guard against a regression here.
 const _: () =
-    assert!(MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE == (RING_SLOTS - AGGREGATE_SLOTS_7D + 1));
+    assert!(MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE as u64 == MAX_DEPEG_WINDOW_EPOCHS + 1);

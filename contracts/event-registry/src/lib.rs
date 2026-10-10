@@ -86,18 +86,6 @@ const EPOCH_SECS: u64 = 3_600;
 /// `WINDOW_SECS`.
 const WINDOW_SECS: u64 = 259_200;
 
-/// `RiskOracle`'s own ring buffer size (Section 5.8), frozen for v1.
-/// `EventRegistry` never needs this as a standalone constant in
-/// production logic (every scan is bounded by the `Vec` `ring()`
-/// actually returns, whose `.len()` always equals this), but
-/// `register_definition`'s own "window plus baseline fits the ring"
-/// check needs a number to check against before any asset has ever
-/// posted (so no real `ring()` call to measure against exists yet).
-/// Moved to `sylox_types::time` (Section 5.9 S7) so this and
-/// `risk-oracle`'s own copy trace to one shared constant instead of
-/// two private, independently-maintained ones.
-use sylox_types::time::RING_SLOTS;
-
 /// IssuerFreeze's own fixed 7 day window (Section 8.2), and the Depeg
 /// liquidity baseline immediately before its own window (ADR-005):
 /// the same 168 epoch span, used for two different purposes.
@@ -792,7 +780,13 @@ fn validate_definition_params(def: &EventDefinition) -> Result<(), Error> {
                 return Err(Error::InvalidDefinition);
             }
             let window_epochs = def.depeg_window_secs / EPOCH_SECS;
-            if window_epochs + BASELINE_EPOCHS > RING_SLOTS as u64 {
+            // The ONE shared source for this ceiling (review finding):
+            // sylox_types::time::MAX_DEPEG_WINDOW_EPOCHS, never a
+            // separate copy of RING_SLOTS - BASELINE_EPOCHS computed
+            // here, so this check and MAX_UNBUILT_HOURS_SCANNED_BY_
+            // COVER_GATE's own build-time assertion can never drift
+            // apart.
+            if window_epochs > sylox_types::time::MAX_DEPEG_WINDOW_EPOCHS {
                 return Err(Error::InvalidDefinition);
             }
         }
@@ -1221,13 +1215,29 @@ enum DepegCheck {
 /// so the gate's own footprint never depends on how many disputes are
 /// open, only on the fixed set of keys below):
 ///
-/// - A BUILT hour (`effective_state_of` reports its `ring()` slot
-///   Final) reads from the ring alone, at its own built, averaged
-///   `peg_ratio`, exactly as before v1.5. A wick a built hour's own
-///   roll-up already absorbed into its average can never be read back
-///   out at sub-epoch granularity once that hour builds, keeping the
-///   gate's own sensitivity fixed at every `sub_epoch_secs`.
-/// - Every UNBUILT hour in the window is instead batched into ONE
+/// Each hour in the window is classified into exactly one of three
+/// buckets (review item, Section 5.9 S5):
+///
+/// - **No signal**: `slot_for_epoch` returns `None` (before the
+///   asset's own history, or a stale-slot gap it cannot verify), or
+///   the slot it returns is `Empty`. A built-Empty hour (below
+///   `min_sub_coverage_bps`) is BUILT in the sense that matters here:
+///   its own sub-epochs, if any ever posted, must never be read
+///   again, the same guarantee a built Final hour already gets. This
+///   can never misclassify a genuinely waiting hour, since posting
+///   even one sub-epoch moves the hour's own slot to `Pending`, never
+///   leaves it `Empty` (S4). Not counted toward the cap, and never
+///   sent to the batched read.
+/// - **Built** (`effective_state_of` reports the slot Final): reads
+///   from the ring alone, at its own built, averaged `peg_ratio`,
+///   exactly as before v1.5. A wick a built hour's own roll-up
+///   already absorbed into its average can never be read back out at
+///   sub-epoch granularity once that hour builds, keeping the gate's
+///   own sensitivity fixed at every `sub_epoch_secs`.
+/// - **Unbuilt**: everything else — a waiting hour on the sub-epoch
+///   path (`Pending` or `Disputed`, `provisional_sub_coverage` set),
+///   or a `Pending`/`Disputed` hour on the hourly fallback path.
+///   Every UNBUILT hour in the window is batched into ONE
 ///   `RiskOracle.sub_peg_ratios_in_span_batch` call, touching exactly
 ///   one ledger key (`Sub(asset)`) regardless of how many hours are
 ///   requested. If more unbuilt hours sit in the window than
@@ -1235,6 +1245,17 @@ enum DepegCheck {
 ///   `UnbuiltBacklog` without making that call at all: blocking new
 ///   cover is the safe failure, not guessing or risking the call
 ///   itself exceeding the network's own transaction memory limit.
+///   Review finding: this check can NEVER actually trigger while
+///   `register_definition` enforces `sylox_types::time::
+///   MAX_DEPEG_WINDOW_EPOCHS` (no registered definition, nor the
+///   default window, can ever produce more unbuilt hours than the
+///   cap allows) — it stays here as a defensive guard that fails
+///   closed if those two limits are ever changed out of step, not
+///   dead code to remove. The build-time assertion tying
+///   `MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE` to `MAX_DEPEG_WINDOW_
+///   EPOCHS + 1` (`sylox_types::time`) is what actually prevents that
+///   drift; this runtime check is the second, defense-in-depth layer
+///   underneath it.
 /// - For each unbuilt hour the batch call returns real sub-epoch data
 ///   for (still inside `Sub(asset)`'s own 5 hour span), those
 ///   sub-epoch values are the check, read at sub-epoch granularity so
@@ -1274,18 +1295,34 @@ fn depeg_check(
     let mut epoch = start;
     while epoch <= newest_epoch {
         let slot = slot_for_epoch(ring, newest_epoch, epoch);
-        let is_built = matches!(
-            slot.as_ref().map(|s| effective_state_of(s, now)),
-            Some(SlotState::Final)
-        );
-        if is_built {
-            if let Some(s) = &slot {
-                if s.state != SlotState::Empty && s.peg_ratio < threshold {
-                    return DepegCheck::Depeg;
+        match &slot {
+            // Before the asset's own history, or a gap `slot_for_
+            // epoch` could not verify: never posted at all, nothing
+            // to read. Not an unbuilt hour: there is no sub-epoch
+            // data to batch, so it must never occupy a slot in the
+            // batched read or count toward the cap.
+            None => {}
+            Some(s) if s.state == SlotState::Empty => {
+                // Built Empty (below min_sub_coverage_bps, or the
+                // hourly fallback's own missing-epoch write) or
+                // genuinely never posted: either way, BUILT in the
+                // sense that matters here — its own sub-epochs (if
+                // any ever existed) must never be read again, the
+                // same rule a built Final hour already gets. An
+                // unbuilt hour with any real posts is never Empty
+                // (posting makes it Pending, S4), so this can never
+                // misclassify a genuinely waiting hour as built.
+            }
+            Some(s) => {
+                let is_built = effective_state_of(s, now) == SlotState::Final;
+                if is_built {
+                    if s.peg_ratio < threshold {
+                        return DepegCheck::Depeg;
+                    }
+                } else {
+                    unbuilt_hours.push_back(epoch);
                 }
             }
-        } else {
-            unbuilt_hours.push_back(epoch);
         }
         epoch += 1;
     }

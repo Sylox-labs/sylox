@@ -546,3 +546,149 @@ fn every_sub_epoch_disputed_reads_as_no_data_never_a_false_depeg() {
          read Clear, never a false depeg from an unset peg_ratio reading as 0"
     );
 }
+
+/// Section 5.9 S5 (review item, three-way classification): a hour
+/// built `Empty` (below `min_sub_coverage_bps`, review item #1) must
+/// never read as a depeg from its own `peg_ratio` field, which a
+/// below-coverage build always writes as a bare `0` (`empty_hour_
+/// signal_set`), not a real reading of anything. Built with a single
+/// real, genuinely-below-threshold sub-epoch posted (so the hour's
+/// own history is not empty, just sparse), proving the gate's own
+/// classification keys off `state == Empty`, never off `peg_ratio`
+/// looking depeg-shaped.
+#[test]
+fn cover_gate_reads_clear_for_a_built_empty_hour_even_with_a_stale_low_peg_ratio_in_the_ring() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+
+    let hour = 100u64;
+    // One sub-epoch posted, genuinely below the default depeg
+    // threshold (9_500_000): nowhere near min_sub_coverage_bps (9 of
+    // 12), so once this backfills out, the hour builds Empty, not
+    // Final, despite carrying a real, depegged value.
+    let start = sub_start(hour, 0);
+    env.ledger().set_timestamp(start + SUB_EPOCH_SECS);
+    fx.oracle.post_sub_signals(
+        &fx.keeper,
+        &asset,
+        &hour,
+        &0u32,
+        &sub_signal_set(&env, &fx.keeper, hour, 9_000_000),
+    );
+    env.ledger()
+        .set_timestamp(sub_start(hour, 11) + SUB_EPOCH_SECS + SUB_BACKFILL_SECS + 1);
+    fx.oracle.build_hour(&asset, &hour);
+
+    // Built-Empty (never Final): try_build_hour's own below-coverage
+    // path writes the ring position back to a plain empty_slot()
+    // (epoch reset to 0, same as a never-written position), so this
+    // hour's own identity no longer appears in ring() at all; is_final
+    // is the one check that still answers "did this hour build
+    // Final" correctly either way.
+    assert!(
+        !fx.oracle.is_final(&asset, &hour),
+        "below min_sub_coverage_bps, the hour must build Empty, not Final"
+    );
+
+    assert_eq!(
+        fx.client.cover_gate(&asset),
+        CoverGate::Clear,
+        "a built-Empty hour must read Clear: its own peg_ratio field (reset to a bare \
+         0 by the below-coverage build) is never a real signal, depeg-shaped or not"
+    );
+}
+
+/// Section 5.9 S5 (review item, three-way classification): a new
+/// asset with less than a full depeg window of history. Every hour
+/// before the asset's own first epoch is "no signal" (`slot_for_
+/// epoch` returns `None`), not "unbuilt": none of them were ever
+/// postable at all, so none should ever reach the batched read or
+/// count toward `MAX_UNBUILT_HOURS_SCANNED_BY_COVER_GATE`. Confirmed
+/// two ways: the gate reads `Clear` (not `UnbuiltBacklog`, which it
+/// would read if the missing history were miscounted as unbuilt), and
+/// a hand build-up confirms a fresh asset's own entire default window
+/// classifies correctly from the very first hour it ever posts.
+#[test]
+fn cover_gate_does_not_count_missing_history_before_the_asset_s_first_epoch_as_unbuilt() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+
+    // A brand new asset: only ONE hour of history ever posted, deep
+    // into what would otherwise be a 72 hour default depeg window.
+    // Every one of the other 71 hours in that window is strictly
+    // before this asset's own first epoch: no signal, not unbuilt.
+    let hour = 500u64;
+    let start = sub_start(hour, 0);
+    env.ledger().set_timestamp(start + SUB_EPOCH_SECS);
+    fx.oracle.post_sub_signals(
+        &fx.keeper,
+        &asset,
+        &hour,
+        &0u32,
+        &sub_signal_set(&env, &fx.keeper, hour, 9_900_000),
+    );
+
+    assert_eq!(
+        fx.client.cover_gate(&asset),
+        CoverGate::Clear,
+        "a brand new asset with only one hour of real history must read Clear, never \
+         UnbuiltBacklog from the 71 hours that come before its own first epoch"
+    );
+}
+
+/// Section 5.9 S5 (review item, three-way classification): a missing
+/// hour strictly inside the window (never posted at all, but AFTER
+/// the asset's own first epoch, unlike the previous test) is also "no
+/// signal," not "unbuilt": `slot_for_epoch` returns `None` for it
+/// (the ring's own default `Empty` slot at that position never
+/// matches a genuinely different epoch, Section 5.8's own stale-slot
+/// detection), so it must never occupy a batch slot or count toward
+/// the cap either.
+#[test]
+fn cover_gate_does_not_count_a_missing_hour_inside_the_window_as_unbuilt() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let asset = Address::generate(&env);
+    let issuer = Address::generate(&env);
+    fx.oracle
+        .add_asset(&asset_config(&env, &asset, &issuer, IssuerFlags::default()));
+
+    // Hour 0 posts (establishing real history), hour 1 is skipped
+    // entirely (never posted, strictly inside the window), hour 2
+    // posts again: the gap at hour 1 must read as no signal, not as
+    // an unbuilt hour the gate has to batch-read or count.
+    let hour0_start = sub_start(0, 0);
+    env.ledger().set_timestamp(hour0_start + SUB_EPOCH_SECS);
+    fx.oracle.post_sub_signals(
+        &fx.keeper,
+        &asset,
+        &0u64,
+        &0u32,
+        &sub_signal_set(&env, &fx.keeper, 0, 9_900_000),
+    );
+
+    let hour2_start = sub_start(2, 0);
+    env.ledger().set_timestamp(hour2_start + SUB_EPOCH_SECS);
+    fx.oracle.post_sub_signals(
+        &fx.keeper,
+        &asset,
+        &2u64,
+        &0u32,
+        &sub_signal_set(&env, &fx.keeper, 2, 9_900_000),
+    );
+
+    assert_eq!(
+        fx.client.cover_gate(&asset),
+        CoverGate::Clear,
+        "hour 1, never posted but strictly inside the window, must read as no signal, \
+         not as an unbuilt hour"
+    );
+}
