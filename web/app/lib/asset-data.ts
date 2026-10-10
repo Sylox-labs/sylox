@@ -376,7 +376,10 @@ const EVENT_KINDS: EventKind["tag"][] = [
   "Insolvency",
 ];
 
-function sentenceFor(kind: EventKind["tag"], def: NonNullable<Awaited<ReturnType<typeof fetchOneDefinition>>>): string {
+export function sentenceFor(
+  kind: EventKind["tag"],
+  def: NonNullable<Awaited<ReturnType<typeof fetchOneDefinition>>>,
+): string {
   switch (kind) {
     case "Depeg": {
       const threshold = Number(def.depeg_threshold) / PEG_RATIO_SCALE;

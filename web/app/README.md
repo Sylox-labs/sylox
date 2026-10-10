@@ -28,8 +28,19 @@ The generated bindings are committed (not gitignored): CI has no network path to
 ## Screens
 
 - **Explorer** (`/`): every tracked asset, its current risk band, score, staleness, and event status, read live from RiskOracle. Done.
-- **Asset** (`/asset/[id]`): a single tracked asset's risk detail. Done.
-- Events, Markets, Faucet: not built yet.
+- **Asset** (`/asset/[id]`): header, Confirmed/Live peg price, peg history chart, failure definitions, cover-sale status, active-event indicator. Done.
+- **Event** (`/event/[id]`): proposal details, a countdown to the real challenge/ruling deadline, Depeg cure progress, and the Checkpoint/Finalize write actions. The first screen that writes to the contracts - see "Wallet" below.
+- Markets, Faucet: not built yet.
+
+## Wallet
+
+The Event screen is the first to write to the contracts, so it's the first to need a connected wallet. Stellar Wallets Kit (`lib/wallet/kit.ts`) provides the actual wallet connections (Freighter, xBull, Albedo - each imported by its own subpath, not `defaultModules()`, which pulls in every "no extra config" module the kit ships), used strictly for its headless SDK - the kit's own built-in modal is never shown. The picker UI itself (`@sylox/ui`'s `WalletPickerModal`) is the shared design system's own component, driven by plain props; `web/shared/ui` never imports the kit.
+
+The kit is loaded with a dynamic `import()` only when the picker actually opens (`lib/wallet/kit.ts`), not on every page load, so its bundle never ships to a visitor who never connects a wallet.
+
+**SDK version boundary (temporary, see issue #37):** the kit bundles its own `@stellar/stellar-sdk` (17.x), while this app is pinned to 16.x (what the generated contract bindings were built against). Only plain XDR strings cross between the kit and the app's own write-action code (`lib/event-actions.ts`) - never a `Transaction` or other SDK object, since those can fail type checks across versions even when TypeScript compiles cleanly. Issue #37 tracks upgrading `web/app` to 17.x and regenerating the bindings, which removes this boundary rule entirely.
+
+**Dev-only fixtures:** `/event/fixture-proposed`, `-challenged`, `-cured`, `-declared` render from typed mock data (`lib/event-fixtures.ts`) instead of the live contract, so the screen's layout/countdown/buttons can be checked without a real event on testnet. Loaded only through a dynamic `import()` gated on `process.env.NODE_ENV !== "production"`, so the whole module - and every string in it - is stripped out of a production build, not just hidden behind a runtime check (verified by grepping the production bundle). A fixture id in a production build falls through to the live fetch and 404s on it like any other invalid id; a real numeric `event_id` always uses the live contract read, in every environment.
 
 ## Deployment
 
@@ -48,3 +59,4 @@ The build needs the whole monorepo (repo root, not `web/app/` alone) in its Dock
 - **Contract reads only, never recomputed.** Staleness, band, and score all come from the contract's own `check_stale`/`band`/`score` calls. The app never re-derives these from raw epoch/timestamp math, because the contract's actual staleness threshold isn't even exposed as a public read (see `lib/explorer-data.ts`'s doc comments).
 - **Testnet labeled everywhere.** `components/TestnetBanner.tsx` renders on every page.
 - **No marketing claims.** No "insured," no "guaranteed returns," no APY, the word "insurance" never appears.
+- **Every write is simulated before it's signed.** A contract method that changes state is always constructed (which auto-simulates) first; its result is shown in plain words before the wallet is ever asked to sign anything (`lib/event-actions.ts`'s `prepare*`/`confirm*` split).

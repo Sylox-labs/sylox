@@ -12,6 +12,7 @@
     "bindings:generate": "node scripts/generate-bindings.mjs"
   },
   "dependencies": {
+    "@creit.tech/stellar-wallets-kit": "^2.7.1",
     "@stellar/stellar-sdk": "^16.0.1",
     "@sylox/ui": "*",
     "next": "16.4.0",
