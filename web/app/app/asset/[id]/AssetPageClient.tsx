@@ -7,7 +7,7 @@ import { TestnetBanner } from "@/components/TestnetBanner";
 import { PegHistoryChart } from "@/components/PegHistoryChart";
 import { DashboardShell } from "@/components/DashboardShell";
 import { Breadcrumb } from "@/components/Breadcrumb";
-import { fetchAssetPageData, type AssetPageData } from "@/lib/asset-data";
+import { fetchAssetPageData, type AssetPageData, type ScoringStart } from "@/lib/asset-data";
 
 type LoadState =
   | { status: "loading" }
@@ -125,7 +125,7 @@ function HeaderSection({ data }: { data: AssetPageData }) {
       </div>
 
       {header.band === null && (
-        <p className="mt-2 font-mono text-xs text-cyber-tin">Not enough confirmed history yet.</p>
+        <p className="mt-2 font-mono text-xs text-cyber-tin">{formatScoringStart(header.scoringStart)}</p>
       )}
 
       <div className="mt-4 flex flex-wrap items-center gap-4">
@@ -164,6 +164,29 @@ function formatChallengeDeadline(pendingUntil: bigint): string {
   return `${hh}:${mm} UTC`;
 }
 
+// "around"/"earliest" wording only - the real 168th-hour-Final promotion
+// can land later than this floor (see AssetHeader.scoringStart's own doc
+// comment in lib/asset-data.ts), so this is never phrased as a promise.
+function formatScoringStart(scoringStart: ScoringStart): string {
+  if (scoringStart.status === "unknown") return "Not scored yet.";
+  const date = new Date(scoringStart.earliestUnixSecs * 1000);
+  const formatted = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(
+    date.getUTCDate(),
+  ).padStart(2, "0")} ${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")} UTC`;
+  return `Scoring starts around ${formatted}.`;
+}
+
+function formatAge(unixSecs: number): string {
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - unixSecs);
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
 function ConfirmedLiveSection({ data }: { data: AssetPageData }) {
   return (
     <div>
@@ -200,27 +223,32 @@ function ConfirmedLiveSection({ data }: { data: AssetPageData }) {
         </Card>
 
         <Card>
-          <p className="font-mono text-xs uppercase tracking-wide text-cyber-tin">Live</p>
+          <p className="font-mono text-xs uppercase tracking-wide text-cyber-tin">Live (challengeable)</p>
           <p className="mt-1 text-xs text-cyber-tin/70">
-            The newest 5-minute update. Can still be challenged.
+            The newest posted sub-epoch. Not yet Confirmed.
           </p>
           {data.live.status === "error" ? (
             <div className="mt-3">
               <SectionError message={data.live.message} />
             </div>
-          ) : data.live.value.status === "not-deployed" ? (
-            <p className="mt-3 font-mono text-sm text-cyber-tin">Live updates coming soon.</p>
           ) : data.live.value.status === "none" ? (
             <p className="mt-3 font-mono text-sm text-cyber-tin">No live update yet.</p>
           ) : (
-            <div className="mt-3 flex items-baseline gap-4">
-              <span className="font-mono text-2xl text-silo-oatmeal" data-numeric>
-                {data.live.value.pegRatio.toFixed(4)}
-              </span>
-              <span className="font-mono text-xs uppercase tracking-wide text-cyber-tin">
-                peg, can still be challenged
-              </span>
-            </div>
+            <>
+              <div className="mt-3 flex items-baseline gap-4">
+                <span className="font-mono text-2xl text-silo-oatmeal" data-numeric>
+                  {data.live.value.pegRatio.toFixed(4)}
+                </span>
+                <span className="font-mono text-xs uppercase tracking-wide text-cyber-tin">peg</span>
+              </div>
+              <p className="mt-3 border-t border-cement-grey/30 pt-3 font-mono text-xs text-cyber-tin">
+                Hour {data.live.value.subEpoch.hour.toString()}, sub-epoch {data.live.value.subEpoch.sub}
+                {" · "}
+                {data.live.value.slotState}
+                {" · "}
+                {formatAge(data.live.value.postedAt)}
+              </p>
+            </>
           )}
         </Card>
       </div>

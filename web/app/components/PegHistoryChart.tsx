@@ -133,6 +133,15 @@ export function PegHistoryChart({ points, depegThreshold }: PegHistoryChartProps
 
   const thresholdY = depegThreshold !== null ? y(depegThreshold) : null;
 
+  // Final hours stay exactly as drawn above (the line segments). A
+  // provisional hour (sub-epoch posting path, dispute not yet resolved)
+  // has pegRatio null like any other not-yet-Final hour - there's no
+  // line to attach a marker to, so it gets its own small tick at the
+  // bottom of the chart with a native SVG tooltip (no existing
+  // hover/tooltip infrastructure here to extend; <title> is the
+  // smallest correct way to attach one).
+  const provisionalPoints = trackedPoints.filter((p) => p.provisionalSubCoverage !== null);
+
   return (
     <div>
       <svg
@@ -194,6 +203,19 @@ export function PegHistoryChart({ points, depegThreshold }: PegHistoryChartProps
             stroke="var(--color-silo-oatmeal)"
             strokeWidth={1.5}
           />
+        ))}
+        {provisionalPoints.map((p) => (
+          <circle
+            key={p.timestamp}
+            cx={x(p.timestamp)}
+            cy={HEIGHT - PAD_Y}
+            r={3}
+            fill="var(--color-cyber-tin)"
+          >
+            <title>
+              Waiting on a dispute. Based on {p.provisionalSubCoverage} of 12 sub-epochs.
+            </title>
+          </circle>
         ))}
       </svg>
 

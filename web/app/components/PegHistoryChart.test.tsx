@@ -11,6 +11,7 @@ function point(overrides: Partial<PegHistoryPoint> & { epoch: bigint }): PegHist
     state: "Final",
     pegRatio: 1.0,
     tracked: true,
+    provisionalSubCoverage: null,
     ...overrides,
   };
 }
@@ -63,5 +64,32 @@ describe("PegHistoryChart", () => {
     const opacity = Number(rect!.getAttribute("fill-opacity"));
     expect(opacity).toBeGreaterThanOrEqual(0.12);
     expect(opacity).toBeLessThanOrEqual(0.15);
+  });
+
+  it("marks a provisional (Pending, sub-epoch-covered) hour with a tooltip, leaving Final hours unmarked", () => {
+    const points = [
+      point({ epoch: BigInt(0), state: "Final", pegRatio: 1.0, provisionalSubCoverage: null }),
+      point({
+        epoch: BigInt(1),
+        state: "Pending",
+        pegRatio: null,
+        provisionalSubCoverage: 5,
+      }),
+      point({ epoch: BigInt(2), state: "Final", pegRatio: 0.999, provisionalSubCoverage: null }),
+    ];
+    const { container } = render(<PegHistoryChart points={points} depegThreshold={null} />);
+
+    const markers = container.querySelectorAll("circle");
+    expect(markers).toHaveLength(1);
+    expect(markers[0].querySelector("title")?.textContent).toMatch(
+      /waiting on a dispute\. based on 5 of 12 sub-epochs\./i,
+    );
+  });
+
+  it("marks no provisional hours when none have a provisionalSubCoverage set", () => {
+    const points = buildPoints(10, 0);
+    const { container } = render(<PegHistoryChart points={points} depegThreshold={null} />);
+
+    expect(container.querySelectorAll("circle")).toHaveLength(0);
   });
 });
