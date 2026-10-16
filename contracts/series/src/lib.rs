@@ -45,8 +45,13 @@ use storage::{AllowanceValue, Config};
 
 use clients::{EventRegistryClient, MarketFactoryClient, PriceGuardClient, RiskOracleClient};
 
-/// Section 9.2: `sale_end = expiry - sale_cutoff_secs`.
-const SALE_CUTOFF_SECS: u64 = 3 * 86_400;
+/// Section 9.2: `sale_end = expiry - sale_cutoff_secs`. 72 epochs (3
+/// days at the defaults), written as a multiple of `EPOCH_SECS` so a
+/// series opened under the `demo-time` feature gets a sale window
+/// short enough to actually fit a demo's own `expiry`, rather than a
+/// fixed 3 real days regardless of how the rest of the deployment is
+/// scaled.
+const SALE_CUTOFF_SECS: u64 = 72 * EPOCH_SECS;
 /// Section 11.5 default: 100 USDC at 7 decimals.
 const MIN_DEPOSIT: i128 = 1_000_000_000;
 /// Section 9.3/11.5 default.
@@ -935,8 +940,8 @@ impl Series {
                     .definition(&terms.asset, &kind, &version)
                     .map(|d| d.depeg_window_secs)
                     .unwrap_or(0),
-                EventKind::IssuerFreeze => 7 * 86_400,
-                EventKind::MintWithoutBacking => 24 * 3_600,
+                EventKind::IssuerFreeze => 168 * EPOCH_SECS,
+                EventKind::MintWithoutBacking => 24 * EPOCH_SECS,
                 EventKind::WithdrawalHalt => registry
                     .definition(&terms.asset, &kind, &version)
                     .map(|d| d.halt_window_secs)

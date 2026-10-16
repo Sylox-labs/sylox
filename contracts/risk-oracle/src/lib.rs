@@ -21,6 +21,7 @@ mod storage;
 use soroban_sdk::{
     contract, contractimpl, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol, Vec,
 };
+use sylox_types::time::EPOCH_SECS;
 use sylox_types::{AssetConfig, Band, EndpointStatus, RingSlot, RiskScore, SignalSet, SCALE};
 
 use clients::{FxAdapterClient, GovernorClient, PriceAdapterClient, StakingClient};
@@ -29,21 +30,19 @@ use score::{Formula, AGGREGATE_SLOTS_7D};
 use storage::DisputeRecord;
 
 /// Signal posting window: how far back a closed epoch may still be posted.
-/// technical-doc.md Section 5.2, Section 23 `window_secs` default.
-const WINDOW_SECS: u64 = 259_200;
-
-/// Default epoch length. technical-doc.md Section 23 `epoch_secs`. Frozen
-/// for v1 alongside `storage::RING_SLOTS`, not a governance parameter: see
-/// the PR's "Spec deviations" section.
-const EPOCH_SECS: u64 = 3_600;
+/// technical-doc.md Section 5.2, Section 23 `window_secs` default: 72
+/// epochs. Written as a multiple of `EPOCH_SECS`, not its own literal,
+/// so the `demo-time` feature (`sylox_types::time`) scales it along
+/// with everything else built the same way, never needing its own gate.
+const WINDOW_SECS: u64 = 72 * EPOCH_SECS;
 
 /// Default signal dispute window. technical-doc.md Section 23
-/// `signal_dispute_secs`.
-const SIGNAL_DISPUTE_SECS: u64 = 7_200;
+/// `signal_dispute_secs`: 2 epochs.
+const SIGNAL_DISPUTE_SECS: u64 = 2 * EPOCH_SECS;
 
-/// ADR-010 amendment (feat/event-registry PR #15 review, finding F1):
-/// how long the committee has to rule on an open signal dispute, from
-/// `dispute_signals`, before `resolve_signal_dispute_timeout` becomes
+/// ADR-010 amendment: how long the committee has to rule on an open
+/// signal dispute, from `dispute_signals`, before
+/// `resolve_signal_dispute_timeout` becomes
 /// callable. Was 7 days, matching ADR-002's `ruling_deadline_secs`
 /// precedent for event disputes; lowered to 6 days because the full
 /// worst-case timeline (`WINDOW_SECS + SIGNAL_DISPUTE_SECS +
@@ -54,11 +53,12 @@ const SIGNAL_DISPUTE_SECS: u64 = 7_200;
 /// assertion below. At 7 days the worst case was 242h, already past
 /// the 240h ring: a keeper's own still-open dispute could be silently
 /// overwritten by the ring wrapping around before anyone ruled.
-const SIGNAL_DISPUTE_RULING_SECS: u64 = 518_400;
+/// 144 epochs.
+const SIGNAL_DISPUTE_RULING_SECS: u64 = 144 * EPOCH_SECS;
 
-/// ADR-010 amendment (finding F1): the worst-case dispute timeline —
-/// posted at the last legal instant, disputed immediately, never
-/// ruled on — must resolve (time out) before the ring wraps around
+/// ADR-010 amendment: the worst-case dispute timeline (posted at the
+/// last legal instant, disputed immediately, never ruled on) must
+/// resolve (time out) before the ring wraps around
 /// and `write_ring_slot` overwrites the still-open dispute. `+
 /// EPOCH_SECS` covers the one additional epoch that closes, and so
 /// becomes postable, in the time it takes `resolve_signal_dispute_timeout`
@@ -108,10 +108,13 @@ const SUPPLY_CHANGE_TOLERANCE_BPS: i128 = 1;
 /// `set_sub_epoch_secs`: no `SubEpochConfig(asset)` entry exists, and
 /// `post_sub_signals` has nothing to post against, so the asset
 /// behaves exactly as it did before this revision (hourly `post_signals`
-/// only). This constant is only ever used to compute `3,600 /
+/// only). This constant is only ever used to compute `EPOCH_SECS /
 /// SUB_EPOCH_SECS_DEFAULT` sizing and validation; it is never written
 /// as an implicit `SubEpochConfig` default (see `current_sub_epoch_secs`).
-const SUB_EPOCH_SECS_DEFAULT: u64 = 300;
+/// The same value as `sylox_types::time::SUB_EPOCH_GRID_SECS`, by
+/// definition - this is that same 5 minute floor, just under its own
+/// name here for the doc comment above to read naturally.
+const SUB_EPOCH_SECS_DEFAULT: u64 = sylox_types::time::SUB_EPOCH_GRID_SECS;
 
 /// Section 5.9 S1: the least time, in hours, between a
 /// `sub_epoch_secs` change taking effect and the next change: 240 hours
@@ -123,12 +126,21 @@ const SUB_EPOCH_SECS_DEFAULT: u64 = 300;
 const SUB_EPOCH_CHANGE_SPACING_HOURS: u64 = storage::RING_SLOTS as u64;
 
 /// Section 5.9 S1: the only values `set_sub_epoch_secs` accepts, each
-/// dividing `EPOCH_SECS` (3,600) evenly.
-const SUB_EPOCH_SECS_ALLOWED: [u64; 6] = [300, 600, 900, 1_200, 1_800, 3_600];
+/// a whole multiple of `SUB_EPOCH_GRID_SECS` and each dividing
+/// `EPOCH_SECS` evenly (1, 2, 3, 4, 6 and 12 times the grid - at the
+/// defaults, 300/600/900/1,200/1,800/3,600).
+const SUB_EPOCH_SECS_ALLOWED: [u64; 6] = [
+    sylox_types::time::SUB_EPOCH_GRID_SECS,
+    2 * sylox_types::time::SUB_EPOCH_GRID_SECS,
+    3 * sylox_types::time::SUB_EPOCH_GRID_SECS,
+    4 * sylox_types::time::SUB_EPOCH_GRID_SECS,
+    6 * sylox_types::time::SUB_EPOCH_GRID_SECS,
+    12 * sylox_types::time::SUB_EPOCH_GRID_SECS,
+];
 
 /// Section 5.9 S2: how long a sub-epoch can be backfilled before the
-/// keeper must fall back to the hourly path.
-const SUB_BACKFILL_SECS: u64 = 7_200;
+/// keeper must fall back to the hourly path. 2 epochs.
+const SUB_BACKFILL_SECS: u64 = 2 * EPOCH_SECS;
 
 /// Section 5.9 S4: the fraction of an hour's sub-epochs that must be
 /// Final for the hour to count as present once built, rather than
@@ -161,7 +173,8 @@ const _: () = assert!(SUB_BACKFILL_SECS + SIGNAL_DISPUTE_SECS + EPOCH_SECS <= SU
 /// `Staking::params::SECONDS_PER_LEDGER` (5s), the same fixed
 /// assumption every TTL computation in this workspace uses.
 const SECONDS_PER_LEDGER: u64 = 5;
-const SUB_DISPUTE_TTL_MARGIN_SECS: u64 = 86_400;
+/// 24 epochs (1 day at the defaults).
+const SUB_DISPUTE_TTL_MARGIN_SECS: u64 = 24 * EPOCH_SECS;
 const SUB_DISPUTE_TTL_LEDGERS: u32 =
     ((SIGNAL_DISPUTE_RULING_SECS + SUB_DISPUTE_TTL_MARGIN_SECS) / SECONDS_PER_LEDGER) as u32;
 /// docs/design/held-repost-disputes.md D3: `HeldHour(asset, hour)`
@@ -210,6 +223,20 @@ impl RiskOracle {
     /// actually deployed without guessing from a wasm hash.
     pub fn version(_env: Env) -> u32 {
         CONTRACT_VERSION
+    }
+
+    /// Whether this exact binary was built with the `demo-time`
+    /// feature (`sylox_types::time`'s own doc comment): `true` only
+    /// for a demo deployment's own wasm, `false` for every real one,
+    /// a pure `cfg!` check of what was actually compiled in, not a
+    /// stored flag anything could set after the fact. CI's own
+    /// `demo-time-not-in-release` job builds the normal release wasm
+    /// (no `--features`, same command `deploy/deploy.sh testnet`
+    /// uses) and calls this against it, failing the build if it ever
+    /// reads anything but `false` - the one thing standing between a
+    /// demo's compressed windows and a real deployment.
+    pub fn demo_build(_env: Env) -> bool {
+        cfg!(feature = "demo-time")
     }
 
     /// technical-doc.md Section 17.3: "Core contracts expose
@@ -384,12 +411,11 @@ impl RiskOracle {
         }
         .publish(&env);
 
-        // Review items C1, C5, C6: this posting cannot itself be final
-        // yet (pending_until is always in the future at post time),
-        // but posting is also the natural moment to sweep the whole
-        // backfill window for any OLDER epoch that has quietly
-        // crossed finality since the last state changing call touched
-        // it ("on backfill" in review item C1's wording).
+        // This posting cannot itself be final yet (pending_until is
+        // always in the future at post time), but posting is also the
+        // natural moment to sweep the whole backfill window for any
+        // OLDER epoch that has quietly crossed finality since the
+        // last state changing call touched it.
         if let Some(newest_final) =
             try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
         {
@@ -1137,9 +1163,9 @@ impl RiskOracle {
         // finalize_endpoint is the one permissionless, callable-by-anyone
         // function guaranteed to run after an epoch's dispute window has
         // had time to elapse (the caller only needs the epoch itself to
-        // have closed, Section 7.4), so it is also where review item C1
-        // and C5's lazy finality sweep gets a chance to run even if no
-        // new SignalSet is ever posted for a later epoch on this asset.
+        // have closed, Section 7.4), so it is also where the lazy
+        // finality sweep gets a chance to run even if no new SignalSet
+        // is ever posted for a later epoch on this asset.
         if let Some(newest_final) =
             try_advance_finality(&env, &config, &asset, FINALITY_LOOKBACK_EPOCHS)
         {
@@ -1202,17 +1228,17 @@ impl RiskOracle {
         Ok(())
     }
 
-    /// technical-doc.md Section 12.1 (feat/event-registry design note,
-    /// review item D6): read-only, no auth. Lets `EventRegistry` assert
-    /// invariant E4 (its own active-event count agrees with this flag)
-    /// directly, rather than inferring the flag only through its one
-    /// visible effect on `band()`'s own Distress floor.
+    /// technical-doc.md Section 12.1: read-only, no auth. Lets
+    /// `EventRegistry` assert invariant E4 (its own active-event count
+    /// agrees with this flag) directly, rather than inferring the flag
+    /// only through its one visible effect on `band()`'s own Distress
+    /// floor.
     pub fn event_in_progress(env: Env, asset: Address) -> bool {
         storage::get_event_in_progress(&env, &asset)
     }
 
-    /// PR #15 review, finding F4: read-only, no auth. Wraps the
-    /// existing `storage::get_newest_epoch_pub`, which reads the
+    /// Read-only, no auth. Wraps the existing
+    /// `storage::get_newest_epoch_pub`, which reads the
     /// dedicated `RingNewest` key directly rather than the newest
     /// ring POSITION's own stored epoch. The two disagree exactly
     /// when the newest position is `Empty` (its epoch was overturned
@@ -1228,7 +1254,7 @@ impl RiskOracle {
         storage::get_newest_epoch_pub(&env, &asset)
     }
 
-    /// PR #25 review: read-only, no auth. The first epoch ever
+    /// Read-only, no auth. The first epoch ever
     /// successfully posted for this asset. `EventRegistry`'s own
     /// Tier 1 Depeg and IssuerFreeze history baselines need this for
     /// the same reason `RiskOracle`'s own score and `median_liquidity`
@@ -1590,8 +1616,8 @@ impl RiskOracle {
         Ok(Self::score(env, asset)?.band)
     }
 
-    /// Re-review item C7 (lead decision): `asset_stale` now means "the
-    /// asset TRANSITIONED into stale", not "a newly observed epoch
+    /// `asset_stale` means "the asset TRANSITIONED into stale", not "a
+    /// newly observed epoch
     /// happened to already be stale on arrival" (the old design's
     /// condition, which never fired at all for the realistic "keepers
     /// stopped posting" case, since nothing new ever arrives to
@@ -1631,7 +1657,7 @@ impl RiskOracle {
         let Some(newest) = storage::get_newest_epoch_pub(&env, &asset) else {
             return 0;
         };
-        // PR #25 review: `newest` alone is always far larger than
+        // `newest` alone is always far larger than
         // `MEDIAN_WINDOW_SLOTS` on a real network (unix-time-derived
         // epoch numbers), so this must be measured against how long
         // THIS asset has actually been posting, not against the
@@ -1742,7 +1768,7 @@ fn is_stale_epoch(env: &Env, epoch: u64) -> bool {
     current_epoch.saturating_sub(epoch) > STALE_AFTER_EPOCHS
 }
 
-/// Re-review item C7: the shared implementation behind both the
+/// The shared implementation behind both the
 /// public, permissionless `check_stale` and the internal call every
 /// state changing function makes on its own asset. Judges staleness
 /// against the STORED score's own epoch (a brand new asset with no
@@ -2884,27 +2910,25 @@ fn reward_posters_for_newly_final_epochs(
     }
 }
 
-/// Review item C1: the one place a `RiskScore` is actually computed and
+/// The one place a `RiskScore` is actually computed and
 /// written. Called from `post_signals` (after writing the new slot and
 /// advancing finality), `finalize_endpoint`, and the dispute resolution
 /// path, each time finality may have moved forward; a no-op (no write,
 /// no `score_updated`/`band_changed` event) if the newest final epoch
 /// has not moved past what is already stored, so repeated calls
 /// within the same epoch do not spam those events. Every caller also
-/// runs `check_stale_internal` afterward (re-review item C7), which is
+/// runs `check_stale_internal` afterward, which is
 /// where `asset_stale` actually gets decided, independent of whether
 /// this function wrote anything.
 ///
 /// The hysteresis down streak in `apply_hysteresis` only advances when
-/// called here with a strictly newer final epoch than what is stored:
-/// this is what review item C1's "the hysteresis down streak may advance
-/// at most once per new epoch... only when the scored epoch is newer
-/// than the stored score's epoch" requires, satisfied by construction
-/// rather than by an extra check, because `score()` itself never calls
-/// this function.
+/// called here with a strictly newer final epoch than what is stored,
+/// so it advances at most once per new epoch, satisfied by
+/// construction rather than by an extra check, because `score()`
+/// itself never calls this function.
 ///
-/// Review decision D1's "at least Distress while an event is in
-/// progress" override is deliberately NOT applied here: it is a
+/// The "at least Distress while an event is in progress" override is
+/// deliberately NOT applied here: it is a
 /// read-time floor applied in `score()` instead (see that function's
 /// doc comment), so that the `RiskScore` persisted here — and the
 /// hysteresis streak computed from it — always reflects the plain
@@ -2924,39 +2948,37 @@ fn recompute_score(env: &Env, asset: &Address, newest_final: u64) -> Result<(), 
         // The epoch that just became final is itself already outside
         // stale_after_epochs (a very late backfill); recording it would
         // immediately read back as stale, which score() already reports
-        // correctly from the stored epoch without a write. Re-review
-        // item C7: asset_stale emission is no longer this function's
-        // job at all; every caller runs check_stale_internal
-        // afterward, which detects exactly this "stale on arrival"
-        // case from the stored score's own (unchanged) epoch and
-        // announces the transition from there.
+        // correctly from the stored epoch without a write. asset_stale
+        // emission is not this function's job at all; every caller
+        // runs check_stale_internal afterward, which detects exactly
+        // this "stale on arrival" case from the stored score's own
+        // (unchanged) epoch and announces the transition from there.
         return Ok(());
     }
-    // PR #25 review: comparing `newest_final` directly against
-    // `AGGREGATE_SLOTS_7D` only guards the subtraction below from
-    // underflowing; it is not a real history check. On a real
-    // network, epoch numbers are unix-time-derived (around 497,000 as
-    // of this fix), always far larger than 168, so that comparison
-    // never fires and a brand-new asset gets scored from however many
-    // epochs it has actually posted, not the 168 (7 days) review
-    // decision D2 requires. The real check is against how long THIS
-    // asset has actually been posting, tracked by `FirstEpoch`.
+    // Comparing `newest_final` directly against `AGGREGATE_SLOTS_7D`
+    // only guards the subtraction below from underflowing; it is not
+    // a real history check. On a real network, epoch numbers are
+    // unix-time-derived (around 497,000 as of writing), always far
+    // larger than 168, so that comparison never fires and a brand-new
+    // asset gets scored from however many epochs it has actually
+    // posted, not the 168 (7 days) the 7 day baseline below requires.
+    // The real check is against how long THIS asset has actually been
+    // posting, tracked by `FirstEpoch`.
     let Some(first_epoch) = storage::get_first_epoch(env, asset) else {
         return Ok(()); // Never posted; nothing to score.
     };
     if newest_final + 1 < first_epoch + AGGREGATE_SLOTS_7D as u64 {
         // Not enough history yet for the 7 day baseline every component
-        // needs (Section 6.5); review decision D2: a new asset with
-        // fewer than 168 epochs of its OWN history reads as stale, by
-        // design, documented here and in the PR report.
+        // needs (Section 6.5): a new asset with fewer than 168 epochs
+        // of its OWN history reads as stale, by design.
         return Ok(());
     }
 
     let cfg = storage::get_asset_config(env, asset).ok_or(Error::UnknownAsset)?;
     let formula = storage::get_formula(env).ok_or(Error::NotInitialized)?;
     let l_target = l_target_for(&cfg);
-    // PR #27 review (round 2): aggregate_from_ring now also fails
-    // with AggregationFailed when the window is calendar-eligible but
+    // aggregate_from_ring fails with AggregationFailed when the
+    // window is calendar-eligible but
     // too sparse (MIN_AGGREGATE_FINAL_SLOTS). Every other "not enough
     // history yet" condition in this function degrades to Ok(()),
     // i.e. post_signals must never abort just because a score could

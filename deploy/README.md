@@ -26,6 +26,22 @@ to make getting this wrong harder.
    exists. Never run alongside the backfill or smoke test on the same
    asset; see `--live`'s own section below.
 
+## `deploy.sh testnet-demo`: a separate target directory
+
+A separate, self-contained path (`deploy/deploy.sh testnet-demo` plus
+`deploy/demo/scenario.sh`): own testnet identities
+(`sylox-demo-time-*`), own `deployments/testnet-demo.json`, never
+touching anything the four steps above use. Its build sets
+`CARGO_TARGET_DIR` to `target/demo-time`, never the default
+`target/wasm32v1-none/release/` step 1 above and CI's own
+`build-contracts` job both read from: `cargo`/`stellar contract build`
+write each contract's Wasm to a fixed path regardless of which feature
+set produced it, so a demo-time build sharing that directory would
+silently replace the real, no-features release artifact with one that
+must never reach a real deployment (`RiskOracle.demo_build()`). After
+a `testnet-demo` run, `target/wasm32v1-none/release/` still holds only
+normal-build Wasm.
+
 ## Why the order matters: `first_epoch` is write-once
 
 `RiskOracle.first_epoch(asset)` is set exactly once, by whichever post
