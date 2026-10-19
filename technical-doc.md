@@ -2,6 +2,8 @@
 
 Version: v1.5 draft, October 9, 2026 · Author: David Ejere
 
+> **SCF #46 funding scope.** This protocol is funded under the Stellar Community Fund Build Award #46. The award covers testnet deployment and validation only. The mainnet architecture, deployment plans and operational sections below document the full production design, but no mainnet deployment, audit, or mainnet operational cost is part of this award.
+
 ## Changelog v1.5
 
 Driven by an SCF delegate's observation that hourly epochs mean a user can wait up to an hour to see new data. Spec only in this revision: no contract code changes. The implementation PR follows once `feat/markets` Part A merges.
@@ -416,6 +418,8 @@ Callers treat a price or rate whose `timestamp` is older than `stale_after_epoch
 | Mainnet | Production | Mainnet data |
 
 Testnet uses real mainnet signals so the feed is meaningful before launch; testnet USDC is used for collateral and payouts.
+
+> The SCF #46 Build Award funds testnet work only. Mainnet deployment is a separate, post-award milestone.
 
 ### 3.5 Repository and module map
 
