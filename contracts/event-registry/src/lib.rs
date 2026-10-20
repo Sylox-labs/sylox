@@ -140,6 +140,9 @@ const FACTORY_SET_KEY: Symbol = symbol_short!("FACT_SET");
 /// permanently present, so a second call always fails.
 const GOVERNOR_SET_KEY: Symbol = symbol_short!("GOV_SET");
 
+/// Maximum number of event records returned in a single `list_events` call.
+pub const MAX_LIST_EVENTS: u32 = 20;
+
 #[contractimpl]
 impl EventRegistry {
     /// Issue #21: a constructor, not a separate `initialize` call -
@@ -628,6 +631,43 @@ impl EventRegistry {
 
     pub fn event(env: Env, event_id: u64) -> Option<EventRecord> {
         storage::get_event(&env, event_id)
+    }
+
+    /// Returns the total number of events ever proposed.
+    ///
+    /// This equals the next event id to assign. Read-only with no auth.
+    pub fn event_count(env: Env) -> u64 {
+        storage::peek_next_event_id(&env)
+    }
+
+    /// Returns a page of event records, oldest first.
+    ///
+    /// Reads sequential event ids starting at `start`. Returns up to `count`
+    /// records, clamped to `MAX_LIST_EVENTS`. Stops at `event_count()`.
+    /// Returns an empty vector if `start >= event_count()`. Missing records
+    /// inside the range are skipped. Read-only with no auth.
+    pub fn list_events(env: Env, start: u64, count: u32) -> Vec<EventRecord> {
+        let total = storage::peek_next_event_id(&env);
+        let mut result = Vec::new(&env);
+        if start >= total {
+            return result;
+        }
+
+        let limit = count.min(MAX_LIST_EVENTS);
+        for i in 0..limit {
+            let id = match start.checked_add(i as u64) {
+                Some(id) => id,
+                None => break,
+            };
+            if id >= total {
+                break;
+            }
+            if let Some(record) = storage::get_event(&env, id) {
+                result.push_back(record);
+            }
+        }
+
+        result
     }
 
     pub fn event_status(env: Env, asset: Address, kind: EventKind) -> AssetEventStatus {

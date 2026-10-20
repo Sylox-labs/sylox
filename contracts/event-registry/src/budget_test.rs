@@ -22,7 +22,7 @@ use sylox_types::{
     Reference, SignalSet,
 };
 
-use crate::{EventRegistry, EventRegistryClient};
+use crate::{EventRegistry, EventRegistryClient, MAX_LIST_EVENTS};
 
 const EPOCH_SECS: u64 = 3_600;
 
@@ -935,4 +935,28 @@ fn disputed_sub_epoch_excluded_then_restored_or_cleared_by_ruling_matches_the_ro
         (9_900_000 + 10_100_000 + 9_000_000) / 3,
         "the provisional roll-up must agree with the gate: the upheld sub-epoch is back"
     );
+}
+
+#[test]
+fn budget_list_events_against_max_page() {
+    let env = Env::default();
+    let (client, oracle) = setup(&env);
+    let keeper = Address::generate(&env);
+
+    for _ in 0..MAX_LIST_EVENTS {
+        let asset = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        oracle.add_asset(&asset_config(&env, &asset, &issuer));
+        client.register_definition(&depeg_definition(&asset));
+        post_failing_depeg_window(&env, &oracle, &keeper, &asset);
+        let caller = Address::generate(&env);
+        client.propose_tier1(&caller, &asset, &EventKind::Depeg, &1);
+    }
+
+    let records = client.list_events(&0, &MAX_LIST_EVENTS);
+    assert_eq!(records.len(), MAX_LIST_EVENTS);
+
+    let estimate = env.cost_estimate();
+    print_resources("list_events, 20 records (MAX_LIST_EVENTS)", &estimate);
+    assert_under_half(&estimate, "list_events");
 }

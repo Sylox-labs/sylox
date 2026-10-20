@@ -12,10 +12,10 @@ use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, IntoVal, Symbol};
 use sylox_types::{
     AssetConfig, AssetEventStatus, CoverGate, EndpointStatus, EventDefinition, EventKind,
-    EventState, IssuerFlags, Reference,
+    EventRecord, EventState, IssuerFlags, Reference,
 };
 
-use crate::{Error, EventRegistry, EventRegistryClient};
+use crate::{Error, EventRegistry, EventRegistryClient, MAX_LIST_EVENTS};
 
 // -- Minimal mocks for RiskOracle and Staking, for unit tests that
 // don't need the real cross-contract behavior; the integration test
@@ -3238,4 +3238,164 @@ fn cannot_initialize_a_second_time() {
          constructor; only instance storage (the Config it writes) \
          is touched"
     );
+}
+
+fn propose_depeg_event(env: &Env, fx: &Fixture) -> u64 {
+    let asset = Address::generate(env);
+    let issuer = Address::generate(env);
+    fx.oracle
+        .add_asset(&asset_config(env, &asset, &issuer, IssuerFlags::default()));
+    fx.client
+        .register_definition(&depeg_definition(env, &asset));
+    post_failing_depeg_window(env, &fx.oracle, &fx.keeper, &asset);
+    fx.client
+        .propose_tier1(&Address::generate(env), &asset, &EventKind::Depeg, &1)
+}
+
+#[test]
+fn event_count_is_zero_on_fresh_registry() {
+    let env = Env::default();
+    let fx = setup(&env);
+    assert_eq!(fx.client.event_count(), 0);
+}
+
+#[test]
+fn event_count_tracks_number_of_proposed_events() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let n = 4u64;
+    for _ in 0..n {
+        propose_depeg_event(&env, &fx);
+    }
+    assert_eq!(fx.client.event_count(), n);
+}
+
+#[test]
+fn event_count_does_not_increment_on_repeated_calls() {
+    let env = Env::default();
+    let fx = setup(&env);
+    propose_depeg_event(&env, &fx);
+    let first = fx.client.event_count();
+    let second = fx.client.event_count();
+    assert_eq!(first, 1);
+    assert_eq!(second, 1);
+}
+
+#[test]
+fn proposing_after_event_count_gets_expected_next_id() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let id0 = propose_depeg_event(&env, &fx);
+    assert_eq!(id0, 0);
+
+    let count = fx.client.event_count();
+    assert_eq!(count, 1);
+
+    let id1 = propose_depeg_event(&env, &fx);
+    assert_eq!(id1, 1);
+    assert_eq!(fx.client.event_count(), 2);
+}
+
+#[test]
+fn list_events_returns_all_records_in_id_order() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let n = 4u64;
+    for _ in 0..n {
+        propose_depeg_event(&env, &fx);
+    }
+    let list = fx.client.list_events(&0, &(n as u32));
+    assert_eq!(list.len() as u64, n);
+    for id in 0..n {
+        let expected = fx.client.event(&id).unwrap();
+        let record = list.get(id as u32).unwrap();
+        assert_eq!(record, expected);
+        assert_eq!(record.id, id);
+    }
+}
+
+#[test]
+fn list_events_paging_equals_combined_read() {
+    let env = Env::default();
+    let fx = setup(&env);
+    for _ in 0..4 {
+        propose_depeg_event(&env, &fx);
+    }
+    let combined = fx.client.list_events(&0, &4);
+    let page1 = fx.client.list_events(&0, &2);
+    let page2 = fx.client.list_events(&2, &2);
+    assert_eq!(combined.len(), 4);
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page1.get(0).unwrap(), combined.get(0).unwrap());
+    assert_eq!(page1.get(1).unwrap(), combined.get(1).unwrap());
+    assert_eq!(page2.get(0).unwrap(), combined.get(2).unwrap());
+    assert_eq!(page2.get(1).unwrap(), combined.get(3).unwrap());
+}
+
+#[test]
+fn list_events_with_start_at_or_above_count_returns_empty() {
+    let env = Env::default();
+    let fx = setup(&env);
+    propose_depeg_event(&env, &fx);
+    let count = fx.client.event_count();
+    let empty_equal = fx.client.list_events(&count, &10);
+    let empty_above = fx.client.list_events(&(count + 5), &10);
+    assert_eq!(empty_equal.len(), 0);
+    assert_eq!(empty_above.len(), 0);
+}
+
+#[test]
+fn list_events_with_zero_count_returns_empty() {
+    let env = Env::default();
+    let fx = setup(&env);
+    propose_depeg_event(&env, &fx);
+    let list = fx.client.list_events(&0, &0);
+    assert_eq!(list.len(), 0);
+}
+
+fn seed_event(env: &Env, fx: &Fixture, id: u64) -> EventRecord {
+    let record = EventRecord {
+        id,
+        asset: Address::generate(env),
+        kind: EventKind::Depeg,
+        def_version: 1,
+        tier: 1,
+        state: EventState::Proposed,
+        window_start: 0,
+        proposed_at: 1000 + id,
+        escalated_at: None,
+        declared_at: None,
+        evidence_hash: BytesN::from_array(env, &[0u8; 32]),
+        proposer: Address::generate(env),
+        bond: 0,
+    };
+    env.as_contract(&fx.contract_id, || {
+        crate::storage::set_event(env, &record);
+        env.storage()
+            .instance()
+            .set(&crate::storage::DataKey::NextEventId, &(id + 1));
+    });
+    record
+}
+
+#[test]
+fn list_events_clamps_count_to_max_list_events() {
+    let env = Env::default();
+    let fx = setup(&env);
+    let total = MAX_LIST_EVENTS + 5;
+    for id in 0..total as u64 {
+        seed_event(&env, &fx, id);
+    }
+    let list = fx.client.list_events(&0, &u32::MAX);
+    assert_eq!(list.len(), MAX_LIST_EVENTS);
+}
+
+#[test]
+fn list_events_with_huge_start_returns_empty_and_does_not_panic() {
+    let env = Env::default();
+    let fx = setup(&env);
+    propose_depeg_event(&env, &fx);
+    let list = fx.client.list_events(&u64::MAX, &5);
+    assert_eq!(list.len(), 0);
 }

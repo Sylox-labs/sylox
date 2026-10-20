@@ -124,6 +124,13 @@ pub fn next_event_id(env: &Env) -> u64 {
     id
 }
 
+pub fn peek_next_event_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextEventId)
+        .unwrap_or(0)
+}
+
 pub fn get_canonical(env: &Env, asset: &Address, kind: EventKind) -> u32 {
     env.storage()
         .persistent()
