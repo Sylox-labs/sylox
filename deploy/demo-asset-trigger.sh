@@ -130,6 +130,10 @@ ASSET_CODE_ARG="DEMOUSD"
 for arg in "${@:3}"; do
   if [[ "$arg" == "--dry-run" ]]; then
     DRY_RUN=1
+  elif [[ "$arg" == --* ]]; then
+    echo "usage: $0 testnet [backfill_hours] [--dry-run] [asset_code]" >&2
+    echo "unknown flag: $arg" >&2
+    exit 1
   else
     ASSET_CODE_ARG="$arg"
   fi
@@ -140,6 +144,10 @@ if [[ "$NETWORK" != "testnet" ]]; then
 fi
 if ! [[ "$BACKFILL_HOURS" =~ ^[0-9]+$ ]] || (( BACKFILL_HOURS < 1 || BACKFILL_HOURS > 71 )); then
   echo "backfill_hours must be an integer between 1 and 71" >&2
+  exit 1
+fi
+if ! [[ "$ASSET_CODE_ARG" =~ ^[A-Z0-9]{1,12}$ ]]; then
+  echo "asset_code must match ^[A-Z0-9]{1,12}\$ (got: $ASSET_CODE_ARG)" >&2
   exit 1
 fi
 
@@ -971,7 +979,11 @@ fi
 
 PENDING_UNTIL=$(( $(date +%s) + 7200 ))
 log "This signal is Pending until $(date -u -r "$PENDING_UNTIL" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$PENDING_UNTIL" +%Y-%m-%dT%H:%M:%SZ) UTC (signal_dispute_secs, 2h), then effectively Final."
-log "propose_tier1 reads effectively-Final slots (ADR-008): this script does NOT wait for that; run deploy/demo-asset-propose.sh testnet once that time has passed."
+if [[ "$DEMO_CODE" == "DEMOUSD" ]]; then
+  log "propose_tier1 reads effectively-Final slots (ADR-008): this script does NOT wait for that; run deploy/demo-asset-propose.sh testnet once that time has passed."
+else
+  log "propose_tier1 reads effectively-Final slots (ADR-008): this script does NOT wait for that; run deploy/demo-asset-propose.sh testnet $DEMO_CODE once that time has passed."
+fi
 
 # Every real transaction this run actually submitted, by label, with
 # its hash - collected by note_submission as each one landed, so this

@@ -21,6 +21,10 @@ if [[ "$NETWORK" != "testnet" ]]; then
   echo "usage: $0 testnet [asset_code]" >&2
   exit 1
 fi
+if ! [[ "$ASSET_CODE_ARG" =~ ^[A-Z0-9]{1,12}$ ]]; then
+  echo "asset_code must match ^[A-Z0-9]{1,12}\$ (got: $ASSET_CODE_ARG)" >&2
+  exit 1
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RECORD="$REPO_ROOT/deployments/testnet.json"

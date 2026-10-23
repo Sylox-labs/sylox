@@ -41,6 +41,10 @@ if [[ "$NETWORK" != "testnet" ]]; then
   exit 1
 fi
 DEMO_CODE="${2:-DEMOUSD}"
+if ! [[ "$DEMO_CODE" =~ ^[A-Z0-9]{1,12}$ ]]; then
+  echo "asset_code must match ^[A-Z0-9]{1,12}\$ (got: $DEMO_CODE)" >&2
+  exit 1
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RECORD="$REPO_ROOT/deployments/testnet.json"
@@ -195,5 +199,5 @@ log "demo asset record written: $DEMO_RECORD"
 if [[ "$DEMO_CODE" == "DEMOUSD" ]]; then
   log "Done. Next: deploy/demo-asset-trigger.sh testnet to create a holder, post $DEMO_CODE's own history, and trigger a real freeze."
 else
-  log "Done. Next: deploy/demo-asset-trigger.sh testnet $DEMO_CODE to create a holder, post $DEMO_CODE's own history, and trigger a real freeze."
+  log "Done. Next: deploy/demo-asset-trigger.sh testnet 3 $DEMO_CODE to create a holder, post $DEMO_CODE's own history, and trigger a real freeze."
 fi
