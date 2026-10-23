@@ -1,0 +1,9 @@
+{
+  "network": "testnet",
+  "demo_asset": {
+    "contract_id": "CBA3TFIN6YSE3A7L6KH3QR3JJPSAWVLDQS6Y3YQV2E22P4AYEIONI644",
+    "asset_code": "DEMOUSD2",
+    "issuer": "GCCOUXN2DDRMSAVHS7TX3SOMTGSE776XZ7SXYRJ54NLMVRDP7HE6MEXD",
+    "note": "SAMPLE asset only, auth_revocable + clawback_enabled, never real value. Never call this a real stablecoin."
+  }
+}
