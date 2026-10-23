@@ -98,6 +98,12 @@ EPOCH_SECS=3600
 SUB_EPOCH_SECS=300
 SUB_BACKFILL_SECS=7200   # crate::SUB_BACKFILL_SECS: post_sub_signals's own backfill reach
 SUBS_PER_HOUR=$(( EPOCH_SECS / SUB_EPOCH_SECS ))
+# How long a deferred sub-epoch may stay unposted before a --live run
+# exits non-zero. 1800s is six 5-minute ticks: long enough to ride out
+# a short RPC outage, and well inside post_sub_signals's 2h backfill
+# window (SUB_BACKFILL_SECS), so a sub-epoch can still be posted once
+# the RPC recovers. See run_live_mode's exit decision.
+LIVE_DEFERRED_FAIL_AFTER_SECS=1800
 
 RO_ID="$(jq -r '.contracts.risk_oracle.id' "$RECORD")"
 KEEPER_ADDR="$(jq -r '.identities.keeper' "$RECORD")"
@@ -256,6 +262,18 @@ post_sub_epochs() {
 #                                           loop, same run as above.
 #   "client error (Connect)"             - the local --live stopgap
 #                                           loop, a separate occurrence.
+#   "Request rejected `502`"              - the Railway --live poster,
+#                                           posting a USDC sub-epoch
+#                                           (2026-10-22 13:36 UTC). The
+#                                           testnet RPC answered one call
+#                                           with a gateway error; the run
+#                                           exited and the poster stayed
+#                                           down for 11 hours.
+#   "Request rejected `503`"/"`504`"      - not yet observed, but the same
+#                                           CLI message for the other two
+#                                           gateway errors an RPC behind a
+#                                           load balancer returns while it
+#                                           is restarting or overloaded.
 #   "txBadSeq"                            - not yet observed in this
 #                                           project directly, but the
 #                                           standard Stellar transaction
@@ -278,6 +296,9 @@ is_transient_error() {
      || "$1" == *"error reading a body from connection"* \
      || "$1" == *"client error (SendRequest)"* \
      || "$1" == *"client error (Connect)"* \
+     || "$1" == *'Request rejected `502`'* \
+     || "$1" == *'Request rejected `503`'* \
+     || "$1" == *'Request rejected `504`'* \
      || "$1" == *"txBadSeq"* ]]
 }
 
@@ -374,6 +395,7 @@ run_live_mode() {
 
   local posted=0 skipped=0 deferred=0
   local posted_list="" skipped_list="" deferred_list=""
+  local oldest_deferred_close=""
 
   local hour
   for hour in $(( hour_now - 1 )) "$hour_now"; do
@@ -410,6 +432,9 @@ run_live_mode() {
           # visible, rather than silently retried forever.
           deferred=$(( deferred + 1 ))
           deferred_list+="$hour.$sub "
+          if [[ -z "$oldest_deferred_close" ]] || (( sub_close < oldest_deferred_close )); then
+            oldest_deferred_close="$sub_close"
+          fi
           ;;
         *)
           echo "FATAL: hour $hour sub $sub: $result" >&2
@@ -436,10 +461,41 @@ run_live_mode() {
   # must still run after this, win or lose - posting's own result is
   # captured by the caller below and combined with the TTL step's own,
   # rather than this function ending the whole script on the spot.
-  if (( posted == 0 && deferred > 0 )); then
+  #
+  # Review finding (2026-10-22 outage): the rule above also fired on a
+  # single RPC blip. The 13:36 UTC run's only NEW sub-epoch hit a 502,
+  # so posted was 0 and deferred was 1, the run exited non-zero, and
+  # Railway marked the deployment crashed. Nothing posted for the next
+  # 11 hours. A deferred sub-epoch that closed a few minutes ago is not
+  # an outage yet: the next tick retries it anyway. The run now fails
+  # only when a deferred sub-epoch has been closed for longer than
+  # LIVE_DEFERRED_FAIL_AFTER_SECS, which means several ticks in a row
+  # have failed to post it. That keeps a real, sustained outage visible
+  # as a crashed run, without letting one bad response take the poster
+  # down.
+  local oldest_deferred_age=0
+  if [[ -n "$oldest_deferred_close" ]]; then
+    oldest_deferred_age=$(( $(date +%s) - oldest_deferred_close ))
+  fi
+  if live_pass_should_fail "$posted" "$deferred" "$oldest_deferred_age" "$LIVE_DEFERRED_FAIL_AFTER_SECS"; then
+    log "live: failing this run: sub-epoch(s) deferred for ${oldest_deferred_age}s, past the ${LIVE_DEFERRED_FAIL_AFTER_SECS}s limit (sustained RPC failure)"
     return 1
   fi
+  if (( deferred > 0 )); then
+    log "live: ${deferred} sub-epoch(s) deferred for ${oldest_deferred_age}s, under the ${LIVE_DEFERRED_FAIL_AFTER_SECS}s limit; the next tick retries them"
+  fi
   return 0
+}
+
+# The pure half of run_live_mode's exit decision, factored out so
+# deploy/test-post-demo-signals-transient-errors.sh can check it
+# without a network. Fails the pass only when nothing new was posted,
+# at least one sub-epoch was deferred, and the oldest deferred one has
+# been closed for longer than the limit.
+#   $1 posted   $2 deferred   $3 oldest deferred age (s)   $4 limit (s)
+live_pass_should_fail() {
+  local posted="$1" deferred="$2" age="$3" limit="$4"
+  (( posted == 0 && deferred > 0 && age > limit ))
 }
 
 # The pure half of build_recent_hours, factored out so it can be
