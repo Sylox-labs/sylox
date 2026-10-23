@@ -79,16 +79,25 @@
 #     stellar.expert-linkable, folded into the posted inputs so anyone
 #     can check the posted numbers against the chain.
 #
-# Usage: deploy/demo-asset-trigger.sh testnet [backfill_hours] [--dry-run]
-#   backfill_hours: hours of plain DEMOUSD history to post before the
-#                   gap-fill hour (step 5), oldest first. Default 3,
-#                   capped at 71 (same bound as post-demo-signals.sh,
-#                   for the same reason).
+# Usage: deploy/demo-asset-trigger.sh testnet [backfill_hours] [--dry-run] [asset_code]
+#   backfill_hours: hours of plain history to post before the gap-fill
+#                   hour (step 5), oldest first. Default 3, capped at
+#                   71 (same bound as post-demo-signals.sh, for the
+#                   same reason).
 #   --dry-run: print the resume plan (every step: "already done (tx
 #              ...)" or "will submit") and exit before anything is
 #              signed. Safe to run any number of times; makes no
 #              on-chain calls beyond the same reads a real run would
 #              make anyway.
+#   asset_code: defaults to DEMOUSD, reading
+#               deployments/testnet-demo-asset.json and reusing
+#               sylox-demo-holder-2, exactly as before this script took
+#               an asset_code argument at all. Any other code reads
+#               deployments/testnet-demo-asset-<code, lowercased>.json
+#               instead and gets its own holder identity
+#               (sylox-demo-holder-2-<code, lowercased>), so a second
+#               demo asset's holder, mint, revoke and clawback never
+#               touch DEMOUSD's own holder or history.
 #
 # Resumable by design, not just safe to retry: every step below checks
 # the REAL chain state before deciding whether to submit anything, the
@@ -117,11 +126,16 @@ set -uo pipefail
 NETWORK="${1:-}"
 BACKFILL_HOURS="${2:-3}"
 DRY_RUN=0
-for arg in "$@"; do
-  [[ "$arg" == "--dry-run" ]] && DRY_RUN=1
+ASSET_CODE_ARG="DEMOUSD"
+for arg in "${@:3}"; do
+  if [[ "$arg" == "--dry-run" ]]; then
+    DRY_RUN=1
+  else
+    ASSET_CODE_ARG="$arg"
+  fi
 done
 if [[ "$NETWORK" != "testnet" ]]; then
-  echo "usage: $0 testnet [backfill_hours] [--dry-run]" >&2
+  echo "usage: $0 testnet [backfill_hours] [--dry-run] [asset_code]" >&2
   exit 1
 fi
 if ! [[ "$BACKFILL_HOURS" =~ ^[0-9]+$ ]] || (( BACKFILL_HOURS < 1 || BACKFILL_HOURS > 71 )); then
@@ -131,9 +145,22 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RECORD="$REPO_ROOT/deployments/testnet.json"
-DEMO_RECORD="$REPO_ROOT/deployments/testnet-demo-asset.json"
+
+# DEMOUSD keeps today's exact record filename and holder alias (no
+# suffix); any other code gets its own suffixed filename and alias
+# (lowercased, same convention as deploy/demo-asset.sh), so a second
+# demo asset's holder, mint, revoke and clawback can never collide
+# with DEMOUSD's own.
+if [[ "$ASSET_CODE_ARG" == "DEMOUSD" ]]; then
+  DEMO_RECORD="$REPO_ROOT/deployments/testnet-demo-asset.json"
+  HOLDER_ALIAS_SUFFIX=""
+else
+  ASSET_CODE_LOWER="$(echo "$ASSET_CODE_ARG" | tr '[:upper:]' '[:lower:]')"
+  DEMO_RECORD="$REPO_ROOT/deployments/testnet-demo-asset-$ASSET_CODE_LOWER.json"
+  HOLDER_ALIAS_SUFFIX="-$ASSET_CODE_LOWER"
+fi
 [[ -f "$RECORD" ]] || { echo "FATAL: $RECORD not found; run deploy/deploy.sh testnet first" >&2; exit 1; }
-[[ -f "$DEMO_RECORD" ]] || { echo "FATAL: $DEMO_RECORD not found; run deploy/demo-asset.sh testnet first" >&2; exit 1; }
+[[ -f "$DEMO_RECORD" ]] || { echo "FATAL: $DEMO_RECORD not found; run deploy/demo-asset.sh testnet${HOLDER_ALIAS_SUFFIX:+ (and pass $ASSET_CODE_ARG)} first" >&2; exit 1; }
 
 STELLAR_BIN="${STELLAR_CLI_BIN:-stellar}"
 EPOCH_SECS=3600
@@ -146,7 +173,7 @@ KEEPER_ADDR="$(jq -r '.identities.keeper' "$RECORD")"
 DEMO_ID="$(jq -r '.demo_asset.contract_id' "$DEMO_RECORD")"
 DEMO_CODE="$(jq -r '.demo_asset.asset_code' "$DEMO_RECORD")"
 DEMO_ISSUER_ADDR="$(jq -r '.demo_asset.issuer' "$DEMO_RECORD")"
-DEMO_ISSUER=sylox-demo-issuer
+DEMO_ISSUER="sylox-demo-issuer$HOLDER_ALIAS_SUFFIX"
 
 log() { echo "==> $*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
@@ -358,7 +385,7 @@ read_tx_epoch() {
 read_real_supply() {
   local stats
   stats="$(curl -sSf "$HORIZON_URL/assets?asset_code=$DEMO_CODE&asset_issuer=$DEMO_ISSUER_ADDR" 2>&1)" \
-    || die "could not read DEMOUSD's asset stats from Horizon: $stats"
+    || die "could not read $DEMO_CODE's asset stats from Horizon: $stats"
   local authorized maintain unauthorized
   authorized="$(echo "$stats" | jq -r '._embedded.records[0].balances.authorized // "0"')"
   maintain="$(echo "$stats" | jq -r '._embedded.records[0].balances.authorized_to_maintain_liabilities // "0"')"
@@ -393,7 +420,7 @@ read_previous_supply() {
   fi
   local previous_epoch=$(( epoch - 1 ))
   local out
-  out="$(invoke_read "signals(DEMOUSD, $previous_epoch)" --id "$RO_ID" --source-account "$DEMO_ISSUER" \
+  out="$(invoke_read "signals($DEMO_CODE, $previous_epoch)" --id "$RO_ID" --source-account "$DEMO_ISSUER" \
     --network testnet --send=no -- signals --asset "$DEMO_ID" --epoch "$previous_epoch")"
   if [[ "$out" == "null" ]]; then
     echo ""
@@ -476,8 +503,8 @@ note_submission() {
   SUBMITTED_TX_HASHES["$label"]="$tx_hash"
 }
 
-log "[1/7] DEMOUSD holder identity"
-HOLDER=sylox-demo-holder-2
+log "[1/7] $DEMO_CODE holder identity"
+HOLDER="sylox-demo-holder-2$HOLDER_ALIAS_SUFFIX"
 HOLDER_EXISTS=0
 "$STELLAR_BIN" keys address "$HOLDER" >/dev/null 2>&1 && HOLDER_EXISTS=1
 
@@ -566,27 +593,27 @@ fi
 # assumed. Guarded now: mint only if the holder's real balance (read
 # from the chain, not assumed) is still zero.
 
-log "[2/7] DEMOUSD balance for $HOLDER_ADDR"
+log "[2/7] $DEMO_CODE balance for $HOLDER_ADDR"
 if [[ -z "$HOLDER_ADDR" ]]; then
   plan "mint" "cannot check yet" "holder identity does not exist locally"
 else
-  holder_balance_before_raw="$(invoke_read "$HOLDER_ADDR's DEMOUSD balance" --id "$DEMO_ID" --source-account "$DEMO_ISSUER" \
+  holder_balance_before_raw="$(invoke_read "$HOLDER_ADDR's $DEMO_CODE balance" --id "$DEMO_ID" --source-account "$DEMO_ISSUER" \
     --network testnet --send=no -- balance --id "$HOLDER_ADDR")"
-  holder_balance_before="$(parse_i128 "$holder_balance_before_raw" "$HOLDER_ADDR's DEMOUSD balance")"
+  holder_balance_before="$(parse_i128 "$holder_balance_before_raw" "$HOLDER_ADDR's $DEMO_CODE balance")"
   if (( holder_balance_before > 0 )); then
     plan "mint" "already done" "$holder_balance_before stroops already held"
-    log "$HOLDER_ADDR already holds $holder_balance_before stroops of DEMOUSD; not minting again"
+    log "$HOLDER_ADDR already holds $holder_balance_before stroops of $DEMO_CODE; not minting again"
   else
     plan "mint" "will submit" "1000000000 stroops"
     if (( ! DRY_RUN )); then
       HOLDER_BALANCE=1000000000   # 100 units at SCALE 1e7, arbitrary plausible size, enough to partially clawback.
-      log "Issuing $HOLDER_BALANCE DEMOUSD to $HOLDER_ADDR"
+      log "Issuing $HOLDER_BALANCE $DEMO_CODE to $HOLDER_ADDR"
       mint_out="$("$STELLAR_BIN" contract invoke --id "$DEMO_ID" --source-account "$DEMO_ISSUER" \
         --network testnet -- mint --to "$HOLDER_ADDR" --amount "$HOLDER_BALANCE" 2>&1)" || die "minting to $HOLDER_ADDR failed:
 $mint_out"
       echo "$mint_out"
       MINT_TX_HASH="$(echo "$mint_out" | grep -oE '[a-f0-9]{64}' | head -1)"
-      log "minted $HOLDER_BALANCE DEMOUSD to $HOLDER_ADDR: $MINT_TX_HASH"
+      log "minted $HOLDER_BALANCE $DEMO_CODE to $HOLDER_ADDR: $MINT_TX_HASH"
       note_submission "mint" "$MINT_TX_HASH"
     fi
   fi
@@ -665,11 +692,11 @@ $revoke_out"
     log "$HOLDER_ADDR already has a real clawback from a prior run; not clawing back again"
     log "found the real clawback transaction from a prior run: $CLAWBACK_TX_HASH ($CLAWBACK_AMOUNT stroops)"
   else
-    holder_balance_now_raw="$(invoke_read "$HOLDER_ADDR's real DEMOUSD balance" --id "$DEMO_ID" --source-account "$DEMO_ISSUER" \
+    holder_balance_now_raw="$(invoke_read "$HOLDER_ADDR's real $DEMO_CODE balance" --id "$DEMO_ID" --source-account "$DEMO_ISSUER" \
       --network testnet --send=no -- balance --id "$HOLDER_ADDR")"
-    holder_balance_now="$(parse_i128 "$holder_balance_now_raw" "$HOLDER_ADDR's real DEMOUSD balance")"
+    holder_balance_now="$(parse_i128 "$holder_balance_now_raw" "$HOLDER_ADDR's real $DEMO_CODE balance")"
     CLAWBACK_REQUEST=$(( holder_balance_now / 2 ))   # Half of whatever the holder really holds right now.
-    (( CLAWBACK_REQUEST > 0 )) || die "$HOLDER_ADDR holds $holder_balance_now stroops of DEMOUSD; nothing to claw back"
+    (( CLAWBACK_REQUEST > 0 )) || die "$HOLDER_ADDR holds $holder_balance_now stroops of $DEMO_CODE; nothing to claw back"
     plan "clawback" "will submit" "$CLAWBACK_REQUEST of $holder_balance_now stroops held"
 
     if (( ! DRY_RUN )); then
@@ -761,12 +788,12 @@ fi
 # the gap deliberately provides).
 
 if [[ -n "$TRIGGER_EPOCH" ]]; then
-  log "[5/7] Backfilling $BACKFILL_HOURS hour(s) of plain DEMOUSD history, then filling the gap hour before epoch $TRIGGER_EPOCH"
+  log "[5/7] Backfilling $BACKFILL_HOURS hour(s) of plain $DEMO_CODE history, then filling the gap hour before epoch $TRIGGER_EPOCH"
   GAP_EPOCH=$(( TRIGGER_EPOCH - 1 ))
   FIRST_EPOCH=$(( GAP_EPOCH - BACKFILL_HOURS ))
 
   for (( epoch = FIRST_EPOCH; epoch < GAP_EPOCH; epoch++ )); do
-    existing_signal="$(invoke_read "signals(DEMOUSD, $epoch)" --id "$RO_ID" --source-account "$DEMO_ISSUER" \
+    existing_signal="$(invoke_read "signals($DEMO_CODE, $epoch)" --id "$RO_ID" --source-account "$DEMO_ISSUER" \
       --network testnet --send=no -- signals --asset "$DEMO_ID" --epoch "$epoch")"
     if [[ "$existing_signal" != "null" ]]; then
       plan "backfill epoch $epoch" "already done"
@@ -786,7 +813,7 @@ if [[ -n "$TRIGGER_EPOCH" ]]; then
         log "epoch $epoch already posted; skipping"
         continue
       fi
-      die "post_signals(DEMOUSD, $epoch) failed:
+      die "post_signals($DEMO_CODE, $epoch) failed:
 $post_out"
     fi
     backfill_tx_hash="$(echo "$post_out" | grep -oE '[a-f0-9]{64}' | head -1)"
@@ -800,7 +827,7 @@ $post_out"
   # supply_change_bps 0 is then correct by construction, not a
   # placeholder, since this post deliberately carries the same supply
   # forward unchanged.
-  gap_existing_signal="$(invoke_read "signals(DEMOUSD, $GAP_EPOCH)" --id "$RO_ID" --source-account "$DEMO_ISSUER" \
+  gap_existing_signal="$(invoke_read "signals($DEMO_CODE, $GAP_EPOCH)" --id "$RO_ID" --source-account "$DEMO_ISSUER" \
     --network testnet --send=no -- signals --asset "$DEMO_ID" --epoch "$GAP_EPOCH")"
   if [[ "$gap_existing_signal" != "null" ]]; then
     gap_supply="$(echo "$gap_existing_signal" | jq -r '.supply')"
@@ -815,7 +842,7 @@ $post_out"
       if ! gap_post_out="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account sylox-testnet-keeper --network testnet -- \
         post_signals --keeper "$KEEPER_ADDR" --asset "$DEMO_ID" --s "$gap_signal_set" 2>&1)"; then
         if [[ "$gap_post_out" != *"Error(Contract, #103)"* ]]; then
-          die "post_signals(DEMOUSD, $GAP_EPOCH, gap fill) failed:
+          die "post_signals($DEMO_CODE, $GAP_EPOCH, gap fill) failed:
 $gap_post_out"
         fi
         log "epoch $GAP_EPOCH already posted; skipping"
@@ -851,13 +878,13 @@ fi
 # reads), so the dry-run plan below can show the real numbers the
 # triggering post would actually carry.
 
-CANONICAL_VERSION="$(invoke_read "current_version(DEMOUSD, IssuerFreeze)" --id "$ER_ID" --source-account sylox-testnet-admin --network testnet --send=no -- current_version --asset "$DEMO_ID" --kind '"IssuerFreeze"')"
-[[ "$CANONICAL_VERSION" =~ ^[1-9][0-9]*$ ]] || die "current_version(DEMOUSD, IssuerFreeze) is not registered ($CANONICAL_VERSION); run deploy/demo-asset.sh testnet first"
-def_json="$(invoke_read "definition(DEMOUSD, IssuerFreeze, v$CANONICAL_VERSION)" --id "$ER_ID" --source-account sylox-testnet-admin --network testnet --send=no -- definition --asset "$DEMO_ID" --kind '"IssuerFreeze"' --version "$CANONICAL_VERSION")"
+CANONICAL_VERSION="$(invoke_read "current_version($DEMO_CODE, IssuerFreeze)" --id "$ER_ID" --source-account sylox-testnet-admin --network testnet --send=no -- current_version --asset "$DEMO_ID" --kind '"IssuerFreeze"')"
+[[ "$CANONICAL_VERSION" =~ ^[1-9][0-9]*$ ]] || die "current_version($DEMO_CODE, IssuerFreeze) is not registered ($CANONICAL_VERSION); run deploy/demo-asset.sh testnet first"
+def_json="$(invoke_read "definition($DEMO_CODE, IssuerFreeze, v$CANONICAL_VERSION)" --id "$ER_ID" --source-account sylox-testnet-admin --network testnet --send=no -- definition --asset "$DEMO_ID" --kind '"IssuerFreeze"' --version "$CANONICAL_VERSION")"
 FREEZE_PCT_BPS="$(echo "$def_json" | jq -r '.freeze_pct_bps')"
 
 supply_at_trigger="$(read_real_supply)"
-(( supply_at_trigger > 0 )) || die "DEMOUSD's real supply read as 0; cannot check the freeze threshold against it"
+(( supply_at_trigger > 0 )) || die "$DEMO_CODE's real supply read as 0; cannot check the freeze threshold against it"
 bps_reached=$(( CLAWBACK_AMOUNT * 10000 / supply_at_trigger ))
 log "[6/7] Check: clawback_amount * 10000 / supply = $CLAWBACK_AMOUNT * 10000 / $supply_at_trigger = $bps_reached bps (threshold: freeze_pct_bps=$FREEZE_PCT_BPS)"
 if (( bps_reached < FREEZE_PCT_BPS )); then
@@ -904,7 +931,7 @@ inputs_json=$(jq -nc \
 inputs_hash="$(printf '%s' "$inputs_json" | shasum -a 256 | cut -d' ' -f1)"
 signal_set="{\"epoch\":$TRIGGER_EPOCH,\"posted_at\":0,\"peg_ratio\":\"10000000\",\"peg_ratio_p10\":\"9998000\",\"liquidity_2pct\":\"$LIQUIDITY\",\"redemption_net\":\"0\",\"supply\":\"$supply_at_trigger\",\"supply_change_bps\":$trigger_supply_change_bps,\"issuer_actions\":{\"clawbacks\":1,\"clawback_amount\":\"$CLAWBACK_AMOUNT\",\"auth_revocations\":1,\"flag_changes\":0},\"endpoint\":\"Unknown\",\"inputs_hash\":\"$inputs_hash\",\"poster\":\"$KEEPER_ADDR\"}"
 
-existing_trigger_signal="$(invoke_read "signals(DEMOUSD, $TRIGGER_EPOCH)" --id "$RO_ID" --source-account "$DEMO_ISSUER" \
+existing_trigger_signal="$(invoke_read "signals($DEMO_CODE, $TRIGGER_EPOCH)" --id "$RO_ID" --source-account "$DEMO_ISSUER" \
   --network testnet --send=no -- signals --asset "$DEMO_ID" --epoch "$TRIGGER_EPOCH")"
 if [[ "$existing_trigger_signal" != "null" ]]; then
   plan "triggering post" "already done" "epoch=$TRIGGER_EPOCH"
@@ -924,7 +951,7 @@ else
       if [[ "$trigger_out" == *"Error(Contract, #103)"* ]]; then
         log "epoch $TRIGGER_EPOCH already posted; not posting again"
       else
-        die "post_signals(DEMOUSD, $TRIGGER_EPOCH, the triggering signal) failed:
+        die "post_signals($DEMO_CODE, $TRIGGER_EPOCH, the triggering signal) failed:
 $trigger_out"
       fi
     else

@@ -38,6 +38,17 @@
 #
 # Usage: deploy/extend-ttl.sh testnet
 #
+# Demo asset records: every deployments/testnet-demo-asset*.json file
+# (DEMOUSD's own testnet-demo-asset.json, plus any
+# testnet-demo-asset-<code>.json a second demo asset's own
+# deploy/demo-asset.sh testnet <code> run wrote) is picked up here, not
+# just DEMOUSD's own record - so a second demo asset's token instance
+# and contract x token Balance entries are tracked automatically, the
+# same convention RiskOracle.assets() and EventRegistry.NextEventId
+# already use for the asset- and event-generic parts of this script.
+# At least DEMOUSD's own record must exist; any later ones are picked
+# up if present, never required.
+#
 # Extra keys: SYLOX_EXTRA_TTL_KEYS, a space-separated list of
 # "contract_id:key_json:durability" triples, extends those alongside
 # the standard set. Off by default (empty). For when a specific
@@ -61,9 +72,15 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RECORD="$REPO_ROOT/deployments/testnet.json"
-DEMO_RECORD="$REPO_ROOT/deployments/testnet-demo-asset.json"
+DEMO_RECORD="$REPO_ROOT/deployments/testnet-demo-asset.json"   # DEMOUSD's own record; always required.
 [[ -f "$RECORD" ]] || { echo "FATAL: $RECORD not found" >&2; exit 1; }
 [[ -f "$DEMO_RECORD" ]] || { echo "FATAL: $DEMO_RECORD not found" >&2; exit 1; }
+
+# Every demo-asset record present, DEMOUSD's own plus any
+# testnet-demo-asset-<code>.json a second demo asset wrote - sorted so
+# this script's own tracked-entry ordering (and therefore its log
+# output) is deterministic across runs, not shell-glob-order-dependent.
+mapfile -t DEMO_RECORD_FILES < <(find "$REPO_ROOT/deployments" -maxdepth 1 -name "testnet-demo-asset*.json" | sort)
 
 STELLAR_BIN="${STELLAR_CLI_BIN:-stellar}"
 # The same identity name post-demo-signals.sh and live-poster-
@@ -101,7 +118,7 @@ STK_ID="$(jq -r '.contracts.staking.id' "$RECORD")"
 KEEPER_ADDR="$(jq -r '.identities.keeper' "$RECORD")"
 TUSD_ID="$(jq -r '.tusd.contract_id' "$RECORD")"
 USDC_ID="$(jq -r '.tracked_asset.contract_id' "$RECORD")"
-DEMO_ID="$(jq -r '.demo_asset.contract_id' "$DEMO_RECORD")"
+DEMO_ID="$(jq -r '.demo_asset.contract_id' "$DEMO_RECORD")"   # DEMOUSD's own id; kept as its own check below, unchanged from before multiple demo records existed.
 
 # Every one of our own contracts, by name and id/wasm_hash, straight
 # from testnet.json's own .contracts object - not a hardcoded list of
@@ -120,16 +137,27 @@ for name in "${CONTRACT_NAMES[@]}"; do
 done
 
 # Every token in the deployment, by name and id - also not hardcoded
-# beyond the 3 top-level JSON fields these two files actually use for
-# tokens today (.tusd, .tracked_asset, .demo_asset); unlike .contracts,
-# these aren't a uniform list to begin with, so there's nothing more
-# generic to enumerate here without inventing a shape the deployment
-# files don't have.
+# beyond the 3 top-level JSON fields testnet.json itself uses for
+# tokens today (.tusd, .tracked_asset), plus one entry per demo-asset
+# record found above (each one's own .demo_asset.asset_code /
+# .contract_id - DEMOUSD's, and any second demo asset's). Unlike
+# .contracts, these aren't a uniform list to begin with, so there's
+# nothing more generic to enumerate for TUSD/USDC here without
+# inventing a shape testnet.json doesn't have; the demo-asset side is
+# already as generic as its own file layout allows.
 declare -A TOKEN_ID_BY_NAME=(
   [TUSD]="$TUSD_ID"
   [USDC]="$USDC_ID"
-  [DEMOUSD]="$DEMO_ID"
 )
+for demo_record_file in "${DEMO_RECORD_FILES[@]}"; do
+  demo_asset_code="$(jq -r '.demo_asset.asset_code' "$demo_record_file")"
+  demo_asset_id="$(jq -r '.demo_asset.contract_id' "$demo_record_file")"
+  if [[ -z "$demo_asset_code" || "$demo_asset_code" == "null" || -z "$demo_asset_id" || "$demo_asset_id" == "null" ]]; then
+    echo "FATAL: could not read demo_asset.asset_code / demo_asset.contract_id from $demo_record_file" >&2
+    exit 1
+  fi
+  TOKEN_ID_BY_NAME["$demo_asset_code"]="$demo_asset_id"
+done
 
 log() { echo "==> $*"; }
 

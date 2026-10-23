@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
-# Issues DEMOUSD, a sample-only Stellar classic asset with real
-# auth-revocable and clawback-enabled issuer flags, registers it in
-# RiskOracle, registers an IssuerFreeze EventDefinition for it, and
-# writes deployments/testnet-demo-asset.json.
+# Issues a sample-only Stellar classic asset (DEMOUSD by default) with
+# real auth-revocable and clawback-enabled issuer flags, registers it
+# in RiskOracle, registers an IssuerFreeze EventDefinition for it, and
+# writes its own deployments/testnet-demo-asset*.json record.
 #
 # This is a SAMPLE asset for demonstrating a real, on-chain-triggered
-# IssuerFreeze event. It is never DEMOUSD:anyone-but-this-script's-own-
-# issuer, never a real stablecoin, and never confused with TUSD
-# (collateral, deploy.sh, lead decision D2) or the tracked USDC asset
-# (D3). Do not mint, hold, or transact real value with it.
+# IssuerFreeze event. It is never DEMOUSD (or whichever code is
+# passed):anyone-but-this-script's-own-issuer, never a real
+# stablecoin, and never confused with TUSD (collateral, deploy.sh,
+# lead decision D2) or the tracked USDC asset (D3). Do not mint, hold,
+# or transact real value with it.
 #
-# Usage: deploy/demo-asset.sh testnet
+# Usage: deploy/demo-asset.sh testnet [asset_code]
+#   asset_code: defaults to DEMOUSD, using today's issuer identity
+#               (sylox-demo-issuer) and record file
+#               (deployments/testnet-demo-asset.json), unchanged from
+#               before this script took an asset_code argument at all.
+#               Any other code (e.g. DEMOEUR) gets its own issuer
+#               identity (sylox-demo-issuer-<code, lowercased>) and its
+#               own record file
+#               (deployments/testnet-demo-asset-<code, lowercased>.json),
+#               so a second demo asset never touches DEMOUSD's own
+#               issuer, holder or record. The on-chain asset code
+#               itself is used exactly as typed, case preserved.
 #
 # Safe to run twice: every step checks whether it already happened
 # (the issuer identity, the SAC deploy, the flags, the asset
@@ -19,20 +31,35 @@
 #
 # Does NOT post history or trigger the freeze; see
 # deploy/demo-asset-trigger.sh for that, run separately once this
-# script's own output confirms DEMOUSD is registered and ready.
+# script's own output confirms the asset is registered and ready.
 
 set -uo pipefail
 
 NETWORK="${1:-}"
 if [[ "$NETWORK" != "testnet" ]]; then
-  echo "usage: $0 testnet" >&2
+  echo "usage: $0 testnet [asset_code]" >&2
   exit 1
 fi
+DEMO_CODE="${2:-DEMOUSD}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RECORD="$REPO_ROOT/deployments/testnet.json"
-DEMO_RECORD="$REPO_ROOT/deployments/testnet-demo-asset.json"
 [[ -f "$RECORD" ]] || { echo "FATAL: $RECORD not found; run deploy/deploy.sh testnet first" >&2; exit 1; }
+
+# DEMOUSD keeps today's exact record filename and identity alias
+# (no suffix); any other code gets its own suffixed filename and alias
+# (lowercased, so the identity store and filesystem path stay
+# shell-safe regardless of the on-chain code's own casing), so running
+# this script again for a second code can never collide with DEMOUSD's
+# own issuer, holder or record.
+if [[ "$DEMO_CODE" == "DEMOUSD" ]]; then
+  DEMO_RECORD="$REPO_ROOT/deployments/testnet-demo-asset.json"
+  ISSUER=sylox-demo-issuer   # NEVER the admin, keeper, or TUSD issuer.
+else
+  DEMO_CODE_LOWER="$(echo "$DEMO_CODE" | tr '[:upper:]' '[:lower:]')"
+  DEMO_RECORD="$REPO_ROOT/deployments/testnet-demo-asset-$DEMO_CODE_LOWER.json"
+  ISSUER="sylox-demo-issuer-$DEMO_CODE_LOWER"   # NEVER the admin, keeper, TUSD issuer, or DEMOUSD's own issuer.
+fi
 
 STELLAR_BIN="${STELLAR_CLI_BIN:-stellar}"
 RO_ID="$(jq -r '.contracts.risk_oracle.id' "$RECORD")"
@@ -40,15 +67,12 @@ ER_ID="$(jq -r '.contracts.event_registry.id' "$RECORD")"
 ADMIN=sylox-testnet-admin   # Identity alias (signing key), not the bare address: deploy.sh's own convention.
 ADMIN_ADDR="$(jq -r '.identities.admin' "$RECORD")"
 
-DEMO_CODE="DEMOUSD"
-ISSUER=sylox-demo-issuer   # NEVER the admin, keeper, or TUSD issuer.
-
 log() { echo "==> $*"; }
 die() { echo "FATAL: $*" >&2; exit 1; }
 
 # -- [1/5] Identity --------------------------------------------------
 
-log "[1/5] DEMOUSD issuer identity"
+log "[1/5] $DEMO_CODE issuer identity"
 if "$STELLAR_BIN" keys address "$ISSUER" >/dev/null 2>&1; then
   log "identity $ISSUER already exists"
 else
@@ -90,15 +114,15 @@ fi
 # D2): the SAC's contract id is deterministic from asset code + issuer,
 # so a second run's "already exists" on deploy is expected, not fatal.
 
-log "[3/5] Deploying DEMOUSD's Stellar Asset Contract"
+log "[3/5] Deploying $DEMO_CODE's Stellar Asset Contract"
 DEMO_ID="$("$STELLAR_BIN" contract id asset --asset "$DEMO_CODE:$ISSUER_ADDR" --network testnet)"
 if deploy_out="$("$STELLAR_BIN" contract asset deploy --asset "$DEMO_CODE:$ISSUER_ADDR" \
      --source-account "$ISSUER" --network testnet 2>&1)"; then
-  log "DEMOUSD contract deployed: $DEMO_ID"
+  log "$DEMO_CODE contract deployed: $DEMO_ID"
 elif echo "$deploy_out" | grep -qi "already exists\|ExistingValue"; then
-  log "DEMOUSD contract already exists at the derived address: $DEMO_ID"
+  log "$DEMO_CODE contract already exists at the derived address: $DEMO_ID"
 else
-  die "DEMOUSD deploy failed:
+  die "$DEMO_CODE deploy failed:
 $deploy_out"
 fi
 
@@ -107,11 +131,11 @@ fi
 log "[4/5] RiskOracle.add_asset"
 existing_assets="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account "$ADMIN_ADDR" --network testnet --send=no -- assets)"
 if [[ "$existing_assets" == *"$DEMO_ID"* ]]; then
-  log "RiskOracle already has DEMOUSD registered"
+  log "RiskOracle already has $DEMO_CODE registered"
 else
   demo_cfg="{\"asset\":\"$DEMO_ID\",\"issuer\":\"$ISSUER_ADDR\",\"reference\":\"Usd\",\"home_domain\":\"example-demo.sylox.test\",\"amm_adapters\":[],\"fx_adapter\":null,\"min_liquidity\":\"1\",\"issuer_flags\":{\"auth_revocable\":true,\"clawback_enabled\":true},\"enabled\":true}"
   if ! add_out="$("$STELLAR_BIN" contract invoke --id "$RO_ID" --source-account "$ADMIN" --network testnet -- add_asset --cfg "$demo_cfg" 2>&1)"; then
-    die "RiskOracle.add_asset(DEMOUSD) failed:
+    die "RiskOracle.add_asset($DEMO_CODE) failed:
 $add_out"
   fi
   log "RiskOracle.add_asset: $DEMO_ID registered (issuer_flags: auth_revocable=true, clawback_enabled=true, matching the real on-chain flags set in step 2)"
@@ -141,7 +165,7 @@ if [[ "$current_version" =~ ^[1-9][0-9]*$ ]]; then
   existing_def="$("$STELLAR_BIN" contract invoke --id "$ER_ID" --source-account "$ADMIN_ADDR" --network testnet --send=no -- definition --asset "$DEMO_ID" --kind '"IssuerFreeze"' --version "$current_version" 2>&1)"
   existing_challenge_secs="$(echo "$existing_def" | jq -r '.challenge_secs // empty' 2>/dev/null)"
   if [[ "$existing_challenge_secs" == "3600" ]]; then
-    log "IssuerFreeze definition already registered for DEMOUSD at challenge_secs=3600 (version $current_version)"
+    log "IssuerFreeze definition already registered for $DEMO_CODE at challenge_secs=3600 (version $current_version)"
     needs_registration=0
   else
     log "IssuerFreeze version $current_version exists at challenge_secs=${existing_challenge_secs:-unknown}, not 3600; registering a new canonical version"
@@ -150,10 +174,10 @@ fi
 if (( needs_registration )); then
   demo_def="{\"asset\":\"$DEMO_ID\",\"kind\":\"IssuerFreeze\",\"version\":0,\"reference\":\"Usd\",\"depeg_threshold\":\"0\",\"depeg_window_secs\":0,\"max_missing_epochs\":0,\"cure_threshold\":\"0\",\"freeze_pct_bps\":100,\"auth_revocation_threshold\":0,\"mint_spike_bps\":0,\"halt_window_secs\":0,\"challenge_secs\":3600,\"ruling_deadline_secs\":1209600}"
   if ! def_out="$("$STELLAR_BIN" contract invoke --id "$ER_ID" --source-account "$ADMIN" --network testnet -- register_definition --def "$demo_def" 2>&1)"; then
-    die "register_definition(DEMOUSD, IssuerFreeze) failed:
+    die "register_definition($DEMO_CODE, IssuerFreeze) failed:
 $def_out"
   fi
-  log "EventRegistry.register_definition: IssuerFreeze registered for DEMOUSD (freeze_pct_bps=100, auth_revocation_threshold=0, challenge_secs=3600)"
+  log "EventRegistry.register_definition: IssuerFreeze registered for $DEMO_CODE (freeze_pct_bps=100, auth_revocation_threshold=0, challenge_secs=3600)"
 fi
 
 cat > "$DEMO_RECORD" <<EOF
@@ -168,4 +192,8 @@ cat > "$DEMO_RECORD" <<EOF
 }
 EOF
 log "demo asset record written: $DEMO_RECORD"
-log "Done. Next: deploy/demo-asset-trigger.sh testnet to create a holder, post DEMOUSD's own history, and trigger a real freeze."
+if [[ "$DEMO_CODE" == "DEMOUSD" ]]; then
+  log "Done. Next: deploy/demo-asset-trigger.sh testnet to create a holder, post $DEMO_CODE's own history, and trigger a real freeze."
+else
+  log "Done. Next: deploy/demo-asset-trigger.sh testnet $DEMO_CODE to create a holder, post $DEMO_CODE's own history, and trigger a real freeze."
+fi
