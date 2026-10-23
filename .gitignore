@@ -13,16 +13,21 @@ dist/
 # is the same category (public contract/asset/address fields only, no
 # secret), committed so deploy/extend-ttl.sh can read the DEMOUSD
 # holder's address from a Railway container that never ran
-# deploy/demo-asset-trigger.sh locally. deployments/testnet-demo.json
-# is the same category again: deploy/deploy.sh testnet-demo writes it,
-# deploy/demo/scenario.sh reads it, and nothing in it is secret either
-# (same public contract/asset/address fields, the demo's own throwaway
-# testnet-demo identities only). Everything else under deployments/
-# (ad hoc local scratch, e.g. deploy/post-demo-signals.sh's own inputs
-# record) stays ignored.
+# deploy/demo-asset-trigger.sh locally. deployments/testnet-demo-asset-
+# <code>.json (deploy/demo-asset.sh testnet <code>'s own record for any
+# code other than DEMOUSD) is the same category again, same reason:
+# committed so extend-ttl.sh running on Railway can track a second demo
+# asset's TTL too. deployments/testnet-demo.json is the same category
+# again: deploy/deploy.sh testnet-demo writes it, deploy/demo/
+# scenario.sh reads it, and nothing in it is secret either (same public
+# contract/asset/address fields, the demo's own throwaway testnet-demo
+# identities only). Everything else under deployments/ (ad hoc local
+# scratch, e.g. deploy/post-demo-signals.sh's own inputs record) stays
+# ignored.
 deployments/*.json
 !deployments/testnet.json
 !deployments/testnet-demo-asset.json
+!deployments/testnet-demo-asset-*.json
 !deployments/testnet-demo.json
 
 # Sylox landing page (web/landing/_moodboard is reference-only, never shipped)

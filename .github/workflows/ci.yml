@@ -625,7 +625,7 @@ jobs:
             changed=$(git diff --name-only "$before" "${{ github.sha }}")
             echo "Changed files ($before..${{ github.sha }}):"
             echo "$changed"
-            if echo "$changed" | grep -qE '^(deploy/post-demo-signals\.sh|deploy/extend-ttl\.sh|deploy/Dockerfile\.live-poster|deploy/live-poster-entrypoint\.sh|deployments/testnet\.json|deployments/testnet-demo-asset\.json)$'; then
+            if echo "$changed" | grep -qE '^(deploy/post-demo-signals\.sh|deploy/extend-ttl\.sh|deploy/Dockerfile\.live-poster|deploy/live-poster-entrypoint\.sh|deployments/testnet\.json|deployments/testnet-demo-asset\.json|deployments/testnet-demo-asset-.*\.json)$'; then
               echo "relevant=true" >> "$GITHUB_OUTPUT"
             else
               echo "relevant=false" >> "$GITHUB_OUTPUT"
