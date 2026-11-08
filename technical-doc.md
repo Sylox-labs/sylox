@@ -4,6 +4,8 @@
 
 Version: v1.5 draft, October 9, 2026 · Author: David Ejere
 
+> **Current build scope.** The work now planned runs entirely on Stellar testnet. Nothing deploys to mainnet, and the audit and bug bounty in Section 21.4 belong to a later mainnet phase. The planned event scope is Depeg, IssuerFreeze and WithdrawalHalt; Insolvency and MintWithoutBacking stay in a later phase. Section 22.2a shows what is built today.
+
 ---
 
 ## Table of contents
@@ -272,7 +274,7 @@ Every change from v1.0, with the decision record behind it (`docs/decisions/`) a
 
 ## 1. Overview and conventions
 
-This document specifies how Sylox is built: the Soroban contracts, their data, math, interfaces and events, the offchain services that feed them, and how to integrate, deploy and operate the system. It is the engineering companion to the Sylox PRD and is written against a v1 design that has not yet been implemented, so every interface here is a draft to be validated in Phase 1.
+This document specifies how Sylox is built: the Soroban contracts, their data, math, interfaces and events, the offchain services that feed them, and how to integrate, deploy and operate the system. It is the engineering companion to the Sylox PRD and specifies the v1 design. Most of the core contracts are now implemented and tested, and four run on testnet (Section 22.2a); interfaces for parts not yet built remain drafts.
 
 ### 1.1 Audience
 
@@ -286,14 +288,14 @@ This document specifies how Sylox is built: the Soroban contracts, their data, m
 
 ### 1.2 Scope of v1
 
-In scope: risk signals and score for issued assets on Stellar mainnet; credit event detection across three tiers; fully collateralized protection series settled in USDC; keeper and reporter staking, bonds and disputes; committee rulings with a ruling deadline; a protocol treasury; governance with timelock.
+In scope: risk signals and score for issued assets on Stellar (built and run on testnet first; mainnet is a later phase, see the note at the top of this document); credit event detection across three tiers; fully collateralized protection series settled in USDC; keeper and reporter staking, bonds and disputes; committee rulings with a ruling deadline; a protocol treasury; governance with timelock.
 
 Event scope by build phase (Section 22.2a):
 
 | Build phase | Event kinds | Tier |
 | --- | --- | --- |
 | First build (Phases A and B) | Depeg, IssuerFreeze, each with one canonical definition per asset (Section 8.8) | 1 |
-| Later build (Phase C) | WithdrawalHalt | 2 |
+| Later build (Phase C, planned first) | WithdrawalHalt | 2 |
 | Later build (Phase C) | Insolvency | 3 |
 | Later build (Phase C) | MintWithoutBacking (Tier 1 flag, committee to confirm) | 1, confirmed by 3 |
 
@@ -2468,9 +2470,13 @@ Short, task oriented recipes for each kind of integrator. Each lists what to rea
 4. Subscribe to `band_changed` and `event_declared` to notify users.
 5. Link to the asset's signal page so users see why, not just a colour.
 
+A reference badge component that implements these steps is planned as a drop in package for wallets.
+
 Pitfall: assets not covered by the oracle return `UnknownAsset`; show "Not rated", not "Safe".
 
 ### 20.2 Lending protocols: use bands in risk parameters
+
+A reference Soroban lending contract built on the snippet below is planned, so lenders have working code to copy.
 
 ```rust
 let oracle = RiskOracleClient::new(&env, &oracle_addr);
@@ -2593,7 +2599,7 @@ Since v1.5 (Section 5.9): the implementation PR's own test list (full existing s
 
 ### 21.4 Audit and disclosure
 
-- External security audit before mainnet, scoped to all seven contracts and the recompute library.
+- External security audit before mainnet, scoped to all seven contracts and the recompute library. Mainnet is outside the current testnet build; the testnet build ends with an audit readiness package (data flow diagram, threat model, invariants, test coverage) for this audit.
 - SECURITY.md with a disclosure address and response targets (acknowledge within 48 hours).
 - Bug bounty once mainnet collateral passes an agreed level.
 
@@ -2657,7 +2663,7 @@ Deployment order (22.2) is the order contracts are *invoked* on a live network; 
 
 - **Phase A, data layer:** shared types, `RiskOracle` (built; ring buffer write cost measured, Section 5.8), `Staking`, `Treasury`, the adapters, the keeper and recompute library, the reporter node.
 - **Phase B, first event scope and markets:** `EventRegistry` with canonical Depeg and IssuerFreeze definitions (Tier 1), challenges and the ruling deadline; `MarketFactory`; `Series`; `Governor`; indexer, API and SDK.
-- **Phase C, later event scope:** WithdrawalHalt (Tier 2) with its evidence handling, Insolvency (Tier 3) with committee tooling, and MintWithoutBacking.
+- **Phase C, later event scope:** WithdrawalHalt (Tier 2) with its evidence handling, the committee ruling tooling it needs, and wiring `EventRegistry` into `Staking`'s bond and slash paths. Insolvency (Tier 3) and MintWithoutBacking follow in a later phase.
 
 ```mermaid
 flowchart LR
@@ -2696,11 +2702,11 @@ flowchart LR
 
   classDef done fill:#dfe,stroke:#393;
   classDef todo fill:#eee,stroke:#999;
-  class A done;
-  class P0,B,C,T,H,K,D,E,F,G,I,L,M,N todo;
+  class A,B,C,T,D,E,F,G done;
+  class P0,H,K,I,L,M,N todo;
 ```
 
-Green: implemented and tested as of this revision (the shared types crate). Grey: not yet implemented; every contract crate exists as a compiling stub (`lib.rs` with one `todo!()` function, no business logic). Within Phase A, `Staking` comes before the parts of `RiskOracle` that read the endpoint aggregate and send bond instructions, and `Treasury` before the reward paths of `Staking`. `Governor` has no functional dependency on the other core contracts but is ordered last in Phase B because every privileged call across them is written against its `require_auth()` pattern (Section 16), so its interface should be stable before those calls are finalized. Phase C adds checks, evidence handling and committee tooling to `EventRegistry`; it needs no type changes (Section 1.2).
+Green: implemented and tested as of this revision: the shared types and all seven contracts. `RiskOracle`, `EventRegistry` (Depeg and IssuerFreeze), `Staking` and `Treasury` are deployed on testnet; `MarketFactory` and `Series` run on a separate fast clock demo deployment; `Governor` is not yet deployed. Grey: not yet built: the two adapters (stubs), the keeper, recompute library, reporter node, indexer and API (a scripted demo poster stands in for the keeper on testnet), and the Phase C event kinds. `packages/sdk` exists and is used by the web app. Within Phase A, `Staking` comes before the parts of `RiskOracle` that read the endpoint aggregate and send bond instructions, and `Treasury` before the reward paths of `Staking`. `Governor` has no functional dependency on the other core contracts but is ordered last in Phase B because every privileged call across them is written against its `require_auth()` pattern (Section 16), so its interface should be stable before those calls are finalized. Phase C adds checks, evidence handling and committee tooling to `EventRegistry`; it needs no type changes (Section 1.2).
 
 ### 22.3 Configuration
 

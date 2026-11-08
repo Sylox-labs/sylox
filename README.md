@@ -234,7 +234,8 @@ For the full picture, including architecture, state machine and call sequence di
 | Web app (`web/app`) | Live on testnet: asset explorer, asset pages, events list, event page with Checkpoint and Finalize actions. Markets, positions and faucet screens are not built yet |
 | Landing site and docs site | Live at [sylox.xyz](https://sylox.xyz) and [docs.sylox.xyz](https://docs.sylox.xyz/docs) |
 | Keeper, reporter node, indexer, API services | Not built yet; testnet uses a scripted demo poster in their place |
-| WithdrawalHalt (Tier 2), Insolvency (Tier 3) | Later build phase |
+| WithdrawalHalt (Tier 2) | Planned next, after the keeper and reporter nodes |
+| Insolvency (Tier 3), MintWithoutBacking | Later build phase |
 
 A real IssuerFreeze event has already been run end to end on testnet against a sample `DEMOUSD` asset; see [`docs/demousd-issuer-freeze-2026-10-11.md`](./docs/demousd-issuer-freeze-2026-10-11.md).
 
