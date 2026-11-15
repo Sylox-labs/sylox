@@ -200,7 +200,7 @@ export function DashboardShell({ title, children }: { title: string; children: R
       <MobileDrawer isOpen={isDrawerOpen} onClose={() => setIsDrawerOpen(false)} pathname={pathname} />
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-cement-grey/20 px-4 md:px-8">
+        <header className="sticky top-0 z-40 flex h-16 shrink-0 items-center justify-between gap-4 border-b border-cement-grey/20 bg-slate-black px-4 md:px-8">
           <div className="flex min-w-0 items-center gap-3">
             <button
               type="button"
