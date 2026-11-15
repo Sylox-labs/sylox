@@ -68,6 +68,18 @@ describe("DashboardShell", () => {
     expect(screen.getByRole("button", { name: /connect wallet/i })).toBeInTheDocument();
   });
 
+  it("keeps the top bar sticky to the viewport, with a solid background so scrolled content never shows through it", () => {
+    renderShell();
+    const header = screen.getByRole("banner");
+    expect(header.className).toMatch(/\bsticky\b/);
+    expect(header.className).toMatch(/\btop-0\b/);
+    // A solid background is what makes "sticky" actually read as fixed in
+    // place rather than content visibly scrolling up underneath a
+    // transparent bar - same convention as the sidebar's own
+    // bg-slate-black panels (MobileDrawer, WalletButton's dropdown).
+    expect(header.className).toMatch(/\bbg-slate-black\b/);
+  });
+
   it("links every External item out, each opening in a new tab", () => {
     renderShell();
     const website = screen.getByRole("link", { name: "Website" });
